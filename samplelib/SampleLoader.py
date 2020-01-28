@@ -14,7 +14,7 @@ from facelib import FaceType, LandmarksProcessor
 from .Sample import Sample, SampleType
 
 
-class SampleHost:
+class SampleLoader:
     samples_cache = dict()
     @staticmethod
     def get_person_id_max_count(samples_path):
@@ -33,7 +33,7 @@ class SampleHost:
 
     @staticmethod
     def load(sample_type, samples_path):
-        samples_cache = SampleHost.samples_cache
+        samples_cache = SampleLoader.samples_cache
 
         if str(samples_path) not in samples_cache.keys():
             samples_cache[str(samples_path)] = [None]*SampleType.QTY
@@ -55,12 +55,12 @@ class SampleHost:
                     io.log_info (f"Loaded {len(result)} packed faces from {samples_path}")
 
                 if result is None:
-                    result = SampleHost.load_face_samples( pathex.get_image_paths(samples_path) )
+                    result = SampleLoader.load_face_samples( pathex.get_image_paths(samples_path) )
                 samples[sample_type] = result
 
         elif          sample_type == SampleType.FACE_TEMPORAL_SORTED:
-                result = SampleHost.load (SampleType.FACE, samples_path)
-                result = SampleHost.upgradeToFaceTemporalSortedSamples(result)
+                result = SampleLoader.load (SampleType.FACE, samples_path)
+                result = SampleLoader.upgradeToFaceTemporalSortedSamples(result)
                 samples[sample_type] = result
 
         return samples[sample_type]
