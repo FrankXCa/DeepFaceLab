@@ -9,11 +9,6 @@
 <img src="https://static.arxiv.org/static/browse/0.3.0/images/icons/favicon.ico" width=14></img>
 https://arxiv.org/abs/2005.05535</a>
 
-
-### the leading software for creating deepfakes
-
-<img src="doc/DFL_welcome.png" align="center">
-
 </td></tr>
 <tr><td colspan=2 align="center">
 
@@ -24,8 +19,6 @@ https://arxiv.org/abs/2005.05535</a>
 ![](doc/logo_directx.png)
 
 </p>
-
-More than 95% of deepfake videos are created with DeepFaceLab.
 
 DeepFaceLab is used by such popular youtube channels as
 
