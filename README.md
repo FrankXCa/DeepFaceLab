@@ -258,20 +258,6 @@ Unfortunately, there is no "make everything ok" button in DeepFaceLab. You shoul
 
 <tr><td colspan=2 align="center">
 
-### Supplementary material
-
-</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/forum-celebrity-facesets">Ready to work facesets</a>
-</td><td align="center">Celebrity facesets made by community</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/forum-trained-models">Pretrained models</a>
-</td><td align="center">Pretrained models made by community</td></tr>
-
-<tr><td colspan=2 align="center">
-
 ### Communication groups
 
 </td></tr>
@@ -279,38 +265,6 @@ Unfortunately, there is no "make everything ok" button in DeepFaceLab. You shoul
 <tr><td align="right">
 <a href="https://discord.gg/rxa7h9M6rH">Discord</a>
 </td><td align="center">Official discord channel. English / Russian.</td></tr>
-
-<tr><td align="right">
-<a href="https://t.me/joinchat/ElkhqlgJ0I5HhdJyFar80w">Telegram group</a>
-</td><td align="center">Official telegram group. English / Russian. For anonymous communication. Don't forget to hide your phone number</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/forum-russian-community">Русский форум</a>
-</td><td align="center"></td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/">mrdeepfakes</a>
-</td><td align="center">the biggest NSFW English community</td></tr>
-
-<tr><td align="right">
-<a href="https://www.reddit.com/r/DeepFakesSFW/new/">reddit r/DeepFakesSFW/</a>
-</td><td align="center">Post your deepfakes there !</td></tr>
-
-<tr><td align="right">
-<a href="https://www.reddit.com/r/RUdeepfakes/new/">reddit r/RUdeepfakes/</a>
-</td><td align="center">Постим русские дипфейки сюда !</td></tr>
-
-<tr><td align="right">
-QQ群124500433
-</td><td align="center">中文交流QQ群，商务合作找群主</td></tr>
-
-<tr><td align="right">
-<a href="https://www.dfldata.cc">dfldata.cc</a>
-</td><td align="center">中文交流论坛，免费软件教程、模型、人脸数据</td></tr>
-
-<tr><td align="right">
-<a href="https://www.deepfaker.xyz/">deepfaker.xyz</a>
-</td><td align="center">中文学习站（非官方)</td></tr>
 
 <tr><td colspan=2 align="center">
 
@@ -321,14 +275,6 @@ QQ群124500433
 <tr><td align="right">
 <a href="https://github.com/iperov/DeepFaceLive">DeepFaceLive</a>
 </td><td align="center">Real-time face swap for PC streaming or video calls</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/neuralchen/SimSwap">neuralchen/SimSwap</a>
-</td><td align="center">Swapping face using ONE single photo 一张图免训练换脸</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/deepfakes/faceswap">deepfakes/faceswap</a>
-</td><td align="center">Something that was before DeepFaceLab and still remains in the past</td></tr>
 
 </td></tr>
 </table>
@@ -361,17 +307,6 @@ bitcoin:bc1qkhh7h0gwwhxgg6h6gpllfgstkd645fefrd5s6z
 
 <tr><td colspan=2 align="center">
 
-### Collect facesets
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-You can collect faceset of any celebrity that can be used in DeepFaceLab and share it <a href="https://mrdeepfakes.com/forums/forum-celebrity-facesets">in the community</a>
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
 ### Star this repo
 
 </td></tr>
@@ -383,8 +318,6 @@ Register github account and push "Star" button.
 </td></tr>
 
 </table>
-
-
 
 <table align="center" border="0">
 <tr><td colspan=2 align="center">
