@@ -94,24 +94,6 @@ DeepFaceLab is used by such popular youtube channels as
 
 </td></tr>
 
-
-<tr><td align="center" width="50%">
-
-<img src="doc/head_replace_0_1.jpg" align="center">
-
-</td>
-<td align="center" width="50%">
-
-<img src="doc/head_replace_0_2.jpg" align="center">
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=xr5FHd0AdlQ
-
-</td></tr>
-
 <tr><td align="center" width="50%">
 
 <img src="doc/head_replace_1_1.jpg" align="center">
@@ -129,39 +111,6 @@ DeepFaceLab is used by such popular youtube channels as
 
 </td></tr>
 
-<tr><td align="center" width="50%">
-
-<img src="doc/head_replace_2_1.jpg" align="center">
-
-</td>
-<td align="center" width="50%">
-
-<img src="doc/head_replace_2_2.jpg" align="center">
-
-</td></tr>
-
-<tr><td colspan=2  align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=R9f7WD0gKPo
-
-</td></tr>
-
-
-<tr><td colspan=2 align="center">
-
-## Manipulate politicians lips
-(voice replacement is not included!)
-(also requires a skill in video editors such as *Adobe After Effects* or *Davinci Resolve*)
-
-<img src="doc/political_speech2.jpg" align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=IvY-Abd2FfM
-
-<img src="doc/political_speech3.jpg" align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=ERQlaJ_czHU
-
-</td></tr>
 <tr><td colspan=2 align="center">
 
 # Deepfake native resolution progress
@@ -223,38 +172,6 @@ Unfortunately, there is no "make everything ok" button in DeepFaceLab. You shoul
 </table>
 
 <table align="center" border="0">
-
-<tr><td colspan=2 align="center">
-
-## Links
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-### Guides and tutorials
-
-</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/thread-guide-deepfacelab-2-0-guide">DeepFaceLab guide</a>
-</td><td align="center">Main guide</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/thread-guide-deepfacelab-2-0-guide?pid=18459#pid18459">Faceset creation guide</a>
-</td><td align="center">How to create the right faceset</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/thread-guide-deepfacelab-google-colab-tutorial">Google Colab guide</a>
-</td><td align="center">Guide how to train the fake on Google Colab</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/thread-deepfacelab-2-0-compositing-in-davinci-resolve-vegas-pro-and-after-effects">Compositing</a>
-</td><td align="center">To achieve the highest quality, compose deepfake manually in video editors such as Davinci Resolve or Adobe AfterEffects</td></tr>
-
-<tr><td align="right">
-<a href="https://mrdeepfakes.com/forums/thread-deepfacelab-2-0-discussion-tips-suggestions">Discussion and suggestions</a>
-</td><td align="center"></td></tr>
 
 <tr><td colspan=2 align="center">
 
