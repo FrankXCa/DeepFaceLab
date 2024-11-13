@@ -106,7 +106,7 @@ DeepFaceLab is used by such popular youtube channels as
 
 <tr><td colspan=2 align="center">
 
-# Deepfake native resolution progress
+# Native resolution progress
 
 </td></tr>
 <tr><td colspan=2 align="center">
@@ -149,10 +149,6 @@ Unfortunately, there is no "make everything ok" button in DeepFaceLab. You shoul
 <tr><td align="right">
 <a href="https://disk.yandex.ru/d/7i5XTKIKVg5UUg">Windows (yandex.ru)</a>
 </td><td align="center">Contains new and prev releases.</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/chervonij/DFL-Colab">Google Colab (github)</a>
-</td><td align="center">by @chervonij . You can train fakes for free using Google Colab.</td></tr>
 
 <tr><td align="right">
 <a href="https://github.com/nagadit/DeepFaceLab_Linux">Linux (github)</a>
@@ -199,24 +195,6 @@ Unfortunately, there is no "make everything ok" button in DeepFaceLab. You shoul
 
 <tr><td colspan=2 align="center">
 
-### Sponsor deepfake research and DeepFaceLab development.
-
-</td></tr>
-<!--
-<tr><td colspan=2 align="center">
-<a href="https://www.paypal.com/paypalme/DeepFaceLab">Donate via Paypal</a>
-</td></tr>
--->
-<tr><td colspan=2 align="center">
-<a href="https://yoomoney.ru/to/41001142318065">Donate via Yoomoney</a>
-</td></tr>
-
-<tr><td colspan=2 align="center">
-bitcoin:bc1qkhh7h0gwwhxgg6h6gpllfgstkd645fefrd5s6z
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
 ### Star this repo
 
 </td></tr>
@@ -250,7 +228,7 @@ Register github account and push "Star" button.
 
 <tr><td colspan=2 align="center">
 
-<sub>#deepfacelab #deepfakes #faceswap #face-swap #deep-learning #deeplearning #deep-neural-networks #deepface #deep-face-swap #fakeapp #fake-app #neural-networks #neural-nets #tensorflow #cuda #nvidia</sub>
+<sub>#deepfacelab #faceswap #face-swap #deep-learning #deeplearning #deep-neural-networks #deepface #deep-face-swap #neural-networks #neural-nets #tensorflow #cuda #nvidia</sub>
 
 </td></tr>
 
