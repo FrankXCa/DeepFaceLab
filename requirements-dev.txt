@@ -1,7 +1,22 @@
-# DeepFaceLab modernization — development/test dependencies (Phase 1)
+# DeepFaceLab modernization — development/test dependencies (Phases 1–2)
 #
 # Install together with requirements-cuda.txt (GPU) or
 # requirements-cpu.txt (CPU fallback):
 #   uv pip install -r requirements-cuda.txt -r requirements-dev.txt
+#
+# The Phase 2 device test suite imports `core.leras` (nn.py pulls in
+# core.interact), so the test environment also needs the app-level
+# modules below. These are test-environment dependencies only: the
+# runtime requirements (requirements-cuda.txt / requirements-cpu.txt)
+# remain minimal, and OpenCV/Matplotlib/IPython become runtime
+# dependencies only when later phases (models, extractors) require them.
 
+# test runner
 pytest==9.1.1
+
+# needed to import core.interact (and therefore core.leras.nn) in tests
+opencv-python==5.0.0.93
+tqdm==4.70.1
+IPython==9.17.1
+matplotlib==3.11.2
+pillow==12.3.0
