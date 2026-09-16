@@ -24,11 +24,17 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 from pathlib import Path
 import numpy as np
 from core.interact import interact as io
-from .device import Devices
+from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (Phase 2: device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
 
 
 class nn():
     current_DeviceConfig = None
+
+    # Phase 2: device-selection semantics live in core.leras.device and are
+    # exposed here as class attributes, because every call site uses
+    # `from core.leras import nn` (the class), not the nn.py module.
+    DeviceConfig = DeviceConfig
+    ask_choose_device_idxs = staticmethod(ask_choose_device_idxs)
 
     tf = None
     tf_sess = None
@@ -197,104 +203,8 @@ class nn():
             nn.tf_sess.close()
             nn.tf_sess = None
 
-    @staticmethod
-    def ask_choose_device_idxs(choose_only_one=False, allow_cpu=True, suggest_best_multi_gpu=False, suggest_all_gpu=False):
-        devices = Devices.getDevices()
-        if len(devices) == 0:
-            return []
-
-        all_devices_indexes = [device.index for device in devices]
-
-        if choose_only_one:
-            suggest_best_multi_gpu = False
-            suggest_all_gpu = False
-
-        if suggest_all_gpu:
-            best_device_indexes = all_devices_indexes
-        elif suggest_best_multi_gpu:
-            best_device_indexes = [device.index for device in devices.get_equal_devices(devices.get_best_device()) ]
-        else:
-            best_device_indexes = [ devices.get_best_device().index ]
-        best_device_indexes = ",".join([str(x) for x in best_device_indexes])
-
-        io.log_info ("")
-        if choose_only_one:
-            io.log_info ("Choose one GPU idx.")
-        else:
-            io.log_info ("Choose one or several GPU idxs (separated by comma).")
-        io.log_info ("")
-
-        if allow_cpu:
-            io.log_info ("[CPU] : CPU")
-        for device in devices:
-            io.log_info (f"  [{device.index}] : {device.name}")
-
-        io.log_info ("")
-
-        while True:
-            try:
-                if choose_only_one:
-                    choosed_idxs = io.input_str("Which GPU index to choose?", best_device_indexes)
-                else:
-                    choosed_idxs = io.input_str("Which GPU indexes to choose?", best_device_indexes)
-
-                if allow_cpu and choosed_idxs.lower() == "cpu":
-                    choosed_idxs = []
-                    break
-
-                choosed_idxs = [ int(x) for x in choosed_idxs.split(',') ]
-
-                if choose_only_one:
-                    if len(choosed_idxs) == 1:
-                        break
-                else:
-                    if all( [idx in all_devices_indexes for idx in choosed_idxs] ):
-                        break
-            except:
-                pass
-        io.log_info ("")
-
-        return choosed_idxs
-
-    class DeviceConfig():
-        @staticmethod
-        def ask_choose_device(*args, **kwargs):
-            return nn.DeviceConfig.GPUIndexes( nn.ask_choose_device_idxs(*args,**kwargs) )
-        
-        def __init__ (self, devices=None):
-            devices = devices or []
-
-            if not isinstance(devices, Devices):
-                devices = Devices(devices)
-
-            self.devices = devices
-            self.cpu_only = len(devices) == 0
-
-        @staticmethod
-        def BestGPU():
-            devices = Devices.getDevices()
-            if len(devices) == 0:
-                return nn.DeviceConfig.CPU()
-
-            return nn.DeviceConfig([devices.get_best_device()])
-
-        @staticmethod
-        def WorstGPU():
-            devices = Devices.getDevices()
-            if len(devices) == 0:
-                return nn.DeviceConfig.CPU()
-
-            return nn.DeviceConfig([devices.get_worst_device()])
-
-        @staticmethod
-        def GPUIndexes(indexes):
-            if len(indexes) != 0:
-                devices = Devices.getDevices().get_devices_from_index_list(indexes)
-            else:
-                devices = []
-
-            return nn.DeviceConfig(devices)
-
-        @staticmethod
-        def CPU():
-            return nn.DeviceConfig([])
+    # Phase 2: device-selection semantics (DeviceConfig, ask_choose_device_idxs)
+    # live in core.leras.device and are exposed on this class, so
+    # `nn.DeviceConfig.*` and `nn.ask_choose_device_idxs(...)` keep working
+    # for all existing call sites (`from core.leras import nn`, see the
+    # import at the top of this file).

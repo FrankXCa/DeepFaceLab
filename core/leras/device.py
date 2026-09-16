@@ -1,26 +1,89 @@
-import sys
-import ctypes
+"""Device layer (Phase 2) — torch-native replacement of the official
+TensorFlow-based GPU discovery.
+
+Architecture (IMPLEMENTATION_PLAN_v2.md section 13):
+
+    model / leras code
+            |
+    Device / Devices / DeviceConfig   (this module, official API)
+            |
+    backend-neutral registry (core.leras.backends)
+            |
+    CUDA (today)   CPU (today)   AMD / Intel (future, this layer only)
+
+Preserved official contract:
+- ``initialize_main_env()`` publishes ``NN_DEVICES_INITIALIZED`` /
+  ``NN_DEVICES_COUNT`` / ``NN_DEVICE_{i}_*`` environment variables so
+  spawned child processes can rebuild the device list without re-running
+  any discovery.
+- ``CUDA_VISIBLE_DEVICES`` is cleared before enumeration (official
+  behavior: users select from all physical GPUs).
+- CPU is represented by an *empty* device list
+  (``DeviceConfig.cpu_only``), exactly like official DFL.
+- ``Device`` keeps its official fields/constructor
+  (``index, tf_dev_type, name, total_mem, free_mem``) plus Phase 2
+  additions: ``backend`` and ``capability``.
+
+Documented deviations from the official TF discovery:
+- No TensorFlow and no helper subprocess: torch enumerates devices
+  in-process (cheap driver queries, no framework context pinning).
+- DirectML (DML) devices are not enumerated: the torch baseline has no
+  DirectML backend; production targets are NVIDIA CUDA + CPU.
+- ``free_mem`` reports real driver values (torch.cuda.mem_get_info);
+  official TF reported the session memory limit (under allow_growth that
+  is effectively the total).
+- New environment keys ``NN_DEVICE_{i}_BACKEND`` and ``NN_DEVICE_{i}_CC``
+  (capability, official 'cc' encoding major*10+minor) are added; the
+  official keys are unchanged, so older readers keep working.
+
+Model-facing helpers (use these instead of torch.cuda.* in model code):
+``get_torch_device(device)``, ``synchronize(device)``,
+``memory_info(device)``.
+"""
+
 import os
-import multiprocessing
-import json
-import time
+import sys
 from pathlib import Path
-from core.interact import interact as io
+
+import torch
+
+from . import backends
+
+
+def _log_info(message):
+    """Use the official logger when the full app environment is importable
+    (core.interact pulls in GUI/opencv dependencies); fall back to a plain
+    line so this layer stays importable in the minimal Phase 1 runtime."""
+    try:
+        from core.interact import interact as io
+        io.log_info(message)
+    except Exception:
+        print(f"[INFO] {message}")
 
 
 class Device(object):
-    def __init__(self, index, tf_dev_type, name, total_mem, free_mem):
+    def __init__(self, index, tf_dev_type, name, total_mem, free_mem,
+                 backend=None, capability=None):
         self.index = index
+        # Kept for official compatibility: TF-era model code builds
+        # '/{tf_dev_type}:{index}' placement strings from it.
         self.tf_dev_type = tf_dev_type
         self.name = name
-        
+
         self.total_mem = total_mem
         self.total_mem_gb = total_mem / 1024**3
         self.free_mem = free_mem
         self.free_mem_gb = free_mem / 1024**3
 
+        # Phase 2 metadata:
+        #   backend    - registry key, e.g. 'cuda' (future: 'rocm', 'xpu')
+        #   capability - (major, minor) e.g. (8, 9) for sm_89; None if unknown
+        self.backend = backend
+        self.capability = capability
+
     def __str__(self):
         return f"[{self.index}]:[{self.name}][{self.free_mem_gb:.3}/{self.total_mem_gb :.3}]"
+
 
 class Devices(object):
     all_devices = None
@@ -79,195 +142,248 @@ class Devices(object):
         result = []
         for device in self.devices:
             if device.name == device_name:
-                result.append (device)
+                result.append(device)
         return Devices(result)
 
     def get_devices_at_least_mem(self, totalmemsize_gb):
         result = []
         for device in self.devices:
             if device.total_mem >= totalmemsize_gb*(1024**3):
-                result.append (device)
+                result.append(device)
         return Devices(result)
 
-    @staticmethod
-    def _get_tf_devices_proc(q : multiprocessing.Queue):
-        
-        if sys.platform[0:3] == 'win':
-            compute_cache_path = Path(os.environ['APPDATA']) / 'NVIDIA' / ('ComputeCache_ALL')
-            os.environ['CUDA_CACHE_PATH'] = str(compute_cache_path)
-            if not compute_cache_path.exists():
-                io.log_info("Caching GPU kernels...")
-                compute_cache_path.mkdir(parents=True, exist_ok=True)
-                
-        import tensorflow
-        
-        tf_version = tensorflow.version.VERSION
-        #if tf_version is None:
-        #    tf_version = tensorflow.version.GIT_VERSION
-        if tf_version[0] == 'v':
-            tf_version = tf_version[1:]
-        if tf_version[0] == '2':
-            tf = tensorflow.compat.v1
-        else:
-            tf = tensorflow
-        
-        import logging
-        # Disable tensorflow warnings
-        tf_logger = logging.getLogger('tensorflow')
-        tf_logger.setLevel(logging.ERROR)
-
-        from tensorflow.python.client import device_lib
-
-        devices = []
-        
-        physical_devices = device_lib.list_local_devices()
-        physical_devices_f = {}
-        for dev in physical_devices:
-            dev_type = dev.device_type
-            dev_tf_name = dev.name
-            dev_tf_name = dev_tf_name[ dev_tf_name.index(dev_type) : ]
-            
-            dev_idx = int(dev_tf_name.split(':')[-1])
-            
-            if dev_type in ['GPU','DML']:
-                dev_name = dev_tf_name
-                
-                dev_desc = dev.physical_device_desc
-                if len(dev_desc) != 0:
-                    if dev_desc[0] == '{':
-                        dev_desc_json = json.loads(dev_desc)
-                        dev_desc_json_name = dev_desc_json.get('name',None)
-                        if dev_desc_json_name is not None:
-                            dev_name = dev_desc_json_name
-                    else:
-                        for param, value in ( v.split(':') for v in dev_desc.split(',') ):
-                            param = param.strip()
-                            value = value.strip()
-                            if param == 'name':
-                                dev_name = value
-                                break
-                
-                physical_devices_f[dev_idx] = (dev_type, dev_name, dev.memory_limit)
-                        
-        q.put(physical_devices_f)
-        time.sleep(0.1)
-        
-        
     @staticmethod
     def initialize_main_env():
         if int(os.environ.get("NN_DEVICES_INITIALIZED", 0)) != 0:
             return
-            
+
+        # Official behavior: enumerate all physical GPUs.
         if 'CUDA_VISIBLE_DEVICES' in os.environ.keys():
             os.environ.pop('CUDA_VISIBLE_DEVICES')
-        
-        os.environ['TF_DIRECTML_KERNEL_CACHE_SIZE'] = '2500'
-        os.environ['CUDA_​CACHE_​MAXSIZE'] = '2147483647'
-        os.environ['TF_MIN_GPU_MULTIPROCESSOR_COUNT'] = '2'
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # tf log errors only
-        
-        q = multiprocessing.Queue()
-        p = multiprocessing.Process(target=Devices._get_tf_devices_proc, args=(q,), daemon=True)
-        p.start()
-        p.join()
-        
-        visible_devices = q.get()
+
+        # Windows: NVIDIA driver JIT compute cache. This is a driver-level
+        # cache (still honored by the torch CUDA runtime), kept from the
+        # official behavior. TF-only variables from the official file are
+        # intentionally not set.
+        if sys.platform[0:3] == 'win':
+            appdata = os.environ.get('APPDATA')
+            if appdata:
+                compute_cache_path = Path(appdata) / 'NVIDIA' / ('ComputeCache_ALL')
+                os.environ['CUDA_CACHE_PATH'] = str(compute_cache_path)
+                if not compute_cache_path.exists():
+                    _log_info("Caching GPU kernels...")
+                    compute_cache_path.mkdir(parents=True, exist_ok=True)
+
+        # Enumerate through the backend-neutral registry (in-process;
+        # the official TF subprocess is not needed for torch).
+        devices = []
+        for backend in backends.available_gpu_backends():
+            for info in backend.enumerate_devices():
+                devices.append(info)
+        devices.sort(key=lambda info: info.index)
 
         os.environ['NN_DEVICES_INITIALIZED'] = '1'
-        os.environ['NN_DEVICES_COUNT'] = str(len(visible_devices))
-        
-        for i in visible_devices:
-            dev_type, name, total_mem = visible_devices[i]
+        os.environ['NN_DEVICES_COUNT'] = str(len(devices))
 
-            os.environ[f'NN_DEVICE_{i}_TF_DEV_TYPE'] = dev_type
-            os.environ[f'NN_DEVICE_{i}_NAME'] = name
-            os.environ[f'NN_DEVICE_{i}_TOTAL_MEM'] = str(total_mem)
-            os.environ[f'NN_DEVICE_{i}_FREE_MEM'] = str(total_mem)
-            
-        
+        for i, info in enumerate(devices):
+            os.environ[f'NN_DEVICE_{i}_BACKEND'] = info.backend
+            # 'GPU' keeps the official key/value for TF-era placement code.
+            os.environ[f'NN_DEVICE_{i}_TF_DEV_TYPE'] = 'GPU'
+            os.environ[f'NN_DEVICE_{i}_NAME'] = info.name
+            os.environ[f'NN_DEVICE_{i}_TOTAL_MEM'] = str(info.total_mem)
+            os.environ[f'NN_DEVICE_{i}_FREE_MEM'] = str(info.free_mem)
+            if info.capability is not None:
+                os.environ[f'NN_DEVICE_{i}_CC'] = str(info.capability_int)
 
     @staticmethod
     def getDevices():
         if Devices.all_devices is None:
             if int(os.environ.get("NN_DEVICES_INITIALIZED", 0)) != 1:
                 raise Exception("nn devices are not initialized. Run initialize_main_env() in main process.")
+
             devices = []
-            for i in range ( int(os.environ['NN_DEVICES_COUNT']) ):
-                devices.append ( Device(index=i,
-                                        tf_dev_type=os.environ[f'NN_DEVICE_{i}_TF_DEV_TYPE'],
-                                        name=os.environ[f'NN_DEVICE_{i}_NAME'],
-                                        total_mem=int(os.environ[f'NN_DEVICE_{i}_TOTAL_MEM']),
-                                        free_mem=int(os.environ[f'NN_DEVICE_{i}_FREE_MEM']), )
-                                )
+            for i in range(int(os.environ['NN_DEVICES_COUNT'])):
+                cc_env = os.environ.get(f'NN_DEVICE_{i}_CC')
+                capability = None
+                if cc_env is not None:
+                    cc = int(cc_env)
+                    capability = (cc // 10, cc % 10)
+                devices.append(
+                    Device(
+                        index=i,
+                        tf_dev_type=os.environ[f'NN_DEVICE_{i}_TF_DEV_TYPE'],
+                        name=os.environ[f'NN_DEVICE_{i}_NAME'],
+                        total_mem=int(os.environ[f'NN_DEVICE_{i}_TOTAL_MEM']),
+                        free_mem=int(os.environ[f'NN_DEVICE_{i}_FREE_MEM']),
+                        backend=os.environ.get(f'NN_DEVICE_{i}_BACKEND', 'cuda'),
+                        capability=capability,
+                    )
+                )
             Devices.all_devices = Devices(devices)
 
         return Devices.all_devices
 
-"""
 
-        
-        # {'name'      : name.split(b'\0', 1)[0].decode(),
-        #     'total_mem' : totalMem.value
-        # }
+def ask_choose_device_idxs(choose_only_one=False, allow_cpu=True,
+                           suggest_best_multi_gpu=False, suggest_all_gpu=False):
+    """Official DFL interactive device prompt, moved here from nn.py
+    (Phase 2): DeviceConfig/selection now lives with the device layer.
+    Behavior is unchanged (same prompts, defaults, validation loop)."""
+    devices = Devices.getDevices()
+    if len(devices) == 0:
+        return []
 
-        
-        
-        
-        
-        return
+    all_devices_indexes = [device.index for device in devices]
 
-        
-        
-        
-        min_cc = int(os.environ.get("TF_MIN_REQ_CAP", 35))
-        libnames = ('libcuda.so', 'libcuda.dylib', 'nvcuda.dll')
-        for libname in libnames:
-            try:
-                cuda = ctypes.CDLL(libname)
-            except:
-                continue
+    if choose_only_one:
+        suggest_best_multi_gpu = False
+        suggest_all_gpu = False
+
+    if suggest_all_gpu:
+        best_device_indexes = all_devices_indexes
+    elif suggest_best_multi_gpu:
+        best_device_indexes = [device.index for device in devices.get_equal_devices(devices.get_best_device())]
+    else:
+        best_device_indexes = [devices.get_best_device().index]
+    best_device_indexes = ",".join([str(x) for x in best_device_indexes])
+
+    _log_info("")
+    if choose_only_one:
+        _log_info("Choose one GPU idx.")
+    else:
+        _log_info("Choose one or several GPU idxs (separated by comma).")
+    _log_info("")
+
+    if allow_cpu:
+        _log_info("[CPU] : CPU")
+    for device in devices:
+        _log_info(f"  [{device.index}] : {device.name}")
+
+    _log_info("")
+
+    from core.interact import interact as io
+
+    while True:
+        try:
+            if choose_only_one:
+                choosed_idxs = io.input_str("Which GPU index to choose?", best_device_indexes)
             else:
+                choosed_idxs = io.input_str("Which GPU indexes to choose?", best_device_indexes)
+
+            if allow_cpu and choosed_idxs.lower() == "cpu":
+                choosed_idxs = []
                 break
+
+            choosed_idxs = [int(x) for x in choosed_idxs.split(',')]
+
+            if choose_only_one:
+                if len(choosed_idxs) == 1:
+                    break
+            else:
+                if all([idx in all_devices_indexes for idx in choosed_idxs]):
+                    break
+        except Exception:
+            pass
+    _log_info("")
+
+    return choosed_idxs
+
+
+class DeviceConfig():
+    """Official device-selection semantics (moved from nn.py in Phase 2;
+    nn.DeviceConfig remains an alias so existing call sites are untouched)."""
+
+    @staticmethod
+    def ask_choose_device(*args, **kwargs):
+        return DeviceConfig.GPUIndexes(ask_choose_device_idxs(*args, **kwargs))
+
+    def __init__(self, devices=None):
+        # Official semantics: devices is always a Devices container
+        # (model code calls e.g. device_config.devices.get_worst_device()).
+        devices = devices or []
+        if not isinstance(devices, Devices):
+            devices = Devices(devices)
+
+        self.devices = devices
+        self.cpu_only = len(devices) == 0
+
+    @staticmethod
+    def CPU():
+        return DeviceConfig([])
+
+    @staticmethod
+    def BestGPU():
+        devices = Devices.getDevices()
+        if len(devices) == 0:
+            return DeviceConfig.CPU()
+
+        return DeviceConfig([devices.get_best_device()])
+
+    @staticmethod
+    def WorstGPU():
+        devices = Devices.getDevices()
+        if len(devices) == 0:
+            return DeviceConfig.CPU()
+
+        return DeviceConfig([devices.get_worst_device()])
+
+    @staticmethod
+    def GPUIndexes(indexes):
+        if len(indexes) != 0:
+            devices = Devices.getDevices().get_devices_from_index_list(indexes)
         else:
-            return Devices([])
+            devices = []
 
-        nGpus = ctypes.c_int()
-        name = b' ' * 200
-        cc_major = ctypes.c_int()
-        cc_minor = ctypes.c_int()
-        freeMem = ctypes.c_size_t()
-        totalMem = ctypes.c_size_t()
+        return DeviceConfig(devices)
 
-        result = ctypes.c_int()
-        device = ctypes.c_int()
-        context = ctypes.c_void_p()
-        error_str = ctypes.c_char_p()
 
-        devices = []
+# --- model-facing device API (Phase 2) ---------------------------------
+# Model/leras code should use these instead of torch.cuda.is_available()/
+# get_device_name()/mem_get_info()/synchronize(); the backend is resolved
+# through the registry, so future non-CUDA backends only touch this layer.
 
-        if cuda.cuInit(0) == 0 and \
-            cuda.cuDeviceGetCount(ctypes.byref(nGpus)) == 0:
-            for i in range(nGpus.value):
-                if cuda.cuDeviceGet(ctypes.byref(device), i) != 0 or \
-                    cuda.cuDeviceGetName(ctypes.c_char_p(name), len(name), device) != 0 or \
-                    cuda.cuDeviceComputeCapability(ctypes.byref(cc_major), ctypes.byref(cc_minor), device) != 0:
-                    continue
+def get_backend(device):
+    """Resolve the backend for a Device or torch.device.
 
-                if cuda.cuCtxCreate_v2(ctypes.byref(context), 0, device) == 0:
-                    if cuda.cuMemGetInfo_v2(ctypes.byref(freeMem), ctypes.byref(totalMem)) == 0:
-                        cc = cc_major.value * 10 + cc_minor.value
-                        if cc >= min_cc:
-                            devices.append ( {'name'      : name.split(b'\0', 1)[0].decode(),
-                                              'total_mem' : totalMem.value,
-                                              'free_mem'  : freeMem.value,
-                                              'cc'        : cc
-                                              })
-                    cuda.cuCtxDetach(context)
+    ``None`` or a CPU torch.device resolve to the CPU backend (DFL
+    semantics: empty device list == CPU).
+    """
+    if device is None:
+        return backends.get_backend('cpu')
+    if isinstance(device, Device):
+        return backends.get_backend(device.backend)
+    if isinstance(device, torch.device):
+        if device.type == 'cuda':
+            return backends.get_backend('cuda')
+        if device.type == 'cpu':
+            return backends.get_backend('cpu')
+    raise TypeError(f"unsupported device for backend resolution: {device!r}")
 
-        os.environ['NN_DEVICES_COUNT'] = str(len(devices))
-        for i, device in enumerate(devices):
-            os.environ[f'NN_DEVICE_{i}_NAME'] = device['name']
-            os.environ[f'NN_DEVICE_{i}_TOTAL_MEM'] = str(device['total_mem'])
-            os.environ[f'NN_DEVICE_{i}_FREE_MEM'] = str(device['free_mem'])
-            os.environ[f'NN_DEVICE_{i}_CC'] = str(device['cc'])
-"""
+
+def get_torch_device(device):
+    """Map a Device (or torch.device, or None == CPU) to a torch.device
+    without any CUDA-specific call in the caller."""
+    backend = get_backend(device)
+    if device is None:
+        return backend.torch_device(None)
+    if isinstance(device, Device):
+        return backend.torch_device(device.index)
+    return device  # already a torch.device
+
+
+def synchronize(device):
+    """Synchronize work on the given Device/torch.device (CPU: no-op)."""
+    backend = get_backend(device)
+    if device is None or isinstance(device, Device):
+        index = None if device is None else device.index
+        backend.synchronize(backend.torch_device(index))
+    else:
+        backend.synchronize(device)
+
+
+def memory_info(device):
+    """Return (free_bytes, total_bytes) for the device, or None if the
+    backend cannot report it."""
+    backend = get_backend(device)
+    index = None if device is None else device.index
+    return backend.memory_info(index)
