@@ -16,9 +16,10 @@ Phase 3A: torch-only foundation.
   (official-format serialization, strict load), and
   core.leras.initializers (initialization lifecycle)
 
-Remaining TensorFlow-dependent leras areas (later Phase 3 subphases):
-layers/* concrete layers, ops/* (incl. depth_to_space, Phase 3B/4),
-optimizers/* (3B), archis/* (3B), models/* (Phases 6-8).
+Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
+model phases): ops/* (Phase 3C migrated depth_to_space; the rest of
+the official ops are preserved in ops/ops_tf.py and rebuilt in later
+subphases), optimizers/*, archis/*, models/* (Phases 6-8).
 
 NCHW speed up training for 10-20%.
 """
@@ -60,13 +61,15 @@ class nn():
             nn.torch = torch
 
             # Torch foundation registries (Phase 3A: layers foundation and
-            # initializers). The remaining leras subpackages (ops,
-            # optimizers, archis, models) are rebuilt in later Phase 3
-            # subphases / model phases and are imported by their own
-            # subphase entry points.
+            # initializers; Phase 3C: torch ops, starting with the
+            # official-compatible depth_to_space). The remaining leras
+            # subpackages (remaining ops, optimizers, archis, models) are
+            # rebuilt in later Phase 3 subphases / model phases and are
+            # imported by their own subphase entry points.
             import core.leras.layers  # noqa: F401
             import core.leras.initializers  # noqa: F401
             import core.leras.checkpoint  # noqa: F401
+            import core.leras.ops  # noqa: F401
 
         torch = nn.torch
 
