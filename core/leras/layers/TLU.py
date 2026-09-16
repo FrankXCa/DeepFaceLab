@@ -1,33 +1,47 @@
+"""TLU — torch implementation of the official leras contract (Phase 3B).
+
+The official DFL "TLU" (docstring references the FRN paper, but the
+implementation is the leaky unit):
+    y = max(x, tau)
+with ``tau`` (in_ch,) a zero-initialized checkpoint variable — the
+torch implementation preserves that parameter name exactly, so the
+official checkpoint key is ``tau:0``.
+
+Device/dtype: nn.device / nn.floatx via the Phase 2 abstraction.
+"""
+
+import torch
+
 from core.leras import nn
-tf = nn.tf
+from .LayerBase import LayerBase
 
-class TLU(nn.LayerBase):
-    """
-    Tensorflow implementation of
-    Filter Response Normalization Layer: Eliminating Batch Dependence in theTraining of Deep Neural Networks
-    https://arxiv.org/pdf/1911.09737.pdf
-    """
-    def __init__(self, in_ch, dtype=None, **kwargs):
+
+class TLU(LayerBase):
+    def __init__(self, in_ch, dtype=None, name=None, **kwargs):
         self.in_ch = in_ch
-
         if dtype is None:
-            dtype = nn.floatx
+            dtype = nn.floatx if nn.floatx is not None else torch.float32
         self.dtype = dtype
 
-        super().__init__(**kwargs)
+        super().__init__(name=name, **kwargs)
 
     def build_weights(self):
-        self.tau = tf.get_variable("tau", (self.in_ch,), dtype=self.dtype, initializer=tf.initializers.zeros() )
+        self.tau = torch.nn.Parameter(
+            torch.empty(self.in_ch, device=nn.device, dtype=self.dtype)
+        )
+        self.register_param_initializer("tau", nn.initializers.zeros)
 
     def get_weights(self):
         return [self.tau]
 
     def forward(self, x):
-        if nn.data_format == "NHWC":
-            shape = (1,1,1,self.in_ch)
-        else:
-            shape = (1,self.in_ch,1,1)
+        shape = (1, self.in_ch, 1, 1) if nn.data_format == "NCHW" else (1, 1, 1, self.in_ch)
+        tau = self.tau.view(shape)
+        return torch.maximum(x, tau)
 
-        tau = tf.reshape ( self.tau, shape )
-        return tf.math.maximum(x, tau)
+    def __str__(self):
+        r = f"{self.__class__.__name__} : in_ch:{self.in_ch} "
+        return r
+
+
 nn.TLU = TLU
