@@ -30,9 +30,14 @@ official defects must not be reintroduced):
 - a shape mismatch is an error (official reshaped greedily);
 - loading is all-or-nothing: everything is validated before anything
   is copied. Layout differences between the official checkpoint layout
-  and the torch layout are resolved through the per-layer
-  ``convert_weight_layout`` hook (identity in Phase 3A; real conversions
-  land with the layers / Phase 4 converter).
+  and the torch layout are resolved through the paired per-layer hooks
+  ``convert_weight_layout`` (official -> torch, applied on load) and
+  ``convert_weight_to_official`` (torch -> official, applied on save;
+  identity in Phase 3A, real conversions land with the Phase 3B layers).
+  Files written by ``save_weights`` therefore always carry the official
+  DFL layouts — readable by official DeepFaceLab directly — and
+  ``load_weights`` accepts official-layout files (including files this
+  project wrote), keeping the round-trip lossless.
 """
 
 import pickle
@@ -60,12 +65,15 @@ class Saveable():
         weights = self.get_weights()
         if len(weights) == 0:
             return []
-        return [
+        result = []
+        for w in weights:
             # numpy has no bfloat16; store it as float32 (External A concept)
-            w.detach().cpu().to(torch.float32).numpy() if w.dtype == torch.bfloat16
-            else w.detach().cpu().numpy()
-            for w in weights
-        ]
+            arr = (w.detach().cpu().to(torch.float32).numpy()
+                   if w.dtype == torch.bfloat16
+                   else w.detach().cpu().numpy())
+            # official-layout output (identity unless a layer overrides)
+            result.append(self.convert_weight_to_official(arr, w))
+        return result
 
     def set_weights(self, new_weights):
         weights = self.get_weights()
@@ -126,6 +134,9 @@ class Saveable():
             if arr.dtype == torch.bfloat16:
                 arr = arr.to(torch.float32)
             arr = arr.numpy().copy()
+            # always write official DFL layouts to disk (identity unless a
+            # layer overrides), so saved files are official-readable
+            arr = self.convert_weight_to_official(arr, w)
             if force_dtype is not None:
                 arr = arr.astype(force_dtype)
             d[sub_name] = arr
@@ -196,13 +207,22 @@ class Saveable():
         return True
 
     def convert_weight_layout(self, value, param):
-        """Convert a loaded checkpoint array to the torch layout of
-        ``param``. Identity in Phase 3A: the official conv kernel layout
-        (H,W,in,out) / dense (in,out) conversions are implemented by the
-        layer classes (Phase 3B) and the Phase 4 converter. Overriding
-        this hook is how a layer declares its layout difference — the
-        hook is the clean path for Phase 4, no ad-hoc reshaping elsewhere.
+        """Convert a loaded (official-layout) checkpoint array to the
+        torch layout of ``param``. Identity unless the layer overrides
+        it: the conv kernel (H,W,in,out) / conv-transpose (H,W,out,in) /
+        depthwise (H,W,in,depth) / dense conversions are implemented by
+        the Phase 3B layer classes (and reused by the Phase 4
+        converter). Overriding this hook is how a layer declares its
+        layout difference — the clean path for Phase 4, no ad-hoc
+        reshaping elsewhere.
         """
+        return value
+
+    def convert_weight_to_official(self, value, param):
+        """Inverse of ``convert_weight_layout``: torch-layout array ->
+        official DFL checkpoint layout, applied by ``save_weights`` and
+        ``get_weights_np`` so files on disk are always official-layout.
+        Identity unless the layer overrides it."""
         return value
 
     def get_param_initializers(self):
