@@ -1,18 +1,12 @@
+# Phase 3A: torch leras foundation only.
+#
+# Saveable and LayerBase are the torch foundation (official contract,
+# torch implementation). The concrete layer modules (Conv2D,
+# Conv2DTranspose, DepthwiseConv2D, Dense, BatchNorm2D, InstanceNorm2D,
+# FRNorm2D, BlurPool, TLU, ScaleAdd, DenseNorm, AdaIN, TanhPolar) are
+# still the TensorFlow versions on disk and are recorded as dead code
+# until they are rebuilt in Phase 3B; they are intentionally NOT
+# imported here, so importing core.leras.layers never touches
+# TensorFlow.
 from .Saveable import *
 from .LayerBase import *
-
-from .Conv2D import *
-from .Conv2DTranspose import *
-from .DepthwiseConv2D import *
-from .Dense import *
-from .BlurPool import *
-
-from .BatchNorm2D import *
-from .InstanceNorm2D import *
-from .FRNorm2D import *
-
-from .TLU import *
-from .ScaleAdd import *
-from .DenseNorm import *
-from .AdaIN import *
-from .TanhPolar import *

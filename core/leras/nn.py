@@ -2,29 +2,33 @@
 Leras.
 
 like lighter keras.
-This is my lightweight neural network library written from scratch
-based on pure tensorflow without keras.
+This is my lightweight neural network library written from scratch.
 
-Provides:
-+ full freedom of tensorflow operations without keras model's restrictions
-+ easy model operations like in PyTorch, but in graph mode (no eager execution)
-+ convenient and understandable logic
+Phase 3A: torch-only foundation.
++ the TensorFlow graph/session layer is replaced by a torch foundation:
+  nn.torch (the torch module), nn.device (a torch.device placed through
+  the Phase 2 backend-neutral device abstraction), nn.floatx (torch
+  dtype), and the data-format helpers preserved from the official API
++ model/layer code creates parameters with device=nn.device and
+  dtype=nn.floatx and must not call torch.cuda.* directly
++ checkpoint/initialization contracts: see core.leras.checkpoint
+  (official DFL variable naming), core.leras.layers.Saveable
+  (official-format serialization, strict load), and
+  core.leras.initializers (initialization lifecycle)
 
-Reasons why we cannot import tensorflow or any tensorflow.sub modules right here:
-1) program is changing env variables based on DeviceConfig before import tensorflow
-2) multiprocesses will import tensorflow every spawn
+Remaining TensorFlow-dependent leras areas (later Phase 3 subphases):
+layers/* concrete layers, ops/* (incl. depth_to_space, Phase 3B/4),
+optimizers/* (3B), archis/* (3B), models/* (Phases 6-8).
 
 NCHW speed up training for 10-20%.
 """
 
-import os
-import sys
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-from pathlib import Path
+
 import numpy as np
-from core.interact import interact as io
-from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (Phase 2: device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
+
+from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
 
 
 class nn():
@@ -36,100 +40,52 @@ class nn():
     DeviceConfig = DeviceConfig
     ask_choose_device_idxs = staticmethod(ask_choose_device_idxs)
 
-    tf = None
-    tf_sess = None
-    tf_sess_config = None
-    tf_default_device_name = None
-    
+    torch = None
+    device = None
+
     data_format = None
     conv2d_ch_axis = None
     conv2d_spatial_axes = None
 
-    floatx = None
-    
+    floatx = None  # torch dtype
+
     @staticmethod
     def initialize(device_config=None, floatx="float32", data_format="NHWC"):
+        if device_config is None:
+            device_config = nn.getCurrentDeviceConfig()
+        nn.setCurrentDeviceConfig(device_config)
 
-        if nn.tf is None:
-            if device_config is None:
-                device_config = nn.getCurrentDeviceConfig()
-            nn.setCurrentDeviceConfig(device_config)
+        if nn.torch is None:
+            import torch
+            nn.torch = torch
 
-            # Manipulate environment variables before import tensorflow
+            # Torch foundation registries (Phase 3A: layers foundation and
+            # initializers). The remaining leras subpackages (ops,
+            # optimizers, archis, models) are rebuilt in later Phase 3
+            # subphases / model phases and are imported by their own
+            # subphase entry points.
+            import core.leras.layers  # noqa: F401
+            import core.leras.initializers  # noqa: F401
+            import core.leras.checkpoint  # noqa: F401
 
-            first_run = False
-            if len(device_config.devices) != 0:
-                if sys.platform[0:3] == 'win':
-                    # Windows specific env vars
-                    if all( [ x.name == device_config.devices[0].name for x in device_config.devices ] ):
-                        devices_str = "_" + device_config.devices[0].name.replace(' ','_')
-                    else:
-                        devices_str = ""
-                        for device in device_config.devices:
-                            devices_str += "_" + device.name.replace(' ','_')
+        torch = nn.torch
 
-                    compute_cache_path = Path(os.environ['APPDATA']) / 'NVIDIA' / ('ComputeCache' + devices_str)
-                    if not compute_cache_path.exists():
-                        first_run = True
-                        compute_cache_path.mkdir(parents=True, exist_ok=True)
-                    os.environ['CUDA_CACHE_PATH'] = str(compute_cache_path)
-            
-            if first_run:
-                io.log_info("Caching GPU kernels...")
-
-            import tensorflow
-
-            tf_version = tensorflow.version.VERSION
-            #if tf_version is None:
-            #    tf_version = tensorflow.version.GIT_VERSION
-            if tf_version[0] == 'v':
-                tf_version = tf_version[1:]
-            if tf_version[0] == '2':
-                tf = tensorflow.compat.v1
-            else:
-                tf = tensorflow
-
-            import logging
-            # Disable tensorflow warnings
-            tf_logger = logging.getLogger('tensorflow')
-            tf_logger.setLevel(logging.ERROR)
-            
-            if tf_version[0] == '2':
-                tf.disable_v2_behavior()
-            nn.tf = tf
-
-            # Initialize framework
-            import core.leras.ops
-            import core.leras.layers
-            import core.leras.initializers
-            import core.leras.optimizers
-            import core.leras.models
-            import core.leras.archis
-            
-            # Configure tensorflow session-config
-            if len(device_config.devices) == 0:
-                config = tf.ConfigProto(device_count={'GPU': 0})
-                nn.tf_default_device_name = '/CPU:0'
-            else:
-                nn.tf_default_device_name = f'/{device_config.devices[0].tf_dev_type}:0'
-                
-                config = tf.ConfigProto()
-                config.gpu_options.visible_device_list = ','.join([str(device.index) for device in device_config.devices])
-                
-            config.gpu_options.force_gpu_compatible = True
-            config.gpu_options.allow_growth = True
-            nn.tf_sess_config = config
-            
-        if nn.tf_sess is None:
-            nn.tf_sess = tf.Session(config=nn.tf_sess_config)
+        # Device placement goes through the Phase 2 backend-neutral
+        # device abstraction: CPU when no device is selected, otherwise
+        # the backend (CUDA today; AMD/Intel future) resolves the
+        # torch.device. No CUDA-specific call appears here.
+        if len(device_config.devices) == 0:
+            nn.device = torch.device('cpu')
+        else:
+            from .device import get_torch_device
+            nn.device = get_torch_device(device_config.devices[0])
 
         if floatx == "float32":
-            floatx = nn.tf.float32
+            nn.set_floatx(torch.float32)
         elif floatx == "float16":
-            floatx = nn.tf.float16
+            nn.set_floatx(torch.float16)
         else:
             raise ValueError(f"unsupported floatx {floatx}")
-        nn.set_floatx(floatx)
         nn.set_data_format(data_format)
 
     @staticmethod
@@ -137,11 +93,51 @@ class nn():
         Devices.initialize_main_env()
 
     @staticmethod
-    def set_floatx(tf_dtype):
+    def init_weights(target):
+        """Torch form of the official ``nn.init_weights``: apply the
+        per-parameter initializers that ``target`` (a torch module,
+        e.g. a LayerBase) registered in ``build_weights`` (via
+        ``register_param_initializers``/``get_param_initializers``,
+        keyed by the torch registered parameter name) to its DIRECT
+        parameters and buffers.
+
+        - a parameter without a registered initializer keeps the value
+          given at construction (explicit, never filled silently);
+        - the DFL ``ca`` initializer placeholder fails loudly until its
+          subprocess batch generation lands in Phase 3B;
+        - modules composing sub-layers (archis) override
+          ``init_weights()`` to cascade to their children, like the
+          official archis do.
+        """
+        if not isinstance(target, nn.torch.nn.Module):
+            return
+
+        torch = nn.torch
+        registered = target.get_param_initializers()
+        direct = dict(target.named_parameters(recurse=False))
+        direct.update(dict(target.named_buffers(recurse=False)))
+
+        for name, param in direct.items():
+            initializer = registered.get(name)
+            if initializer is None:
+                continue
+            if initializer is nn.initializers.ca:
+                raise NotImplementedError(
+                    f"parameter '{name}' uses nn.initializers.ca whose "
+                    "batch generation is not implemented yet (Phase 3B)"
+                )
+            with torch.no_grad():
+                shape = tuple(param.shape)
+                param.copy_(
+                    initializer(shape, dtype=param.dtype).to(device=param.device)
+                )
+
+    @staticmethod
+    def set_floatx(torch_dtype):
         """
         set default float type for all layers when dtype is None for them
         """
-        nn.floatx = tf_dtype
+        nn.floatx = torch_dtype
 
     @staticmethod
     def set_data_format(data_format):
@@ -190,18 +186,14 @@ class nn():
 
     @staticmethod
     def reset_session():
-        if nn.tf is not None:
-            if nn.tf_sess is not None:
-                nn.tf.reset_default_graph()
-                nn.tf_sess.close()
-                nn.tf_sess = nn.tf.Session(config=nn.tf_sess_config)
+        # Torch foundation: there is no TF graph/session to reset; memory is
+        # managed by torch's caching allocator. Kept as an API no-op so
+        # existing call sites (reworked in later phases) keep working.
+        pass
 
     @staticmethod
     def close_session():
-        if nn.tf_sess is not None:
-            nn.tf.reset_default_graph()
-            nn.tf_sess.close()
-            nn.tf_sess = None
+        pass
 
     # Phase 2: device-selection semantics (DeviceConfig, ask_choose_device_idxs)
     # live in core.leras.device and are exposed on this class, so
