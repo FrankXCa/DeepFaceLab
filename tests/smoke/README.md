@@ -83,8 +83,32 @@ Populated in Phase 3C:
   and an AST check that the ops source contains no `torch.cuda` or
   `cuda:` literals.
 
-Current counts (2026-09, after Phase 3C): CUDA environment 108
-passed; CPU environment 98 passed + 10 skipped.
+Populated in Phase 3D:
+
+- `test_ops_core.py` — Phase 3D acceptance for the core numerical
+  ops with official semantics: `dssim` (parity vs an independent
+  NumPy reference of the official formula - arange-centered
+  softmax-normalized window, **VALID** convolution, the official
+  luminance×cs expressions, (N, C) reduction, even filter sizes like
+  22, identical/different inputs, dtype round-trip and mismatch
+  rejection, gradient smoke), `gaussian_blur` (kernel normalization,
+  impulse response at the kernel-center tap, interior constant
+  preservation with the official zero-padded edge behavior, the
+  sigma values used by the official models 2/4/8/32, non-square
+  shapes, gradient smoke), `style_loss` (per-channel TF-moments
+  formula - both terms squared, per-sample (N,) results,
+  loss_weight scaling, identical-input zero, shifted/scaled inputs,
+  channel-mismatch rejection, the blurred-radius path, and an
+  explicit test proving the implementation is NOT the External A/B
+  gram-matrix variant), `pixel_norm` (official epsilon 1e-6 with a
+  test that discriminates it from External B's 1e-8, zero/near-zero
+  stability, per-axis behavior, gradient smoke); plus GPU execution
+  on the RTX 4090 with CPU-vs-GPU parity (skip-if-CPU-only), the
+  NHWC boundary contract, the TensorFlow import boundary, and the
+  no-direct-CUDA AST check.
+
+Current counts (2026-09, after Phase 3D): CUDA environment 132
+passed; CPU environment 121 passed + 11 skipped.
 
 Environments (git-ignored, created with `uv`):
 
