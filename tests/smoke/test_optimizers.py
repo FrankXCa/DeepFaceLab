@@ -20,9 +20,18 @@ random_binomial op (official lr_dropout mask source):
 - NO bias correction / NO momentum / NO weight decay (official
   has none; third-party additions are not adopted)
 - lr_cos schedule: official literal 2*3.1415926535/lr_cos and the
-  POST-increment iteration count (official TF queue-order
-  semantics, matching USER_LEGACY/EXTERNAL_A) - pinned by a
-  step-1 discrimination test
+  POST-increment iteration count - the current COMPATIBILITY
+  ASSUMPTION for the official TF queue-order semantics, labeled
+  STRUCTURALLY_INFERRED / TF_RUNTIME_NOT_VERIFIED: the official
+  graph builds the assign_add(iters, 1) op first and groups it
+  with the update ops that read iters, but there is NO data or
+  control dependency between them and tf.group imposes no order,
+  so the TF runtime does not guarantee the ordering - the
+  post-increment reading follows the graph construction order,
+  the TF1 executor's FIFO work-queue practice, and the
+  independent choices of USER_LEGACY/EXTERNAL_A, and the official
+  TF runtime was never executed in this project (no TF runtime
+  parity is claimed) - pinned by a step-1 discrimination test
 - global-norm gradient clipping (float32 global norm over ALL
   gradients, per-gradient c/n scaling, never per-parameter norms)
 - lr_dropout: ONE FRESH mask per parameter per step (the official
@@ -274,8 +283,13 @@ def test_adabelief_official_epsilon_is_finfo_resolution():
 def test_adabelief_lr_cos_post_increment_schedule():
     # fresh state + large constant gradient: the per-element update is
     # proportional to the per-step lr, so the weight decrement pins the
-    # cosine schedule. The official TF queue order (assign_add queued
-    # before the updates) means step 1 uses iters=1, not iters=0.
+    # cosine schedule. Step 1 uses iters=1 (post-increment) per the
+    # COMPATIBILITY ASSUMPTION: STRUCTURALLY_INFERRED from the
+    # official graph construction order (assign_add grouped first)
+    # + the TF1 executor FIFO work-queue practice + USER_LEGACY /
+    # EXTERNAL_A; the official TF runtime never executed this (the
+    # graph has no ordering guarantee between the increment and the
+    # reads) - TF_RUNTIME_NOT_VERIFIED, no TF runtime parity claimed.
     g_np = np.full((2, 2), 10.0, np.float64)
     x = _param((2, 2), values=np.full((2, 2), 10.0, np.float32), name="w:0")
     opt = dfl_nn.AdaBelief(lr=1.0, lr_cos=8, name="t")
@@ -298,7 +312,9 @@ def test_adabelief_lr_cos_post_increment_schedule():
     # step-1 discrimination: post-increment gives lr_mult=(cos(pi/4)+1)/2
     # = 0.8536; a pre-increment implementation would have used 1.0 -
     # the reference above only matches the post-increment schedule, so
-    # the parity asserts above pin the official queue-order behavior.
+    # the parity asserts above pin the ASSUMED official queue-order
+    # behavior (compatibility assumption, STRUCTURALLY_INFERRED;
+    # TF_RUNTIME_NOT_VERIFIED).
     mult_post = float(_ref_lr_cos_mult(1, 8))
     mult_pre = float(_ref_lr_cos_mult(0, 8))
     assert mult_post == pytest.approx(0.8535534, abs=1e-6)
@@ -527,6 +543,10 @@ def test_rmsprop_zero_gradient_exact_noop():
 
 
 def test_rmsprop_lr_cos_post_increment():
+    # same compatibility assumption as the AdaBelief lr_cos test:
+    # STRUCTURALLY_INFERRED post-increment (the official graph
+    # builds assign_add first; no TF ordering guarantee;
+    # TF_RUNTIME_NOT_VERIFIED, no TF runtime parity claimed)
     g_np = np.full((2,), 10.0, np.float64)
     x = _param((2,), values=np.full((2,), 10.0, np.float32), name="z:0")
     opt = dfl_nn.RMSprop(lr=1.0, lr_cos=8, name="t")
