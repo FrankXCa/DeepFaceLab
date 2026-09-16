@@ -16,18 +16,19 @@ reference code, never imported by torch paths):
   the SAEHD/AMP/XSeg archi dense<->map transitions),
   ``average_tensor_list``, ``total_variation_mse`` (reduction/loss
   helpers used by the official model code).
+- Phase 3E2: ``random_binomial`` (the official lr_dropout mask
+  source for the migrated AdaBelief/RMSprop optimizers).
 
 Still TensorFlow (later Phase 3 subphases / model phases; see
 ``ops/ops_tf.py``): rgb_to_lab (dead in the official baseline - no
 callers; documented deferral), gelu (no baseline callers),
 upsample2d (FANExtractor - facelib TF code), resize2d_* (FaceEnhancer
 - facelib TF code), max_pool (no nn-namespace callers in the
-baseline), space_to_depth (no baseline callers), random_binomial
-(-> Phase 3E2 with the optimizers that are its only consumers),
-tf_gradients/nn.gradients + average_gv_list (-> Phase 3E2
-optimizer/multi-GPU gradient flow), batch_set_value/tf_get_value
-(session machinery - disappears under the torch foundation),
-bilinear_sampler (TanhPolar phase).
+baseline), space_to_depth (no baseline callers),
+tf_gradients/nn.gradients + average_gv_list (-> the model-phase
+gradient flow / dedicated multi-GPU phase), batch_set_value/
+tf_get_value (session machinery - disappears under the torch
+foundation), bilinear_sampler (TanhPolar phase).
 
 Importing this package never touches TensorFlow.
 
@@ -161,6 +162,31 @@ flatten / reshape_4D / average_tensor_list / total_variation_mse
   (the USER_LEGACY NCHW branch and External A both deviate; External
   A additionally returns a global scalar MEAN - rejected on both
   counts: sum not mean, (N,) not scalar).
+
+random_binomial (Phase 3E2)
+===========================
+
+The official DFL op (the lr_dropout mask source for AdaBelief/RMSprop
+- the ONLY baseline consumers):
+
+    where(random_uniform(shape, seed=...) < p, ones(shape, dtype),
+          zeros(shape, dtype))
+
+- P(mask == 1) == p; values are exactly 0/1 in the given ``dtype``.
+  The official compares a FLOAT16 random draw (a TF precision quirk);
+  the torch implementation draws in float32, distributionally
+  equivalent. Exact TensorFlow RNG-stream parity is NOT claimed and
+  NOT verified (no TF environment in this project).
+- the official ``seed=None`` path picks a fresh random seed per call
+  (``np.random.randint(10e6)``); under torch a given ``seed``
+  initializes a local generator (deterministic per call) and
+  ``seed=None`` draws from the global torch RNG - the optimizers
+  rely on the per-call resampling (one fresh mask per optimizer
+  step, exactly like the official TF graph re-evaluating its random
+  op on every run of the update op).
+- the optional ``device`` keyword is a torch-only convenience for
+  placing the mask where the optimizers need it; the official
+  signature parameters (shape, p, dtype, seed) are all preserved.
 """
 
 import numpy as np
@@ -447,6 +473,32 @@ def total_variation_mse(images):
             + torch.square(pixel_dif2).sum(dim=(1, 2, 3)))
 
 
+# ---------------------------------------------------------------------------
+# Phase 3E2: random_binomial (lr_dropout mask source for the optimizers)
+# ---------------------------------------------------------------------------
+
+def random_binomial(shape, p=0.0, dtype=None, seed=None, device=None):
+    """Official DFL random_binomial: ``where(random_uniform(shape) <
+    p, ones(shape, dtype), zeros(shape, dtype))``. See the module
+    docstring for the RNG-stream parity limitations (the official
+    float16 comparison quirk is a distributionally-equivalent TF
+    detail; a given seed uses a local torch generator, so the mask
+    sequence is deterministic per seed but NOT the TF stream)."""
+    if dtype is None:
+        dtype = torch.float32
+    dev = device if device is not None else "cpu"
+    if seed is None:
+        # global RNG stream (official: a fresh random seed per call)
+        mask = torch.rand(shape, dtype=torch.float32, device=dev) < p
+    else:
+        # deterministic per seed: a local generator (NOT the TF stream)
+        generator = torch.Generator(device=dev)
+        generator.manual_seed(seed)
+        mask = torch.rand(shape, dtype=torch.float32, device=dev,
+                          generator=generator) < p
+    return mask.to(dtype)
+
+
 nn.depth_to_space = depth_to_space
 nn.dssim = dssim
 nn.gaussian_blur = gaussian_blur
@@ -456,3 +508,4 @@ nn.flatten = flatten
 nn.reshape_4D = reshape_4D
 nn.average_tensor_list = average_tensor_list
 nn.total_variation_mse = total_variation_mse
+nn.random_binomial = random_binomial
