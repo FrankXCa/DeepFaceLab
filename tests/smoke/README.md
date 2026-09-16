@@ -46,8 +46,25 @@ Populated in Phase 3A:
   (sandbox-safe makedirs-based temp directories; also used unchanged
   in style by the Phase 1 fixture).
 
-Current counts (2026-09, after Phase 3A): CUDA environment 42 passed;
-CPU environment 34 passed + 8 skipped.
+Populated in Phase 3B:
+
+- `test_leras_layers.py` — Phase 3B concrete layer acceptance for all
+  12 migrated layers (Conv2D, Conv2DTranspose, DepthwiseConv2D,
+  Dense, DenseNorm, BatchNorm2D, InstanceNorm2D, FRNorm2D, BlurPool,
+  AdaIN, TLU, ScaleAdd): config/type errors, two-phase build
+  lifecycle, official parameter names/shapes, dtype/device via the
+  Phase 2 abstraction, forward shape + parity vs manual NumPy
+  references (deterministic unique-value tensors; WITHIN_TOLERANCE
+  1e-4 or EXACT per test), CPU always / RTX 4090 GPU execution
+  (skip-if-CPU-only), naming stability across repeated construction,
+  Saveable round-trips producing OFFICIAL-layout `.npy` files,
+  synthetic official->torch layout conversions with exact index maps,
+  strict invalid-shape rejection, import boundary (no TensorFlow),
+  and an AST check that no layer source calls `torch.cuda` or
+  hardcodes `'cuda:'` device strings.
+
+Current counts (2026-09, after Phase 3B): CUDA environment 86 passed;
+CPU environment 77 passed + 9 skipped.
 
 Environments (git-ignored, created with `uv`):
 
