@@ -1,12 +1,36 @@
-tqdm
-numpy==1.19.3
-numexpr
-h5py==2.10.0
-opencv-python==4.1.0.25
-ffmpeg-python==0.1.17
-scikit-image==0.14.2
-scipy==1.4.1
-colorama
-tensorflow-gpu==2.4.0
-pyqt5
-tf2onnx==1.9.3
+# DeepFaceLab modernization — CUDA runtime baseline (Phase 1)
+#
+# Windows 11. Tested with Python 3.12.11 (3.11 also supported).
+# Tested machine: NVIDIA GeForce RTX 4090, driver 591.86 (CUDA 13.1).
+#
+#   - RTX 4090 (Ada, sm_89):  TESTED in Phase 1
+#   - RTX 50 series (Blackwell, sm_120): TARGET — cu130 wheels are
+#     dependency-level compatible; no Blackwell hardware was tested.
+#
+# Install:
+#   uv venv .venv --python 3.12
+#   uv pip install --index-strategy unsafe-best-match \
+#       -r requirements-cuda.txt -r requirements-dev.txt
+# (pip users: plain `pip install -r` is fine; the uv flag is needed
+# because the PyTorch index mirrors a few numpy versions and uv's
+# default first-index-wins strategy would otherwise miss numpy on PyPI.)
+#
+# CPU-only variant (import/fallback path): see requirements-cpu.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# --- required runtime ---
+# torch is pinned to the Blackwell-capable cu130 build, fetched from the
+# PyTorch index above (the local version tag only exists on that index).
+# Driver-restricted systems (cu128 line only) can use the last cu128-line
+# release, torch==2.11.0+cu128, from https://download.pytorch.org/whl/cu128.
+torch==2.14.0+cu130
+numpy==2.5.3
+
+# --- optional (not part of the Phase 1 baseline) ---
+# torchvision — revisit in Phase 9 (extractors) if needed
+# onnx          — required in Phase 11 (DFM/ONNX export)
+# opencv-python — required in Phase 9 (extractors)
+#
+# Deliberately excluded from this phase (IMPLEMENTATION_PLAN.md section 12):
+# FP8, INT4, NVFP4, TorchAO, TensorRT

@@ -1,0 +1,18 @@
+# DeepFaceLab modernization — CPU-only runtime baseline (Phase 1)
+#
+# Validates the CPU import/fallback path: a torch build without CUDA
+# libraries, so the baseline must import and run basic tensor work on
+# CPU alone. Same Python baseline as requirements-cuda.txt.
+#
+# Install:
+#   uv venv .venv-cpu --python 3.12
+#   uv pip install --index-strategy unsafe-best-match \
+#       -r requirements-cpu.txt -r requirements-dev.txt
+# (pip users: plain `pip install -r` is fine; see requirements-cuda.txt
+# for why the uv flag is needed.)
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- required runtime (CPU variant) ---
+torch==2.14.0+cpu
+numpy==2.5.3

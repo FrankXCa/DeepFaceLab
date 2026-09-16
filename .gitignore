@@ -29,8 +29,8 @@ htmlcov/
 # --- Local environments / embedded runtimes ---
 # Covers virtualenvs, embedded Python distributions, and the legacy
 # bundle's spoofed user-environment directories.
-.venv/
-venv/
+.venv*/
+venv*/
 env/
 _e/
 _internal/
@@ -68,6 +68,7 @@ pretrain_faces/
 .nvidia/
 nv_cache/
 torchinductor/
+.pytest-tmp/
 *.tmp
 
 # --- Personal media ---

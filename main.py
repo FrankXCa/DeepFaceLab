@@ -15,8 +15,8 @@ if __name__ == "__main__":
     from pathlib import Path
     from core.interact import interact as io
 
-    if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 6):
-        raise Exception("This program requires at least Python 3.6")
+    if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 11):
+        raise Exception("This program requires at least Python 3.11")
 
     class fixPathAction(argparse.Action):
         def __call__(self, parser, namespace, values, option_string=None):

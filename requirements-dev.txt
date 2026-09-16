@@ -1,0 +1,7 @@
+# DeepFaceLab modernization — development/test dependencies (Phase 1)
+#
+# Install together with requirements-cuda.txt (GPU) or
+# requirements-cpu.txt (CPU fallback):
+#   uv pip install -r requirements-cuda.txt -r requirements-dev.txt
+
+pytest==9.1.1
