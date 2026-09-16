@@ -9,18 +9,18 @@ reference code, never imported by torch paths):
   channel permutation + ``F.pixel_shuffle``; a bare ``pixel_shuffle``
   is C-R-R and would silently scramble converted official
   checkpoints).
-- Phase 3D (in progress): ``dssim``, ``gaussian_blur`` (this state);
-  ``style_loss`` and ``pixel_norm`` follow in the next commit.
+- Phase 3D: ``dssim``, ``gaussian_blur``, ``style_loss``,
+  ``pixel_norm`` (the core numerical ops required by the official
+  SAEHD/AMP/Quick96/XSeg loss stacks and the SAEHD archi).
 
 Still TensorFlow (later Phase 3 subphases / model phases; see
-``ops/ops_tf.py``): style_loss, pixel_norm, rgb_to_lab (dead in the
-official baseline - no callers; documented deferral),
-total_variation_mse (SAEHD/AMP GAN term -> model phase),
-average_tensor_list, gelu, upsample2d, resize2d_*, flatten,
-max_pool, reshape_4D, space_to_depth, random_binomial (AdaBelief ->
-Phase 3E), tf_gradients, average_gv_list, batch_set_value,
-tf_get_value (session machinery), bilinear_sampler (TanhPolar
-phase).
+``ops/ops_tf.py``): rgb_to_lab (dead in the official baseline - no
+callers; documented deferral), total_variation_mse (SAEHD/AMP GAN
+term -> model phase), average_tensor_list, gelu, upsample2d,
+resize2d_*, flatten, max_pool, reshape_4D, space_to_depth,
+random_binomial (AdaBelief -> Phase 3E), tf_gradients,
+average_gv_list, batch_set_value, tf_get_value (session machinery),
+bilinear_sampler (TanhPolar phase).
 
 Importing this package never touches TensorFlow.
 
@@ -76,10 +76,10 @@ Official deviations (strict policy, plan v2 sections 19/42):
 - NHWC tensors are handled by boundary permutation through
   ``nn.to_data_format`` (official DFL call sites use NCHW).
 
-dssim / gaussian_blur (Phase 3D)
-================================
+dssim / gaussian_blur / style_loss / pixel_norm (Phase 3D)
+==========================================================
 
-Both reproduce the official formulas exactly (verified by
+All four reproduce the official formulas exactly (verified by
 ``tests/smoke/test_ops_core.py`` against independent NumPy
 implementations of the official formulas):
 
@@ -92,10 +92,11 @@ implementations of the official formulas):
   num0/num1/den0/den1 intermediate convs (NOT the algebraically
   equivalent but differently-rounded sigma_xy form), NO epsilon in
   the denominators and NO ssim clamping (both are External A/B
-  training-stability hacks), spatial mean -> (N, C), and the
-  official float32 cast round-trip for non-float32 inputs.
-  filter_size is used as given (NOT forced odd, as External A/B do -
-  official DFL passes e.g. 22 for resolution 256).
+  training-stability hacks), spatial mean over the conv2d spatial
+  axes -> (N, C), and the official float32 cast round-trip for
+  non-float32 inputs. filter_size is used as given (NOT forced odd,
+  as External A/B do - official DFL passes e.g. 22 for resolution
+  256).
 - ``gaussian_blur(input, radius=2.0)``: ``radius`` is the official
   sigma; kernel_size = max(3, int(2*2*sigma)) forced odd; 1D
   gaussian around mean = floor(0.5*kernel_size); 2D outer product
@@ -103,8 +104,21 @@ implementations of the official formulas):
   construction); symmetric padding kernel_size//2; single-pass
   VALID depthwise convolution (External A/B's OpenCV sigma rule and
   separable two-pass forms produce different kernels/rounding and
-  are rejected). The official zero-padded edge behavior is
-  preserved (borders darken; that IS the official semantics).
+  are rejected).
+- ``style_loss(target, style, gaussian_blur_radius=0.0,
+  loss_weight=1.0, step_size=1)``: the official PER-CHANNEL MOMENTS
+  (mean/variance) formulation - NOT a gram-matrix loss (External
+  A/B's gram variant is rejected for the compatibility path):
+  TF ``tf.nn.moments`` semantics (mean, then mean of squared
+  deviations), std = sqrt(var + 1e-5), BOTH loss terms squared,
+  summed over all axes except the batch (per-sample vector (N,)),
+  scaled by loss_weight / channel_count; raises on channel-count
+  mismatch (the legacy bridge forgot to square std_loss - rejected);
+  the ``step_size`` parameter is kept for signature parity (unused
+  in the official implementation).
+- ``pixel_norm(x, axes)``: ``x * rsqrt(mean(x^2, axes, keepdims) +
+  1e-06)`` with the official epsilon 1e-6 (External B's 1e-8
+  epsilon is rejected) and the official required-``axes`` signature.
 """
 
 import numpy as np
@@ -152,7 +166,7 @@ def depth_to_space(x, size):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3D: dssim / gaussian_blur
+# Phase 3D: dssim / gaussian_blur / style_loss / pixel_norm
 # ---------------------------------------------------------------------------
 
 def _make_dssim_kernel(filter_size, filter_sigma, device, dtype):
@@ -277,6 +291,52 @@ def gaussian_blur(input, radius=2.0):
     return x
 
 
+def _tf_moments(x, axes, keepdims=True):
+    """TF ``tf.nn.moments`` semantics: mean, then the mean of squared
+    deviations from that mean (NOT the algebraically equivalent
+    E[x^2]-E[x]^2, which rounds differently in float32)."""
+    m = x.mean(dim=axes, keepdim=keepdims)
+    v = (x - m).pow(2).mean(dim=axes, keepdim=keepdims)
+    return m, v
+
+
+def style_loss(target, style, gaussian_blur_radius=0.0, loss_weight=1.0, step_size=1):
+    """Official DFL style loss: per-channel MOMENTS (mean/variance)
+    matching, NOT a gram-matrix loss (see module docstring).
+    ``step_size`` is kept for official signature parity; the official
+    implementation does not use it."""
+    def sd(content, style, loss_weight):
+        content_nc = content.shape[nn.conv2d_ch_axis]
+        style_nc = style.shape[nn.conv2d_ch_axis]
+        if content_nc != style_nc:
+            raise Exception("style_loss() content_nc != style_nc")
+        c_mean, c_var = _tf_moments(content, nn.conv2d_spatial_axes, keepdims=True)
+        s_mean, s_var = _tf_moments(style, nn.conv2d_spatial_axes, keepdims=True)
+        c_std, s_std = torch.sqrt(c_var + 1e-5), torch.sqrt(s_var + 1e-5)
+        # official: reduce_sum over [1,2,3] = every axis except the batch,
+        # in both NCHW (C,H,W) and NHWC (H,W,C) -> per-sample vector (N,)
+        axes = tuple(range(1, content.dim()))
+        mean_loss = torch.square(c_mean - s_mean).sum(dim=axes)
+        std_loss = torch.square(c_std - s_std).sum(dim=axes)
+        return (mean_loss + std_loss) * (loss_weight / content_nc)
+
+    if gaussian_blur_radius > 0.0:
+        target = gaussian_blur(target, gaussian_blur_radius)
+        style = gaussian_blur(style, gaussian_blur_radius)
+
+    return sd(target, style, loss_weight)
+
+
+def pixel_norm(x, axes):
+    """Official DFL pixel norm: ``x * rsqrt(mean(x^2, axes) + 1e-06)``
+    with the official epsilon 1e-6 (External B's 1e-8 is rejected)
+    and the official required-``axes`` signature (call sites pass
+    e.g. axes=-1)."""
+    return x * torch.rsqrt(torch.mean(x.pow(2), dim=axes, keepdim=True) + 1e-06)
+
+
 nn.depth_to_space = depth_to_space
 nn.dssim = dssim
 nn.gaussian_blur = gaussian_blur
+nn.style_loss = style_loss
+nn.pixel_norm = pixel_norm
