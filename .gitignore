@@ -1,8 +1,100 @@
-*
-!*.py
-!*.md
-!*.txt
-!*.jpg
-!requirements*
-!Dockerfile*
-!*.sh
+# DeepFaceLab modernization — ignore rules
+#
+# Phase 0 (IMPLEMENTATION_PLAN.md section 11): replaces the upstream
+# allowlist ignore file (ignore-all + extension whitelist) with an
+# explicit blocklist. Files already tracked by Git remain tracked
+# regardless of these rules — notably:
+#   - doc/*          upstream documentation images
+#   - facelib/*.npy  official S3FD/2DFAN/3DFAN/FaceEnhancer extractor weights
+#   - .vscode/*      upstream-tracked editor configuration
+#
+# A new intentional repository file of a listed type must be staged
+# with `git add -f` and the justification recorded in the commit
+# (REVIEW_AND_COMMIT_GUIDE.md section 24).
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Local environments / embedded runtimes ---
+# Covers virtualenvs, embedded Python distributions, and the legacy
+# bundle's spoofed user-environment directories.
+.venv/
+venv/
+env/
+_e/
+_internal/
+python-3*/
+Anaconda*/
+Miniconda*/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- DFL working data: datasets and extracted samples ---
+workspace/
+data_src/
+data_dst/
+data_xseg/
+
+# --- Generated models and exported artifacts ---
+# User checkpoints (official pickle-dict *.npy files, converter
+# outputs, merged/exported model files). The four official extractor
+# weights in facelib/ remain tracked.
+model/
+*.npy
+*.h5
+*.onnx
+*.dfm
+*.pt
+*.pth
+*.engine
+*.torchscript
+pretrained/
+pretrain_faces/
+
+# --- Caches ---
+.cache/
+.nvidia/
+nv_cache/
+torchinductor/
+*.tmp
+
+# --- Personal media ---
+# Tracked upstream images (doc/) are unaffected; intentional new
+# repository images must be staged with `git add -f`.
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.psd
+*.tif
+*.tiff
+*.zip
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Temporary audit / parity artifacts ---
+audit_diffs/
+parity_dumps/
+*_audit_notes/
