@@ -10,10 +10,13 @@ random_binomial op (official lr_dropout mask source):
   own oracle)
 - zero-gradient no-ops, positive/negative gradient direction,
   multi-parameter updates
-- the official epsilon IS the dtype machine resolution
-  (torch.finfo(...).eps == NumPy 1.x finfo.resolution; the NumPy 2
-  redefinition of `resolution` is NOT the official value - pinned
-  by an explicit discrimination test)
+- the official denominator epsilon is the dtype's finfo
+  RESOLUTION - the DECIMAL resolution 10**ceil(log10(machine
+  eps)): 1e-06 for f32, 1e-03 for f16 (verified under the official
+  pinned NumPy 1.19.3; identical under NumPy 2.x). The machine
+  epsilon torch.finfo(...).eps (1.19e-07 for f32) is NOT the
+  official value - an explicit discrimination test pins the
+  official value against it
 - NO bias correction / NO momentum / NO weight decay (official
   has none; third-party additions are not adopted)
 - lr_cos schedule: official literal 2*3.1415926535/lr_cos and the
@@ -66,10 +69,14 @@ requires_gpu = pytest.mark.skipif(
     reason="Phase 3E2 GPU test: RTX 4090 / CUDA device required",
 )
 
-# the OFFICIAL optimizer epsilon: NumPy 1.x `finfo(...).resolution`
-# WAS the machine epsilon; NumPy 2.x redefined it (1e-06 for f32).
-# torch.finfo(...).eps is unchanged and equals the official value.
-EPS_F32 = float(torch.finfo(torch.float32).eps)
+# the OFFICIAL optimizer denominator epsilon:
+# np.finfo(dtype).resolution - the DECIMAL resolution
+# 10 ** ceil(log10(machine eps)) - which is NOT the machine
+# epsilon itself. Verified under the official pinned NumPy 1.19.3
+# (and identical under NumPy 1.26.x / 2.5.x - the property did not
+# change): f32 -> 1e-06, f16 -> 1e-03. torch.finfo(...).eps
+# (1.19e-07 for f32) is NOT the official value.
+OFFICIAL_EPS_F32 = 1e-6
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +155,7 @@ def test_adabelief_single_step_parity():
     run = opt.get_update_op([(g, x)])
     run()
 
-    m_t, v_t, v_diff = _ref_adabelief_states(m_ref, v_ref, g_ref, 0.1, 0.9, 0.999, EPS_F32)
+    m_t, v_t, v_diff = _ref_adabelief_states(m_ref, v_ref, g_ref, 0.1, 0.9, 0.999, OFFICIAL_EPS_F32)
     x_ref = x_ref + v_diff
     assert int(opt.iterations.item()) == 1
     assert np.abs(x.detach().numpy() - x_ref).max() < 1e-5
@@ -180,7 +187,7 @@ def test_adabelief_multi_step_evolution():
         g = torch.from_numpy(g_np.astype(np.float32))
         opt.get_update_op([(g, x)])()
         m_t, v_t, v_diff = _ref_adabelief_states(m_ref, v_ref, g_np, 0.05,
-                                                 0.9, 0.999, EPS_F32)
+                                                 0.9, 0.999, OFFICIAL_EPS_F32)
         m_ref, v_ref = m_t, v_t
         x_ref = x_ref + v_diff
         assert int(opt.iterations.item()) == k + 1
@@ -199,9 +206,9 @@ def test_adabelief_multi_param_update():
     a0, b0 = a.detach().numpy().astype(np.float64), b.detach().numpy().astype(np.float64)
     opt.get_update_op([(ga, a), (gb, b)])()
     ma, va, da = _ref_adabelief_states(np.zeros((2, 2)), np.zeros((2, 2)),
-                                       np.ones((2, 2)), 0.1, 0.9, 0.999, EPS_F32)
+                                       np.ones((2, 2)), 0.1, 0.9, 0.999, OFFICIAL_EPS_F32)
     mb, vb, db = _ref_adabelief_states(np.zeros((4,)), np.zeros((4,)),
-                                       -np.ones((4,)), 0.1, 0.9, 0.999, EPS_F32)
+                                       -np.ones((4,)), 0.1, 0.9, 0.999, OFFICIAL_EPS_F32)
     assert np.abs(a.detach().numpy() - (a0 + da)).max() < 1e-5
     assert np.abs(b.detach().numpy() - (b0 + db)).max() < 1e-5
     # states keyed per parameter, official names
@@ -237,10 +244,11 @@ def test_adabelief_gradient_sign_direction():
     assert torch.all(x > x1)
 
 
-def test_adabelief_epsilon_is_machine_eps():
-    # tiny gradient: the eps in the denominator dominates sqrt(v_t);
-    # a reference with the NumPy-2 resolution (1e-6) would differ
-    # measurably from the official (machine-eps) value
+def test_adabelief_official_epsilon_is_finfo_resolution():
+    # tiny gradient: the epsilon in the denominator dominates
+    # sqrt(v_t); the OFFICIAL value is the finfo RESOLUTION
+    # (1e-06 for f32, verified under the pinned NumPy 1.19.3), NOT
+    # the machine epsilon torch.finfo(...).eps = 1.19e-07
     g_np = np.full((2, 2), 1e-4, np.float64)
     x = _param((2, 2), values=np.zeros((2, 2), np.float32) + 7.0, name="w:0")
     opt = dfl_nn.AdaBelief(lr=0.1, name="t")
@@ -248,14 +256,19 @@ def test_adabelief_epsilon_is_machine_eps():
     g = torch.from_numpy(g_np.astype(np.float32))
     x0 = x.detach().numpy().astype(np.float64)
     opt.get_update_op([(g, x)])()
-    _, _, vd_official = _ref_adabelief_states(np.zeros((2, 2)), np.zeros((2, 2)),
-                                              g_np, 0.1, 0.9, 0.999, EPS_F32)
-    _, _, vd_numpy2 = _ref_adabelief_states(np.zeros((2, 2)), np.zeros((2, 2)),
-                                            g_np, 0.1, 0.9, 0.999, 1e-6)
+    _, _, vd_official = _ref_adabelief_states(np.zeros((2, 2)),
+                                              np.zeros((2, 2)),
+                                              g_np, 0.1, 0.9, 0.999,
+                                              OFFICIAL_EPS_F32)
+    _, _, vd_machine_eps = _ref_adabelief_states(np.zeros((2, 2)),
+                                                 np.zeros((2, 2)),
+                                                 g_np, 0.1, 0.9, 0.999,
+                                                 float(torch.finfo(torch.float32).eps))
     got = x.detach().numpy().astype(np.float64) - x0
     assert np.abs(got - vd_official).max() < 1e-6
-    # the NumPy-2-resolution variant must NOT match the official value
-    assert np.abs(vd_official - vd_numpy2).max() > 1e-5
+    # the machine-epsilon variant must NOT match the official value
+    # (sqrt(v_t) = 9e-06 here, so 1e-06 vs 1.19e-07 is significant)
+    assert np.abs(vd_official - vd_machine_eps).max() > 1e-5
 
 
 def test_adabelief_lr_cos_post_increment_schedule():
@@ -277,7 +290,7 @@ def test_adabelief_lr_cos_post_increment_schedule():
         opt.get_update_op([(g, x)])()
         lr_eff = 1.0 * _ref_lr_cos_mult(step, 8)  # POST-increment iters = step
         m_t, v_t, v_diff = _ref_adabelief_states(m_ref, v_ref, g_np32, lr_eff,
-                                                 0.9, 0.999, EPS_F32)
+                                                 0.9, 0.999, OFFICIAL_EPS_F32)
         m_ref, v_ref = m_t, v_t
         x_ref = x_ref + v_diff
         assert int(opt.iterations.item()) == step
@@ -309,9 +322,9 @@ def test_adabelief_global_norm_clipping():
     c1, c2 = _ref_global_clip([np.array([20.0, 20.0], np.float64),
                                np.array([6.0, 8.0], np.float64)], 1.0)
     _, _, d1 = _ref_adabelief_states(np.zeros((2,)), np.zeros((2,)), c1,
-                                     0.1, 0.9, 0.999, EPS_F32)
+                                     0.1, 0.9, 0.999, OFFICIAL_EPS_F32)
     _, _, d2 = _ref_adabelief_states(np.zeros((2,)), np.zeros((2,)), c2,
-                                     0.1, 0.9, 0.999, EPS_F32)
+                                     0.1, 0.9, 0.999, OFFICIAL_EPS_F32)
     assert np.abs(p1.detach().numpy() - (p10 + d1)).max() < 1e-5
     assert np.abs(p2.detach().numpy() - (p20 + d2)).max() < 1e-5
 
@@ -467,7 +480,7 @@ def test_rmsprop_single_step_parity():
     g_ref = g.numpy().astype(np.float64)
     a_ref = np.zeros_like(g_ref)
     opt.get_update_op([(g, x)])()
-    a_t, v_diff = _ref_rmsprop_state(a_ref, g_ref, 0.05, 0.9, EPS_F32)
+    a_t, v_diff = _ref_rmsprop_state(a_ref, g_ref, 0.05, 0.9, OFFICIAL_EPS_F32)
     x_ref = x_ref + v_diff
     assert int(opt.iterations.item()) == 1
     assert np.abs(x.detach().numpy() - x_ref).max() < 1e-5
@@ -494,7 +507,7 @@ def test_rmsprop_multi_param_multi_step():
                            (torch.from_numpy(gb_np.astype(np.float32)), b)])()
         for name, gx in (("a:0", ga_np), ("b:0", gb_np)):
             x_ref, a_ref = refs[name]
-            a_t, v_diff = _ref_rmsprop_state(a_ref, gx, 0.05, 0.9, EPS_F32)
+            a_t, v_diff = _ref_rmsprop_state(a_ref, gx, 0.05, 0.9, OFFICIAL_EPS_F32)
             refs[name] = (x_ref + v_diff, a_t)
     assert np.abs(a.detach().numpy() - refs["a:0"][0]).max() < 1e-5
     assert np.abs(b.detach().numpy() - refs["b:0"][0]).max() < 1e-5
@@ -525,7 +538,7 @@ def test_rmsprop_lr_cos_post_increment():
     for step in range(1, 4):
         opt.get_update_op([(g, x)])()
         lr_eff = 1.0 * _ref_lr_cos_mult(step, 8)
-        a_t, v_diff = _ref_rmsprop_state(a_ref, g_np, lr_eff, 0.9, EPS_F32)
+        a_t, v_diff = _ref_rmsprop_state(a_ref, g_np, lr_eff, 0.9, OFFICIAL_EPS_F32)
         a_ref = a_t
         x_ref = x_ref + v_diff
         assert int(opt.iterations.item()) == step
@@ -545,8 +558,8 @@ def test_rmsprop_global_norm_clipping():
     # the GLOBAL norm (30) scales both grads
     c1, c2 = _ref_global_clip([np.array([20.0, 20.0], np.float64),
                                np.array([6.0, 8.0], np.float64)], 1.0)
-    _, d1 = _ref_rmsprop_state(np.zeros((2,)), c1, 0.1, 0.9, EPS_F32)
-    _, d2 = _ref_rmsprop_state(np.zeros((2,)), c2, 0.1, 0.9, EPS_F32)
+    _, d1 = _ref_rmsprop_state(np.zeros((2,)), c1, 0.1, 0.9, OFFICIAL_EPS_F32)
+    _, d2 = _ref_rmsprop_state(np.zeros((2,)), c2, 0.1, 0.9, OFFICIAL_EPS_F32)
     assert np.abs(p1.detach().numpy() - (p10 + d1)).max() < 1e-5
     assert np.abs(p2.detach().numpy() - (p20 + d2)).max() < 1e-5
 

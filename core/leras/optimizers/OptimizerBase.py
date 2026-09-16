@@ -46,15 +46,15 @@ torch, so the torch model code assigns ``param._dfl_name =
 must not depend on them).
 
 Documented semantics (official behavior preserved):
-- **epsilon** = ``torch.finfo(dtype).eps`` == the official
-  ``np.finfo(...).resolution`` under NUMPY 1.x, where
-  ``resolution`` was the machine epsilon (f32: 1.19e-07, f16:
-  9.77e-04). WARNING: NumPy 2.x redefined ``finfo.resolution`` as
-  the smallest DECIMAL resolution (1e-06 for f32) — code re-run
-  against NumPy 2 with the official formula would silently change
-  the optimizer epsilon. The torch implementation uses
-  ``torch.finfo(dtype).eps`` (unchanged by NumPy), which is the
-  official value; tests pin it against the legacy 1.x constant.
+- **epsilon** = the official ``np.finfo(g.dtype).resolution`` —
+  the DECIMAL resolution ``10 ** ceil(log10(machine eps))``, which
+  is NOT the machine epsilon itself: f32 -> 1e-06, f16 -> 1e-03,
+  f64 -> 1e-15. Verified under the official pinned NumPy 1.19.3
+  (and identical under NumPy 1.26.x / 2.5.x — the property did not
+  change across these versions). ``torch.finfo(dtype).eps``
+  (f32: 1.19e-07) is NOT the official value and is never used here;
+  a test pins the official value and discriminates it from the
+  machine epsilon.
 - **no bias correction** in either optimizer (the official has
   none — a third-party AdaBelief's bias correction is NOT added);
 - **lr_cos** uses the official literal ``2*3.1415926535/lr_cos``
@@ -85,6 +85,31 @@ import torch
 
 from core.leras import nn
 from core.leras.layers.Saveable import Saveable
+
+# The official denominator epsilon: ``np.finfo(dtype).resolution`` —
+# the DECIMAL resolution ``10 ** ceil(log10(machine eps))``, NOT the
+# machine epsilon itself. Values verified under the official pinned
+# NumPy 1.19.3 (identical under NumPy 1.26.x / 2.5.x — the property
+# did not change across these versions): f32 -> 1e-06, f16 -> 1e-03,
+# f64 -> 1e-15. ``torch.finfo(dtype).eps`` (e.g. 1.19e-07 for f32)
+# is NOT the official value.
+_OFFICIAL_FINFO_RESOLUTION = {
+    torch.float16: 1e-3,
+    torch.float32: 1e-6,
+    torch.float64: 1e-15,
+}
+
+
+def official_finfo_resolution(dtype):
+    """The official ``np.finfo(dtype).resolution`` value for a torch
+    floating dtype (see the module docstring for the verification
+    record). Raises ``ValueError`` for dtypes without an official
+    value."""
+    try:
+        return _OFFICIAL_FINFO_RESOLUTION[dtype]
+    except KeyError:
+        raise ValueError(
+            f"no official finfo resolution for dtype {dtype}")
 
 
 class OptimizerBase(torch.nn.Module, Saveable):

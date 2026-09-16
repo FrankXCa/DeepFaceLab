@@ -13,8 +13,10 @@ iteration count) and the gradient pre-clipped by the optimizer's
 global norm when ``clipnorm > 0``.
 
 Official semantics preserved (see the OptimizerBase docstring for
-the shared mechanics): the official epsilon IS the dtype
-resolution (f32: 1.19e-07), there is NO momentum and NO centering
+the shared mechanics): the official denominator epsilon IS the
+dtype's finfo RESOLUTION - the decimal resolution (f32: 1e-06,
+NOT the machine epsilon ``torch.finfo(...).eps`` = 1.19e-07),
+there is NO momentum and NO centering
 (standard ``torch.optim.RMSprop`` has neither the official state
 naming — ``acc_*``, not ``vs_*`` — nor the official lr_cos /
 lr_dropout / global-norm-clip machinery, so it is NOT substituted),
@@ -26,7 +28,7 @@ rejected).
 import torch
 
 from core.leras import nn
-from .OptimizerBase import OptimizerBase
+from .OptimizerBase import OptimizerBase, official_finfo_resolution
 
 
 class RMSprop(OptimizerBase):
@@ -65,9 +67,10 @@ class RMSprop(OptimizerBase):
 
         new_a = self.rho * acc + (1. - self.rho) * g.pow(2)
 
-        # official: np.finfo(g.dtype).resolution == torch.finfo(...).eps
+        # official: np.finfo(g.dtype).resolution - the DECIMAL
+        # resolution (f32: 1e-06), NOT the machine epsilon
         v_diff = -lr * g / (torch.sqrt(new_a)
-                            + torch.finfo(g.dtype).eps)
+                            + official_finfo_resolution(g.dtype))
         v_diff = self._apply_lr_dropout_mask(v_diff, v)
         v.add_(v_diff)
 

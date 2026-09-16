@@ -138,10 +138,12 @@ Populated in Phase 3E2:
   multi-step `AdaBelief`/`RMSprop` updates (fresh-state and
   evolving-state references; the torch code is never its own
   oracle), zero-gradient exact no-ops, positive/negative gradient
-  direction, multi-parameter updates, the official epsilon ==
-  `torch.finfo(dtype).eps` (the official NumPy-1.x machine
-  resolution; a test discriminates it from the NumPy-2 redefined
-  `resolution` value), NO bias correction / NO momentum / NO
+  direction, multi-parameter updates, the official denominator
+  epsilon == `np.finfo(dtype).resolution` - the DECIMAL resolution
+  (1e-06 for f32; verified under the official pinned NumPy 1.19.3,
+  identical under NumPy 2.x; the machine epsilon
+  `torch.finfo(...).eps` = 1.19e-07 is NOT the official value - a
+  test discriminates the two), NO bias correction / NO momentum / NO
   weight decay (official has none), the lr_cos schedule (official
   literal `2*3.1415926535/lr_cos` and the POST-increment iteration
   count - a step-1 discrimination test pins the official TF
