@@ -107,8 +107,30 @@ Populated in Phase 3D:
   NHWC boundary contract, the TensorFlow import boundary, and the
   no-direct-CUDA AST check.
 
-Current counts (2026-09, after Phase 3D): CUDA environment 132
-passed; CPU environment 121 passed + 11 skipped.
+Populated in Phase 3E1:
+
+- `test_ops_lowlevel.py` — Phase 3E1 acceptance for the remaining
+  low-level ops with official semantics: `flatten` (exact
+  channel-major element placement in NCHW, the NHWC boundary-
+  transpose guarantee - channel-major even for NHWC input, dtype
+  preservation, gradient flow), `reshape_4D` (exact element
+  placement NCHW and NHWC output, invalid flat tail fails
+  explicitly - no permissive heuristics, gradient flow),
+  `average_tensor_list` (single-element identity, exact mean
+  reference, official tf_device_string signature parity, gradient
+  flow 0.5 per input), `total_variation_mse` (the official
+  VERBATIM formula - axis-1/axis-2 slice differences, squared,
+  SUMMED over axes 1..3 -> per-sample (N,) vector; under NCHW the
+  axis-1 term is the official channel-difference quirk that the
+  baseline SAEHD/AMP GAN loss actually computed; the suite
+  explicitly distinguishes the official per-sample sum from
+  External A's global scalar mean variant; zero-input exact zero;
+  gradient smoke); plus the RTX 4090 GPU execution test with
+  bit-exact CPU-vs-GPU parity on the deterministic integer-valued
+  inputs (skip-if-CPU-only) and the nn/module alias registration.
+
+Current counts (2026-09, after Phase 3E1): CUDA environment 151
+passed; CPU environment 139 passed + 12 skipped.
 
 Environments (git-ignored, created with `uv`):
 
