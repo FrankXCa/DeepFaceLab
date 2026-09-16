@@ -1,15 +1,31 @@
-"""Torch leras ops (Phase 3C start).
+"""Torch leras ops (Phase 3C/3D progressive migration).
 
-Phase 3C migrates exactly one operation from the official TensorFlow
-ops module: ``depth_to_space``. The remaining official ops (dssim,
-style_loss, gaussian blur, pixel_norm, rgb_to_lab, batch_set_value,
-...) are preserved verbatim in ``core/leras/ops/ops_tf.py`` (dead TF
-code, never imported by torch paths) and are rebuilt as torch ops in
-later Phase 3 subphases. Importing this package never touches
-TensorFlow.
+Migrated so far (each op mirrors the official DeepFaceLab
+TensorFlow semantics 1:1; the complete official TF module is
+preserved verbatim in ``core/leras/ops/ops_tf.py`` as dead
+reference code, never imported by torch paths):
 
-depth_to_space - official DeepFaceLab / TensorFlow semantics (R-R-C)
-============================================================
+- Phase 3C: ``depth_to_space`` (official TF R-R-C semantics via
+  channel permutation + ``F.pixel_shuffle``; a bare ``pixel_shuffle``
+  is C-R-R and would silently scramble converted official
+  checkpoints).
+- Phase 3D (in progress): ``dssim``, ``gaussian_blur`` (this state);
+  ``style_loss`` and ``pixel_norm`` follow in the next commit.
+
+Still TensorFlow (later Phase 3 subphases / model phases; see
+``ops/ops_tf.py``): style_loss, pixel_norm, rgb_to_lab (dead in the
+official baseline - no callers; documented deferral),
+total_variation_mse (SAEHD/AMP GAN term -> model phase),
+average_tensor_list, gelu, upsample2d, resize2d_*, flatten,
+max_pool, reshape_4D, space_to_depth, random_binomial (AdaBelief ->
+Phase 3E), tf_gradients, average_gv_list, batch_set_value,
+tf_get_value (session machinery), bilinear_sampler (TanhPolar
+phase).
+
+Importing this package never touches TensorFlow.
+
+depth_to_space (Phase 3C)
+=========================
 
 The official DFL op (``ops/__init__.py``) uses TensorFlow
 ``depth_to_space`` semantics in BOTH of its NCHW branches (native
@@ -59,7 +75,39 @@ Official deviations (strict policy, plan v2 sections 19/42):
   official CPU fallback silently truncated via integer division);
 - NHWC tensors are handled by boundary permutation through
   ``nn.to_data_format`` (official DFL call sites use NCHW).
+
+dssim / gaussian_blur (Phase 3D)
+================================
+
+Both reproduce the official formulas exactly (verified by
+``tests/smoke/test_ops_core.py`` against independent NumPy
+implementations of the official formulas):
+
+- ``dssim(img1, img2, max_val, filter_size=11, filter_sigma=1.5,
+  k1=0.01, k2=0.03)``: the official kernel (arange centered at
+  (filter_size-1)/2, squared x (-0.5/sigma^2), 2D outer product,
+  softmax-normalized, tiled per channel), VALID depthwise
+  convolution (External A/B use SAME padding - rejected), the
+  official luminance x cs expressions built from the official
+  num0/num1/den0/den1 intermediate convs (NOT the algebraically
+  equivalent but differently-rounded sigma_xy form), NO epsilon in
+  the denominators and NO ssim clamping (both are External A/B
+  training-stability hacks), spatial mean -> (N, C), and the
+  official float32 cast round-trip for non-float32 inputs.
+  filter_size is used as given (NOT forced odd, as External A/B do -
+  official DFL passes e.g. 22 for resolution 256).
+- ``gaussian_blur(input, radius=2.0)``: ``radius`` is the official
+  sigma; kernel_size = max(3, int(2*2*sigma)) forced odd; 1D
+  gaussian around mean = floor(0.5*kernel_size); 2D outer product
+  normalized to sum 1 (float32, exactly as the official numpy
+  construction); symmetric padding kernel_size//2; single-pass
+  VALID depthwise convolution (External A/B's OpenCV sigma rule and
+  separable two-pass forms produce different kernels/rounding and
+  are rejected). The official zero-padded edge behavior is
+  preserved (borders darken; that IS the official semantics).
 """
+
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -86,7 +134,7 @@ def depth_to_space(x, size):
         raise ValueError(
             f"depth_to_space: input channels {c_in} must be divisible by "
             f"size*size = {size * size} (the official CPU fallback truncated "
-            f"silently; this project fails explicitly)"
+            "silently; this project fails explicitly)"
         )
     c_out = c_in // (size * size)
 
@@ -103,4 +151,132 @@ def depth_to_space(x, size):
     return x
 
 
+# ---------------------------------------------------------------------------
+# Phase 3D: dssim / gaussian_blur
+# ---------------------------------------------------------------------------
+
+def _make_dssim_kernel(filter_size, filter_sigma, device, dtype):
+    """Official DFL DSSIM window, verbatim: arange centered at
+    (filter_size-1)/2, squared x (-0.5/sigma^2), 2D outer product,
+    softmax-normalized over the flattened (filter_size*filter_size)
+    values (tf.nn.softmax == exp/sum for finite values, max-subtract
+    stabilized as TF does). Returns a torch (1, 1, fs, fs) tensor."""
+    kernel = np.arange(0, filter_size, dtype=np.float32)
+    kernel -= (filter_size - 1) / 2.0
+    kernel = kernel ** 2
+    kernel *= (-0.5 / (filter_sigma ** 2))
+    kernel = np.reshape(kernel, (1, -1)) + np.reshape(kernel, (-1, 1))
+    kernel = np.reshape(kernel, (-1,))
+    e = np.exp(kernel - kernel.max())
+    kernel = (e / e.sum()).astype(np.float32)
+    kernel = torch.as_tensor(kernel, device=device)
+    kernel = kernel.view(1, 1, filter_size, filter_size)
+    return kernel.to(dtype)
+
+
+def dssim(img1, img2, max_val, filter_size=11, filter_sigma=1.5, k1=0.01, k2=0.03):
+    """Official DFL DSSIM (VALID window convolution, per-sample
+    (N, C) result). See the module docstring for the exact formula
+    and the rejected External A/B deviations (SAME padding, eps,
+    clamping, forced-odd filter size, (N,C,1,1) shape)."""
+    if img1.dtype != img2.dtype:
+        raise ValueError("img1.dtype != img2.dtype")
+
+    not_float32 = img1.dtype != torch.float32
+    if not_float32:
+        img_dtype = img1.dtype
+        img1 = img1.to(torch.float32)
+        img2 = img2.to(torch.float32)
+    else:
+        img_dtype = None
+
+    nhwc = nn.data_format == "NHWC"
+    if nhwc:
+        img1 = nn.to_data_format(img1, "NCHW", "NHWC")
+        img2 = nn.to_data_format(img2, "NCHW", "NHWC")
+
+    filter_size = max(1, filter_size)
+    channels = img1.shape[1]
+    kernel = _make_dssim_kernel(filter_size, filter_sigma, img1.device, img1.dtype)
+    kernel = kernel.repeat(channels, 1, 1, 1)  # official: tf.tile over the channel axis
+
+    def reducer(x):
+        # official: tf.nn.depthwise_conv2d(..., padding='VALID') - torch conv with
+        # padding=0 is exactly VALID (no pre-padding, unlike gaussian_blur)
+        return F.conv2d(x, kernel, padding=0, groups=channels)
+
+    c1 = (k1 * max_val) ** 2
+    c2 = (k2 * max_val) ** 2
+
+    mean0 = reducer(img1)
+    mean1 = reducer(img2)
+    num0 = mean0 * mean1 * 2.0
+    den0 = torch.square(mean0) + torch.square(mean1)
+    luminance = (num0 + c1) / (den0 + c1)
+
+    num1 = reducer(img1 * img2) * 2.0
+    den1 = reducer(torch.square(img1) + torch.square(img2))
+    # the official code has `c2 *= 1.0 #compensation factor` (a no-op)
+    cs = (num1 - num0 + c2) / (den1 - den0 + c2)
+
+    # official: tf.reduce_mean(luminance*cs, axis=nn.conv2d_spatial_axes)
+    # -> (N, C). The computation above runs in NCHW (NHWC inputs are
+    # boundary-permuted), so the spatial axes are (2, 3) here; the
+    # resulting (N, C) is identical in both data formats.
+    ssim_val = (luminance * cs).mean(dim=(2, 3))
+    dssim = (1.0 - ssim_val) / 2.0
+
+    if not_float32:
+        dssim = dssim.to(img_dtype)
+    return dssim
+
+
+def _make_gaussian_blur_kernel(radius):
+    """Official DFL gaussian blur kernel, verbatim: kernel_size =
+    max(3, int(2*2*sigma)) forced odd, 1D gaussian around
+    mean = floor(0.5*kernel_size), 2D outer product normalized to
+    sum 1 in float32. Returns (kernel, kernel_size)."""
+    def gaussian(x, mu, sigma):
+        return np.exp(-(float(x) - float(mu)) ** 2 / (2 * sigma ** 2))
+
+    kernel_size = max(3, int(2 * 2 * radius))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    mean = np.floor(0.5 * kernel_size)
+    kernel_1d = np.array([gaussian(x, mean, radius) for x in range(kernel_size)])
+    np_kernel = np.outer(kernel_1d, kernel_1d).astype(np.float32)
+    kernel = np_kernel / np.sum(np_kernel)
+    return kernel, kernel_size
+
+
+def gaussian_blur(input, radius=2.0):
+    """Official DFL gaussian blur (``radius`` is the sigma, exactly as
+    the official SAEHD/AMP/Quick96 models call it positionally).
+    Single-pass VALID depthwise convolution with symmetric
+    padding = kernel_size//2. See the module docstring for the
+    rejected External A/B kernel deviations."""
+    nhwc = nn.data_format == "NHWC"
+    if nhwc:
+        input = nn.to_data_format(input, "NCHW", "NHWC")
+
+    gauss_kernel, kernel_size = _make_gaussian_blur_kernel(radius)
+    channels = input.shape[1]
+    k = torch.as_tensor(gauss_kernel, device=input.device)
+    k = k.view(1, 1, kernel_size, kernel_size)
+    k = k.repeat(channels, 1, 1, 1)  # official: tf.tile over the channel axis
+
+    x = input
+    padding = kernel_size // 2
+    if padding != 0:
+        x = F.pad(x, (padding, padding, padding, padding))
+    # official: tf.nn.depthwise_conv2d(x, k, strides=[1,1,1,1], padding='VALID')
+    x = F.conv2d(x, k, padding=0, groups=channels)
+
+    if nhwc:
+        x = nn.to_data_format(x, "NHWC", "NCHW")
+    return x
+
+
 nn.depth_to_space = depth_to_space
+nn.dssim = dssim
+nn.gaussian_blur = gaussian_blur
