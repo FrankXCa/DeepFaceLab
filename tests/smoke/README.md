@@ -29,6 +29,26 @@ Populated in Phase 2:
 - `conftest.py` (repository root) — puts the repo root on `sys.path`
   so `import core...` works from any pytest invocation style.
 
+Populated in Phase 3A:
+
+- `test_leras_foundation.py` — Phase 3A torch-only leras foundation
+  acceptance (`IMPLEMENTATION_PLAN_v2.md` section 14, 3A scope):
+  foundation imports without TensorFlow, LayerBase/module construction
+  (official two-phase `build_weights`/`init_weights` lifecycle on a
+  synthetic stand-in layer), deterministic official-name enumeration,
+  stable naming across repeated construction, device placement through
+  the Phase 2 abstraction (CPU; CUDA-on-4090 where available),
+  official-format save/load round-trip on a synthetic module, strict
+  failure behavior (`CheckpointLoadError` for missing/extra/shape
+  mismatches, all-or-nothing), no direct CUDA API in foundation sources
+  (AST-checked).
+- `conftest.py` (this directory) — shared `plain_tmp` fixture
+  (sandbox-safe makedirs-based temp directories; also used unchanged
+  in style by the Phase 1 fixture).
+
+Current counts (2026-09, after Phase 3A): CUDA environment 42 passed;
+CPU environment 34 passed + 8 skipped.
+
 Environments (git-ignored, created with `uv`):
 
 - `.venv`      — CUDA baseline (`requirements-cuda.txt` + `requirements-dev.txt`)
