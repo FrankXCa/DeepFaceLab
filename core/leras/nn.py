@@ -18,11 +18,11 @@ Phase 3A: torch-only foundation.
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
-migrated dssim, gaussian_blur, style_loss, pixel_norm; Phase 3E1 is
-migrating the remaining low-level ops - flatten and reshape_4D in
-this state, average_tensor_list/total_variation_mse next; the rest
-of the official ops are preserved in ops/ops_tf.py and rebuilt in
-later subphases), optimizers/*, archis/*, models/* (Phases 6-8).
+migrated dssim, gaussian_blur, style_loss, pixel_norm; Phase 3E1
+migrated flatten, reshape_4D, average_tensor_list,
+total_variation_mse; the rest of the official ops are preserved in
+ops/ops_tf.py and rebuilt in later subphases), optimizers/*,
+archis/*, models/* (Phases 6-8).
 
 NCHW speed up training for 10-20%.
 """
@@ -66,10 +66,11 @@ class nn():
             # Torch foundation registries (Phase 3A: layers foundation and
             # initializers; Phase 3C/3D/3E1: torch ops - depth_to_space,
             # dssim, gaussian_blur, style_loss, pixel_norm, flatten,
-            # reshape_4D). The remaining leras subpackages (remaining ops,
-            # optimizers, archis, models) are rebuilt in later Phase 3
-            # subphases / model phases and are imported by their own
-            # subphase entry points.
+            # reshape_4D, average_tensor_list, total_variation_mse). The
+            # remaining leras subpackages (remaining ops, optimizers,
+            # archis, models) are rebuilt in later Phase 3 subphases /
+            # model phases and are imported by their own subphase entry
+            # points.
             import core.leras.layers  # noqa: F401
             import core.leras.initializers  # noqa: F401
             import core.leras.checkpoint  # noqa: F401

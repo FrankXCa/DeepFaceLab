@@ -12,20 +12,18 @@ reference code, never imported by torch paths):
 - Phase 3D: ``dssim``, ``gaussian_blur``, ``style_loss``,
   ``pixel_norm`` (the core numerical ops required by the official
   SAEHD/AMP/Quick96/XSeg loss stacks and the SAEHD archi).
-- Phase 3E1 (in progress): ``flatten``, ``reshape_4D`` (tensor-layout
-  ops used by the SAEHD/AMP/XSeg archi dense<->map transitions, this
-  state); ``average_tensor_list`` and ``total_variation_mse`` (the
-  reduction/loss helpers used by the official model code) follow in
-  the next commit.
+- Phase 3E1: ``flatten``, ``reshape_4D`` (tensor-layout ops used by
+  the SAEHD/AMP/XSeg archi dense<->map transitions),
+  ``average_tensor_list``, ``total_variation_mse`` (reduction/loss
+  helpers used by the official model code).
 
 Still TensorFlow (later Phase 3 subphases / model phases; see
 ``ops/ops_tf.py``): rgb_to_lab (dead in the official baseline - no
-callers; documented deferral), average_tensor_list, total_variation
-_mse (next commit), gelu (no baseline callers), upsample2d
-(FANExtractor - facelib TF code), resize2d_* (FaceEnhancer - facelib
-TF code), max_pool (no nn-namespace callers in the baseline),
-space_to_depth (no baseline callers), random_binomial (-> Phase 3E2
-with the optimizers that are its only consumers),
+callers; documented deferral), gelu (no baseline callers),
+upsample2d (FANExtractor - facelib TF code), resize2d_* (FaceEnhancer
+- facelib TF code), max_pool (no nn-namespace callers in the
+baseline), space_to_depth (no baseline callers), random_binomial
+(-> Phase 3E2 with the optimizers that are its only consumers),
 tf_gradients/nn.gradients + average_gv_list (-> Phase 3E2
 optimizer/multi-GPU gradient flow), batch_set_value/tf_get_value
 (session machinery - disappears under the torch foundation),
@@ -129,8 +127,9 @@ implementations of the official formulas):
   1e-06)`` with the official epsilon 1e-6 (External B's 1e-8
   epsilon is rejected) and the official required-``axes`` signature.
 
-flatten / reshape_4D (Phase 3E1)
-================================
+flatten / reshape_4D / average_tensor_list / total_variation_mse
+(Phase 3E1)
+=================================================================
 
 - ``flatten(x)``: the official always flattens in the NCHW layout
   (channel-major ``(-1, C*H*W)``): an NHWC input is boundary-
@@ -144,6 +143,24 @@ flatten / reshape_4D (Phase 3E1)
   flat tail must contain exactly ``c*h*w`` elements per sample -
   torch's reshape fails explicitly otherwise (no permissive
   heuristics).
+- ``average_tensor_list(tensors_list, tf_device_string=None)``:
+  single element -> returned as-is; otherwise the mean over a new
+  leading axis (official ``expand_dims + concat + reduce_mean``).
+  ``tf_device_string`` is kept for official signature parity; under
+  torch the placement comes from the input tensors (Phase 2 device
+  model).
+- ``total_variation_mse(images)``: the official formula VERBATIM -
+  ``dif1 = x[:, 1:, :, :] - x[:, :-1, :, :]`` and
+  ``dif2 = x[:, :, 1:, :] - x[:, :, :-1, :]``, each squared and
+  summed over axes (1,2,3) -> a PER-SAMPLE (N,) vector of SUMS.
+  The formula is data-format-agnostic in the official source: with
+  NCHW (the format the baseline models run), axis 1 is the channel
+  axis, so the first term is a channel-difference term - that is
+  exactly what the official baseline GAN loss computed, and this
+  project reproduces it rather than "fixing" it to spatial axes
+  (the USER_LEGACY NCHW branch and External A both deviate; External
+  A additionally returns a global scalar MEAN - rejected on both
+  counts: sum not mean, (N,) not scalar).
 """
 
 import numpy as np
@@ -388,6 +405,48 @@ def reshape_4D(x, w, h, c):
     return x
 
 
+# ---------------------------------------------------------------------------
+# Phase 3E1: average_tensor_list / total_variation_mse
+# ---------------------------------------------------------------------------
+
+def average_tensor_list(tensors_list, tf_device_string=None):
+    """Official DFL average over a list of same-shape tensors:
+    single element -> returned as-is, otherwise the element-wise
+    mean over a new leading axis (official ``expand_dims + concat +
+    reduce_mean``). ``tf_device_string`` is kept for official
+    signature parity; under torch the placement comes from the input
+    tensors (Phase 2 device model)."""
+    if len(tensors_list) == 1:
+        return tensors_list[0]
+    # torch.stack + mean is exactly the official
+    # tf.concat([expand_dims(t, 0) ...], 0) + tf.reduce_mean(..., 0)
+    return torch.stack(tensors_list, dim=0).mean(dim=0)
+
+
+def total_variation_mse(images):
+    """Official DFL total variation (MSE-difference form, SAEHD/AMP
+    GAN term) VERBATIM:
+
+        dif1 = x[:, 1:, :, :] - x[:, :-1, :, :]
+        dif2 = x[:, :, 1:, :] - x[:, :, :-1, :]
+        out  = sum(square(dif1), axes 1..3) + sum(square(dif2), axes 1..3)
+
+    -> a PER-SAMPLE (N,) vector of SUMS (never a scalar, never a
+    mean). The formula is data-format-agnostic in the official
+    source: under NCHW (the format the baseline models run) axis 1
+    is the channel axis, so the first term is a channel-difference
+    term - exactly what the official baseline GAN loss computed.
+    Rejected deviations: USER_LEGACY's NCHW branch (spatial axes
+    instead) and External A's variant (spatial axes + global scalar
+    MEAN, no batch dimension)."""
+    pixel_dif1 = images[:, 1:, :, :] - images[:, :-1, :, :]
+    pixel_dif2 = images[:, :, 1:, :] - images[:, :, :-1, :]
+    # official: reduce_sum over [1,2,3] = every axis except the batch,
+    # in both NCHW (C,H,W) and NHWC (H,W,C)
+    return (torch.square(pixel_dif1).sum(dim=(1, 2, 3))
+            + torch.square(pixel_dif2).sum(dim=(1, 2, 3)))
+
+
 nn.depth_to_space = depth_to_space
 nn.dssim = dssim
 nn.gaussian_blur = gaussian_blur
@@ -395,3 +454,5 @@ nn.style_loss = style_loss
 nn.pixel_norm = pixel_norm
 nn.flatten = flatten
 nn.reshape_4D = reshape_4D
+nn.average_tensor_list = average_tensor_list
+nn.total_variation_mse = total_variation_mse
