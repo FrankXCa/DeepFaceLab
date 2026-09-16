@@ -129,8 +129,41 @@ Populated in Phase 3E1:
   bit-exact CPU-vs-GPU parity on the deterministic integer-valued
   inputs (skip-if-CPU-only) and the nn/module alias registration.
 
-Current counts (2026-09, after Phase 3E1): CUDA environment 151
-passed; CPU environment 139 passed + 12 skipped.
+Populated in Phase 3E2:
+
+- `test_optimizers.py` — Phase 3E2 acceptance for the torch
+  optimizer layer (official semantics; the verbatim TF reference is
+  `core/leras/optimizers/optimizers_tf.py`, never imported by torch
+  paths): independent-NumPy-reference parity for one-step and
+  multi-step `AdaBelief`/`RMSprop` updates (fresh-state and
+  evolving-state references; the torch code is never its own
+  oracle), zero-gradient exact no-ops, positive/negative gradient
+  direction, multi-parameter updates, the official epsilon ==
+  `torch.finfo(dtype).eps` (the official NumPy-1.x machine
+  resolution; a test discriminates it from the NumPy-2 redefined
+  `resolution` value), NO bias correction / NO momentum / NO
+  weight decay (official has none), the lr_cos schedule (official
+  literal `2*3.1415926535/lr_cos` and the POST-increment iteration
+  count - a step-1 discrimination test pins the official TF
+  queue-order semantics), global-norm gradient clipping (float32
+  norm over ALL gradients, per-gradient c/n scaling; the below-
+  threshold run must equal the no-clip run), lr_dropout (one fresh
+  mask per parameter per step - the USER_LEGACY frozen mask is
+  rejected: consecutive steps must differ; p=1.0 == disabled,
+  p=0.0 freezes weights while states still evolve; statistical
+  rate), the official state layout and checkpoint sub-names
+  (`iters:0` + all `ms_*`/`vs_*`/`acc_*`, positional `param_i`
+  keys for unnamed params, never object ids), the mandatory
+  resume test (5 steps -> snapshot weights+state -> fresh
+  optimizer -> restore -> step 6 == continuous run), `random_
+  binomial` (p=0/p=1 extremes, dtype/shape, seeded determinism,
+  per-call independence, Bernoulli rate over 200k draws), the nn
+  registry aliases, the TensorFlow-free import boundary, the
+  no-direct-CUDA AST check, and RTX 4090 execution through the
+  Phase 2 abstraction with CPU-vs-GPU parity (skip-if-CPU-only).
+
+Current counts (2026-09, after Phase 3E2): CUDA environment 180
+passed; CPU environment 167 passed + 13 skipped.
 
 Environments (git-ignored, created with `uv`):
 
