@@ -63,8 +63,28 @@ Populated in Phase 3B:
   and an AST check that no layer source calls `torch.cuda` or
   hardcodes `'cuda:'` device strings.
 
-Current counts (2026-09, after Phase 3B): CUDA environment 86 passed;
-CPU environment 77 passed + 9 skipped.
+Populated in Phase 3C:
+
+- `test_depth_to_space.py` — Phase 3C acceptance for the
+  official-compatible `depth_to_space` (TF R-R-C semantics):
+  deterministic exact index placement (block size 2, every output
+  cell checked, plus the classic 2x2 placement table), random
+  unique-value tensors against an independent NumPy implementation of
+  the official index formula (multiple channel counts 4/8/12/16/9/18,
+  non-square spatial sizes, block sizes 1/2/3 — TensorFlow runtime
+  parity honestly labeled NOT_VERIFIED in this phase), invalid
+  channel-count/size rejection (strict ValueError), CPU execution,
+  RTX 4090 GPU execution through the Phase 2 abstraction with
+  bit-exact CPU-vs-GPU equality (skip-if-CPU-only), dtype
+  preservation (float32/float16/float64), gradient-flow smoke (the op
+  is an element bijection, so `sum().backward()` gives exact ones),
+  the NHWC boundary contract, the `nn.depth_to_space` alias used by
+  official call sites, no TensorFlow import in the production path,
+  and an AST check that the ops source contains no `torch.cuda` or
+  `cuda:` literals.
+
+Current counts (2026-09, after Phase 3C): CUDA environment 108
+passed; CPU environment 98 passed + 10 skipped.
 
 Environments (git-ignored, created with `uv`):
 
