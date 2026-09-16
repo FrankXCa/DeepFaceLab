@@ -20,9 +20,13 @@ Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
 migrated dssim, gaussian_blur, style_loss, pixel_norm; Phase 3E1
 migrated flatten, reshape_4D, average_tensor_list,
-total_variation_mse; the rest of the official ops are preserved in
-ops/ops_tf.py and rebuilt in later subphases), optimizers/*,
-archis/*, models/* (Phases 6-8).
+total_variation_mse; Phase 3E2 migrated random_binomial; the rest of
+the official ops are preserved in ops/ops_tf.py and rebuilt in later
+subphases), optimizers/* (Phase 3E2 migrated the optimizer
+foundation, AdaBelief and RMSprop in torch; the TF reference is
+preserved in optimizers/optimizers_tf.py; only the gradient
+machinery - nn.gradients/average_gv_list - stays TF until the
+model/multi-GPU phases), archis/*, models/* (Phases 6-8).
 
 NCHW speed up training for 10-20%.
 """
@@ -66,15 +70,17 @@ class nn():
             # Torch foundation registries (Phase 3A: layers foundation and
             # initializers; Phase 3C/3D/3E1: torch ops - depth_to_space,
             # dssim, gaussian_blur, style_loss, pixel_norm, flatten,
-            # reshape_4D, average_tensor_list, total_variation_mse). The
-            # remaining leras subpackages (remaining ops, optimizers,
-            # archis, models) are rebuilt in later Phase 3 subphases /
-            # model phases and are imported by their own subphase entry
-            # points.
+            # reshape_4D, average_tensor_list, total_variation_mse;
+            # Phase 3E2: torch optimizers - OptimizerBase, AdaBelief,
+            # RMSprop + the random_binomial op). The remaining leras
+            # subpackages (remaining ops, archis, models) are rebuilt in
+            # later Phase 3 subphases / model phases and are imported by
+            # their own subphase entry points.
             import core.leras.layers  # noqa: F401
             import core.leras.initializers  # noqa: F401
             import core.leras.checkpoint  # noqa: F401
             import core.leras.ops  # noqa: F401
+            import core.leras.optimizers  # noqa: F401  (Phase 3E2: torch optimizers)
 
         torch = nn.torch
 

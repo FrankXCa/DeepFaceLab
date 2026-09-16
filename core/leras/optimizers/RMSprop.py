@@ -1,10 +1,37 @@
-import numpy as np
-from tensorflow.python.ops import control_flow_ops, state_ops
-from core.leras import nn
-tf = nn.tf
+"""RMSprop — official DFL optimizer, torch (Phase 3E2).
 
-class RMSprop(nn.OptimizerBase):
-    def __init__(self, lr=0.001, rho=0.9, lr_dropout=1.0, lr_cos=0, clipnorm=0.0, name=None, **kwargs):
+The official update (preserved verbatim; the TF reference is in
+``optimizers_tf.py``) is, per parameter per step:
+
+    new_a = rho * acc + (1 - rho) * g^2
+    v_diff = - lr * g / (sqrt(new_a) + finfo(g.dtype).resolution)
+    v += v_diff                                          # (+ lr_dropout mask)
+
+with ``lr`` optionally scaled by the official lr_cos factor
+``(cos(iters * 2*3.1415926535/lr_cos) + 1)/2`` (post-increment
+iteration count) and the gradient pre-clipped by the optimizer's
+global norm when ``clipnorm > 0``.
+
+Official semantics preserved (see the OptimizerBase docstring for
+the shared mechanics): the official epsilon IS the dtype
+resolution (f32: 1.19e-07), there is NO momentum and NO centering
+(standard ``torch.optim.RMSprop`` has neither the official state
+naming — ``acc_*``, not ``vs_*`` — nor the official lr_cos /
+lr_dropout / global-norm-clip machinery, so it is NOT substituted),
+the state layout is ``iters`` + all ``acc_*``, and the lr_dropout
+mask is resampled every step (the USER_LEGACY frozen mask is
+rejected).
+"""
+
+import torch
+
+from core.leras import nn
+from .OptimizerBase import OptimizerBase
+
+
+class RMSprop(OptimizerBase):
+    def __init__(self, lr=0.001, rho=0.9, lr_dropout=1.0, lr_cos=0,
+                 clipnorm=0.0, name=None, **kwargs):
         super().__init__(name=name)
 
         if name is None:
@@ -16,59 +43,35 @@ class RMSprop(nn.OptimizerBase):
         self.rho = rho
         self.clipnorm = clipnorm
 
-        with tf.device('/CPU:0') :
-            with tf.variable_scope(self.name):
-                
-                self.iterations = tf.Variable(0, dtype=tf.int64, name='iters')
-
+        # official: tf variable 'acc_<varname>' under the optimizer
+        # scope (zero-init, same shape/dtype as the parameter)
         self.accumulators_dict = {}
-        self.lr_rnds_dict = {}
 
-    def get_weights(self):
-        return [self.iterations] + list(self.accumulators_dict.values())
+    def _build_state(self, weights):
+        for i, v in enumerate(weights):
+            key = self._weight_key(v, i)
+            self.accumulators_dict[key] = self._zero_state(
+                self._state_sub_name('acc', key), v)
+        self._state_official_names = [
+            self._state_sub_name('acc', k) for k in self.accumulators_dict
+        ]
 
-    def initialize_variables(self, trainable_weights, vars_on_cpu=True, lr_dropout_on_cpu=False):
-        # Initialize here all trainable variables used in training
-        e = tf.device('/CPU:0') if vars_on_cpu else None
-        if e: e.__enter__()
-        with tf.variable_scope(self.name):
-            accumulators = { v.name : tf.get_variable ( f'acc_{v.name}'.replace(':','_'), v.shape, dtype=v.dtype, initializer=tf.initializers.constant(0.0), trainable=False) for v in trainable_weights }
-            self.accumulators_dict.update ( accumulators)
+    def _states(self):
+        return list(self.accumulators_dict.values())
 
-            if self.lr_dropout != 1.0:
-                e = tf.device('/CPU:0') if lr_dropout_on_cpu else None
-                if e: e.__enter__()                    
-                lr_rnds = [ nn.random_binomial( v.shape, p=self.lr_dropout, dtype=v.dtype) for v in trainable_weights ]
-                if e: e.__exit__(None, None, None)                
-                self.lr_rnds_dict.update ( { v.name : rnd for v,rnd in zip(trainable_weights,lr_rnds) } )
-        if e: e.__exit__(None, None, None)
+    def _update(self, g, v, lr):
+        key = self._key_of(v)
+        acc = self.accumulators_dict[key]
 
-    def get_update_op(self, grads_vars):
-        updates = []
+        new_a = self.rho * acc + (1. - self.rho) * g.pow(2)
 
-        if self.clipnorm > 0.0:
-            norm = tf.sqrt( sum([tf.reduce_sum(tf.square(tf.cast(g, tf.float32))) for g,v in grads_vars]))
-        updates += [ state_ops.assign_add( self.iterations, 1) ]
-        for i, (g,v) in enumerate(grads_vars):
-            if self.clipnorm > 0.0:
-                g = self.tf_clip_norm(g, self.clipnorm, tf.cast(norm, g.dtype) )
+        # official: np.finfo(g.dtype).resolution == torch.finfo(...).eps
+        v_diff = -lr * g / (torch.sqrt(new_a)
+                            + torch.finfo(g.dtype).eps)
+        v_diff = self._apply_lr_dropout_mask(v_diff, v)
+        v.add_(v_diff)
 
-            a = self.accumulators_dict[ v.name ]
+        acc.copy_(new_a)
 
-            new_a = self.rho * a + (1. - self.rho) * tf.square(g)
 
-            lr = tf.constant(self.lr, g.dtype)
-            if self.lr_cos != 0:
-                lr *= (tf.cos(  tf.cast(self.iterations, g.dtype) * (2*3.1415926535/ float(self.lr_cos) )  ) + 1.0) / 2.0
-
-            v_diff = - lr * g / (tf.sqrt(new_a) + np.finfo( g.dtype.as_numpy_dtype ).resolution  )
-            if self.lr_dropout != 1.0:
-                lr_rnd = self.lr_rnds_dict[v.name]
-                v_diff *= lr_rnd
-            new_v = v + v_diff
-
-            updates.append (state_ops.assign(a, new_a))
-            updates.append (state_ops.assign(v, new_v))
-
-        return control_flow_ops.group ( *updates, name=self.name+'_updates')
 nn.RMSprop = RMSprop
