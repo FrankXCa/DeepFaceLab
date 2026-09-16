@@ -12,14 +12,23 @@ reference code, never imported by torch paths):
 - Phase 3D: ``dssim``, ``gaussian_blur``, ``style_loss``,
   ``pixel_norm`` (the core numerical ops required by the official
   SAEHD/AMP/Quick96/XSeg loss stacks and the SAEHD archi).
+- Phase 3E1 (in progress): ``flatten``, ``reshape_4D`` (tensor-layout
+  ops used by the SAEHD/AMP/XSeg archi dense<->map transitions, this
+  state); ``average_tensor_list`` and ``total_variation_mse`` (the
+  reduction/loss helpers used by the official model code) follow in
+  the next commit.
 
 Still TensorFlow (later Phase 3 subphases / model phases; see
 ``ops/ops_tf.py``): rgb_to_lab (dead in the official baseline - no
-callers; documented deferral), total_variation_mse (SAEHD/AMP GAN
-term -> model phase), average_tensor_list, gelu, upsample2d,
-resize2d_*, flatten, max_pool, reshape_4D, space_to_depth,
-random_binomial (AdaBelief -> Phase 3E), tf_gradients,
-average_gv_list, batch_set_value, tf_get_value (session machinery),
+callers; documented deferral), average_tensor_list, total_variation
+_mse (next commit), gelu (no baseline callers), upsample2d
+(FANExtractor - facelib TF code), resize2d_* (FaceEnhancer - facelib
+TF code), max_pool (no nn-namespace callers in the baseline),
+space_to_depth (no baseline callers), random_binomial (-> Phase 3E2
+with the optimizers that are its only consumers),
+tf_gradients/nn.gradients + average_gv_list (-> Phase 3E2
+optimizer/multi-GPU gradient flow), batch_set_value/tf_get_value
+(session machinery - disappears under the torch foundation),
 bilinear_sampler (TanhPolar phase).
 
 Importing this package never touches TensorFlow.
@@ -119,6 +128,22 @@ implementations of the official formulas):
 - ``pixel_norm(x, axes)``: ``x * rsqrt(mean(x^2, axes, keepdims) +
   1e-06)`` with the official epsilon 1e-6 (External B's 1e-8
   epsilon is rejected) and the official required-``axes`` signature.
+
+flatten / reshape_4D (Phase 3E1)
+================================
+
+- ``flatten(x)``: the official always flattens in the NCHW layout
+  (channel-major ``(-1, C*H*W)``): an NHWC input is boundary-
+  permuted to NCHW first so the result is channel-major regardless
+  of ``nn.data_format`` (the legacy ``torch.flatten(x, start_dim=1)``
+  and External A's NCHW-only reshape flatten an NHWC input
+  spatial-major - rejected).
+- ``reshape_4D(x, w, h, c)``: the official always reshapes the flat
+  tail as the NCHW layout ``(-1, c, h, w)`` (channel-major); an NHWC
+  data_format produces an NHWC tensor (boundary permutation). The
+  flat tail must contain exactly ``c*h*w`` elements per sample -
+  torch's reshape fails explicitly otherwise (no permissive
+  heuristics).
 """
 
 import numpy as np
@@ -335,8 +360,38 @@ def pixel_norm(x, axes):
     return x * torch.rsqrt(torch.mean(x.pow(2), dim=axes, keepdim=True) + 1e-06)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3E1: flatten / reshape_4D (tensor layout)
+# ---------------------------------------------------------------------------
+
+def flatten(x):
+    """Official DFL flatten: channel-major ``(-1, C*H*W)`` in the NCHW
+    layout - an NHWC input is boundary-permuted first so the result
+    is channel-major regardless of ``nn.data_format`` (the SAEHD
+    archi, XSeg and the AMP archi rely on this layout for their
+    dense<->map transitions)."""
+    if nn.data_format == "NHWC":
+        x = nn.to_data_format(x, "NCHW", "NHWC")
+    return x.reshape(x.shape[0], -1)
+
+
+def reshape_4D(x, w, h, c):
+    """Official DFL reshape_4D: interpret the flat tail of each sample
+    as the NCHW layout ``(-1, c, h, w)`` (channel-major, matching the
+    official ``flatten``); an NHWC data_format yields an NHWC tensor
+    (boundary permutation). The flat tail must hold exactly c*h*w
+    elements per sample - torch's reshape fails explicitly otherwise
+    (the official tf.reshape raised InvalidArgumentError)."""
+    x = x.reshape(-1, c, h, w)
+    if nn.data_format == "NHWC":
+        x = nn.to_data_format(x, "NHWC", "NCHW")
+    return x
+
+
 nn.depth_to_space = depth_to_space
 nn.dssim = dssim
 nn.gaussian_blur = gaussian_blur
 nn.style_loss = style_loss
 nn.pixel_norm = pixel_norm
+nn.flatten = flatten
+nn.reshape_4D = reshape_4D
