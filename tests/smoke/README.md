@@ -359,8 +359,95 @@ Populated in Phase 5:
   test-environment measure only — no production code is affected and
   CUDA tests are unaffected (GPU kernels do not use these pools).
 
-Current counts (2026-09, after the Phase 5 publish audit): CUDA environment 316
-passed; CPU environment 299 passed + 17 skipped.
+Populated in Phase 6A (SAEHD structural skeleton):
+
+- `test_model_saehd.py` — Phase 6A acceptance for the official SAEHD
+  model on the torch foundation (`models/Model_SAEHD/Model.py`; the
+  verbatim official TF source `Model_tf.py` is a never-imported
+  reference): option parsing (stored-options resume, legacy
+  `eyes_prio` pop, `lr_dropout` bool->'y' backward compat, the
+  true-face zeroing warning for non-'df' archis, the pretrain
+  structural overrides), the two official detection flags
+  (`pretrain_just_disabled` inter re-init + `set_iter(0)`,
+  `gan_model_changed` D_src re-init — both exercised headless
+  through scripted `builtins.input` answers + a forced
+  `input_in_time`, the official Model_tf.py L180-185 semantics),
+  archi parsing (`df`/`liae` bases, `u/d/t/c` modifier subsets,
+  explicit `ValueError` on `xseg-ud`/`df-`/`df-xyz`/`df-ud-l`/
+  `SAEHD`/`liae-x`), component construction & registration under
+  the official logical names/files (df `encoder`/`inter`/
+  `decoder_src`/`decoder_dst` + `dis`/`code_discriminator.npy`,
+  liae `encoder`/`inter_AB`/`inter_B`/`decoder`, `D_src`/`GAN.npy`,
+  the three optimizers `src_dst_opt`/`D_code_opt`/`GAN_opt`), the
+  official lr=5e-5 optimizer wiring (AdaBelief vs RMSprop,
+  clipgrad->clipnorm, the lr_cos/lr_dropout coupling, the official
+  src_dst saveable/trainable weight lists incl. the `random_warp`
+  effect), forward shapes for every modifier combo at the official
+  `get_out_res`/`get_out_ch` contract at resolutions 64/128/256
+  (flat encoder code, spatial inter codes, decoder BGR+mask at the
+  input resolution for every archi variant — the `-d` head doubles
+  the half-res inter map via `depth_to_space` back to full
+  resolution, the official "same computation cost" semantics —,
+  `D_src` `(center_out, x)`, `CodeDiscriminator` downsampled
+  single-channel map), backward
+  readiness (autograd reaches
+  every in-graph component with finite grads; unused components
+  stay grad-free — no loss, Phase 6B), the headless lifecycle via
+  the test-only `Model_SAEHDTest` package (overrides ONLY
+  `on_initialize_options` with a direct seed; real packed facesets
+  through the in-process `ThisThreadGenerator`, `debug=True`), a
+  strict save/load round-trip EXACT between the headless bootstrap
+  (all nine official files for df + true_face + GAN) and the REAL
+  `SAEHDModel` resume (CPU + RTX 4090 skip-if-CPU-only), strict
+  resume failures (missing required file, truncated pickle,
+  malformed `data.dat`, archi mismatch, shape mismatch via
+  `CheckpointLoadError`), CPU-only / GPU device placement, the
+  TensorFlow import boundary, AST hygiene over the torch sources
+  (no tensorflow import, no `torch.cuda`/`"cuda:"`), the official
+  optimizer-state file fidelity tests (every optimized parameter is
+  bound to its official component-relative name before
+  `initialize_variables`, so the state files carry the official
+  `iters:0` + `ms_`/`vs_<component>/<sub>_0:0` keys — never
+  positional `param_<i>` — and the conv-kernel state tensors are
+  stored on disk in the OFFICIAL orientation of the tracked
+  variable, restored EXACT through the Phase 4 layout rule on a
+  fresh optimizer; the foundation-level layout rule itself is
+  pinned by `test_checkpoint_conversion.py`), the official
+  `predictor_func` / `get_MergerConfig` merge-boundary wrappers
+  (NumPy in / NumPy out; the `merger` package import is TF-free
+  under the torch venv), the `onTrainOneIter` / `export_dfm`
+  Phase 6B/11 deferral stubs (explicit deterministic raises), and
+  the OPTIONAL real-artifact validations (both env-gated; unset ->
+  skip; never hardcoded): `DFL_TEST_SAEHD_CHECKPOINT` (path to an
+  official SAEHD checkpoint dir; files are copied into the test
+  temp dir — the private dir is never read in place; both on-disk
+  prefixes — bare `SAEHD_*` and `<model>_SAEHD_*` — are renamed to
+  the test model name; options from the checkpoint's own `data.dat`,
+  the documented test-only `face_type 'wf'->'f'` substitution;
+  the resume runs in the TRAINING context so the GAN/optimizer-
+  state files are registered and strictly loaded in-place; per-file
+  Phase 4 conversion-engine validation with zero missing-REQUIRED
+  keys / zero shape+dtype mismatches as hard gates, benign legacy
+  extra keys reported; labels REAL CHECKPOINT STRUCTURAL MAPPING
+  TESTED / TRAINING PARITY NOT_VERIFIED) and `DFL_TEST_FACESET_PAK`
+  (path to an official `faceset.pak` or its parent dir; the full
+  sample-generator lifecycle on REAL images + landmarks —
+  SampleLoader/PackedFaceset, in-process `ThisThreadGenerator`,
+  uniform-yaw index host, SampleProcessor output contract with
+  both mask channels).
+- `Model_SAEHDTest/` (test-only package) — the headless bootstrap
+  vehicle for the SAEHD suite: `SAEHDHeadless` (mirrors the Phase 5
+  `Model_Dummy` convention — the folder name feeds the official
+  `model_class_name` derivation), deterministic packed-faceset
+  fixtures (2DFAN 68-point landmark layout, official
+  `faceset.pak` VERSION-1 layout) and `make_model`.
+
+Current counts (2026-09, after the Phase 6A publish audit): CUDA
+environment 415 passed + 2 skipped; CPU environment 396 passed + 21
+skipped (the optional real-artifact validations —
+`DFL_TEST_SAEHD_CHECKPOINT` / `DFL_TEST_FACESET_PAK` — skip without
+the environment variables and are validated separately against the
+local official artifacts).
 
 Environments (git-ignored, created with `uv`):
 
