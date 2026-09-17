@@ -1,76 +1,47 @@
-"""DeepFakeArchi — torch implementation of the official leras contract
-(Phase 3F).
+"""DEAD REFERENCE - official DeepFaceLab (TF) source, preserved verbatim for the
+Phase 3F review record. Do not import, do not execute, do not maintain.
 
-Official behavior preserved (dead official TF reference: ``archis_tf.py``):
-- ``DeepFakeArchi(resolution, use_fp16=False, mod=None, opts=None)`` is a
-  factory: when ``mod is None`` it defines the block classes ``Downscale``,
-  ``DownscaleBlock``, ``Upscale``, ``ResidualBlock`` and the sub-model
-  classes ``Encoder``/``Inter``/``Decoder``, closing over ``conv_dtype``,
-  the ``act`` activation, ``use_fp16`` and ``opts`` exactly like the
-  official code; the models instantiate ``archi.Encoder/Inter/Decoder``
-  and register the instances as their own attributes (``name=...``) —
-  the official calling pattern is unchanged;
-- the official ``mod`` parameter only has a ``mod is None`` code branch
-  (the docstring mentions 'quick', but the official code never implements
-  it); the torch factory mirrors the official structure, so any other
-  ``mod`` value is a dead end here exactly like it is officially;
-- opts semantics (official):
-    't'  encoder down1..down5 + res1/res5 chain (5 halvings -> res//32),
-         inter without upscale1 (out res = lowest_dense_res), decoder
-         upscale0..upscale3 + res0..res3;
-    'd'  lowest_dense_res = resolution//32 (else //16), decoder x-head =
-         sigmoid of depth_to_space(concat(out_conv, out_conv1..3, ch_axis))
-         (2x resolution), extra mask stages upscalem3 ('d' without 't')
-         or upscalem4 ('d' with 't');
-    'u'  nn.pixel_norm(axes=-1) on the flattened encoder output
-         (official epsilon 1e-6, Phase 3D op);
-    'c'  CosRelu activation ``x*cos(x)`` (alpha ignored) in place of
-         leaky_relu (Downscale/Upscale 0.1, ResidualBlock 0.2 otherwise);
-- use_fp16: ``conv_dtype = torch.float16`` (else ``torch.float32``) on the
-  Conv2D layers + boundary casts at the encoder/inter/decoder edges,
-  exactly like the official ``tf.cast``; this is plain dtype handling —
-  NO mixed-precision (AMP) policy is introduced (Phase 3F exclusion);
-- checkpoint naming: official list-scope names are reproduced by
-  registering list children under ``<attr>_<i>`` module names (the
-  official ``ModelBase._build_sub`` names list elements ``f"{name}_{i}"``)
-  while keeping the plain ``self.downs`` reference list for the forward
-  loop; ``torch.nn.ModuleList`` is deliberately NOT used — its dotted
-  index names (``downs/0/...``) would not be official DFL checkpoint keys.
-  The torch dotted tree names therefore map 1:1 to the official variable
-  names via ``core.leras.checkpoint.official_name``
-  (e.g. ``encoder/down1/downs_0/conv1/weight:0``).
-- layers are Phase 3B torch layers (official ``weight``/``bias``
-  parameter names, official layouts); two-phase lifecycle preserved:
-  children are registered into the module tree first, then the
-  Conv2D/Dense leaves run ``build_weights()`` (the torch equivalent of
-  the official ``ModelBase.build`` / ``build_weights`` phase);
-  ``init_weights`` cascades to the whole sub-tree like the official
-  archis.
+This file contains the official TensorFlow implementations that Phase 3F
+replaced in place with the torch versions:
+
+    ArchiBase.py        (official: 17 lines)  -> core/leras/archis/ArchiBase.py (torch)
+    DeepFakeArchi.py    (official: 265 lines) -> core/leras/archis/DeepFakeArchi.py (torch)
+
+The official code is kept exactly as shipped in the upstream baseline
+(commit e4b7543ffa1d73b26fce1e31852727f658ba490c). The torch replacements
+preserve its public API, tensor layouts, option semantics (opts: empty /
+'t' / 'd' / 'u' / 'c' combinations and use_fp16) and official checkpoint
+naming (see core.leras.checkpoint).
 """
 
-import torch
+# ===========================================================================
+# OFFICIAL (TF) ArchiBase.py
+# ===========================================================================
 
 from core.leras import nn
-from core.leras.layers.LayerBase import LayerBase
 
+class ArchiBase():
+    
+    def __init__(self, *args, name=None, **kwargs):
+        self.name=name
+        
+       
+    #overridable 
+    def flow(self, *args, **kwargs):
+        raise Exception("this archi does not support flow. Use model classes directly.")
+    
+    #overridable
+    def get_weights(self):
+        pass
+    
+nn.ArchiBase = ArchiBase
 
-def _build_leaf_weights(module):
-    """Create the parameters of all Conv2D/Dense leaves under ``module``
-    (torch equivalent of the official build phase that runs after the
-    tree placement). Idempotent: leaves that already own their weights
-    (built by their own ``__init__``) are left untouched."""
-    for m in module.modules():
-        if isinstance(m, (nn.Conv2D, nn.Dense)) and not hasattr(m, "weight"):
-            m.build_weights()
+# ===========================================================================
+# OFFICIAL (TF) DeepFakeArchi.py
+# ===========================================================================
 
-
-def _cascade_init_weights(module):
-    """Apply every initializer registered in the sub-tree (official
-    archis initialize all nested layers; the Phase 3A foundation
-    initializes only direct parameters, so archis cascade)."""
-    for m in module.modules():
-        nn.init_weights(m)
-
+from core.leras import nn
+tf = nn.tf
 
 class DeepFakeArchi(nn.ArchiBase):
     """
@@ -90,24 +61,25 @@ class DeepFakeArchi(nn.ArchiBase):
             opts = ''
 
 
-        conv_dtype = torch.float16 if use_fp16 else torch.float32
-
+        conv_dtype = tf.float16 if use_fp16 else tf.float32
+        
         if 'c' in opts:
             def act(x, alpha=0.1):
-                return x*torch.cos(x)
+                return x*tf.cos(x)
         else:
             def act(x, alpha=0.1):
-                return torch.nn.functional.leaky_relu(x, alpha)
-
+                return tf.nn.leaky_relu(x, alpha)
+                
         if mod is None:
-            class Downscale(LayerBase):
-                def __init__(self, in_ch, out_ch, kernel_size=5, name=None):
+            class Downscale(nn.ModelBase):
+                def __init__(self, in_ch, out_ch, kernel_size=5, *kwargs ):
                     self.in_ch = in_ch
                     self.out_ch = out_ch
                     self.kernel_size = kernel_size
-                    super().__init__(name=name)
+                    super().__init__(*kwargs)
+
+                def on_build(self, *args, **kwargs ):
                     self.conv1 = nn.Conv2D( self.in_ch, self.out_ch, kernel_size=self.kernel_size, strides=2, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
 
                 def forward(self, x):
                     x = self.conv1(x)
@@ -117,22 +89,14 @@ class DeepFakeArchi(nn.ArchiBase):
                 def get_out_ch(self):
                     return self.out_ch
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
-            class DownscaleBlock(LayerBase):
-                def __init__(self, in_ch, ch, n_downscales, kernel_size, name=None):
-                    super().__init__(name=name)
-
+            class DownscaleBlock(nn.ModelBase):
+                def on_build(self, in_ch, ch, n_downscales, kernel_size):
                     self.downs = []
 
                     last_ch = in_ch
                     for i in range(n_downscales):
                         cur_ch = ch*( min(2**i, 8)  )
-                        d = Downscale(last_ch, cur_ch, kernel_size=kernel_size)
-                        # official list scope name: 'downs_<i>' (ModelBase._build_sub)
-                        setattr(self, f"downs_{i}", d)
-                        self.downs.append (d)
+                        self.downs.append ( Downscale(last_ch, cur_ch, kernel_size=kernel_size))
                         last_ch = self.downs[-1].get_out_ch()
 
                 def forward(self, inp):
@@ -141,14 +105,9 @@ class DeepFakeArchi(nn.ArchiBase):
                         x = down(x)
                     return x
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
-            class Upscale(LayerBase):
-                def __init__(self, in_ch, out_ch, kernel_size=3, name=None):
-                    super().__init__(name=name)
+            class Upscale(nn.ModelBase):
+                def on_build(self, in_ch, out_ch, kernel_size=3):
                     self.conv1 = nn.Conv2D( in_ch, out_ch*4, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
 
                 def forward(self, x):
                     x = self.conv1(x)
@@ -156,15 +115,10 @@ class DeepFakeArchi(nn.ArchiBase):
                     x = nn.depth_to_space(x, 2)
                     return x
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
-            class ResidualBlock(LayerBase):
-                def __init__(self, ch, kernel_size=3, name=None):
-                    super().__init__(name=name)
+            class ResidualBlock(nn.ModelBase):
+                def on_build(self, ch, kernel_size=3):
                     self.conv1 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
                     self.conv2 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
 
                 def forward(self, inp):
                     x = self.conv1(inp)
@@ -173,15 +127,13 @@ class DeepFakeArchi(nn.ArchiBase):
                     x = act(inp + x, 0.2)
                     return x
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
-            class Encoder(LayerBase):
-                def __init__(self, in_ch, e_ch, name=None):
+            class Encoder(nn.ModelBase):
+                def __init__(self, in_ch, e_ch, **kwargs ):
                     self.in_ch = in_ch
                     self.e_ch = e_ch
-                    super().__init__(name=name)
+                    super().__init__(**kwargs)
 
+                def on_build(self):
                     if 't' in opts:
                         self.down1 = Downscale(self.in_ch, self.e_ch, kernel_size=5)
                         self.res1 = ResidualBlock(self.e_ch)
@@ -191,15 +143,11 @@ class DeepFakeArchi(nn.ArchiBase):
                         self.down5 = Downscale(self.e_ch*8, self.e_ch*8, kernel_size=5)
                         self.res5 = ResidualBlock(self.e_ch*8)
                     else:
-                        # official: n_downscales=4 if 't' not in opts else 5
-                        # (this branch is only reached when 't' is not in opts)
-                        self.down1 = DownscaleBlock(self.in_ch, self.e_ch, n_downscales=4, kernel_size=5)
-
-                    _build_leaf_weights(self)
+                        self.down1 = DownscaleBlock(self.in_ch, self.e_ch, n_downscales=4 if 't' not in opts else 5, kernel_size=5)
 
                 def forward(self, x):
                     if use_fp16:
-                        x = x.to(torch.float16)
+                        x = tf.cast(x, tf.float16)
 
                     if 't' in opts:
                         x = self.down1(x)
@@ -216,7 +164,7 @@ class DeepFakeArchi(nn.ArchiBase):
                         x = nn.pixel_norm(x, axes=-1)
 
                     if use_fp16:
-                        x = x.to(torch.float32)
+                        x = tf.cast(x, tf.float32)
                     return x
 
                 def get_out_res(self, res):
@@ -225,22 +173,20 @@ class DeepFakeArchi(nn.ArchiBase):
                 def get_out_ch(self):
                     return self.e_ch * 8
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
             lowest_dense_res = resolution // (32 if 'd' in opts else 16)
 
-            class Inter(LayerBase):
-                def __init__(self, in_ch, ae_ch, ae_out_ch, name=None):
+            class Inter(nn.ModelBase):
+                def __init__(self, in_ch, ae_ch, ae_out_ch, **kwargs):
                     self.in_ch, self.ae_ch, self.ae_out_ch = in_ch, ae_ch, ae_out_ch
-                    super().__init__(name=name)
+                    super().__init__(**kwargs)
+
+                def on_build(self):
+                    in_ch, ae_ch, ae_out_ch = self.in_ch, self.ae_ch, self.ae_out_ch
 
                     self.dense1 = nn.Dense( in_ch, ae_ch )
                     self.dense2 = nn.Dense( ae_ch, lowest_dense_res * lowest_dense_res * ae_out_ch )
                     if 't' not in opts:
                         self.upscale1 = Upscale(ae_out_ch, ae_out_ch)
-
-                    _build_leaf_weights(self)
 
                 def forward(self, inp):
                     x = inp
@@ -249,7 +195,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     x = nn.reshape_4D (x, lowest_dense_res, lowest_dense_res, self.ae_out_ch)
 
                     if use_fp16:
-                        x = x.to(torch.float16)
+                        x = tf.cast(x, tf.float16)
 
                     if 't' not in opts:
                         x = self.upscale1(x)
@@ -262,12 +208,8 @@ class DeepFakeArchi(nn.ArchiBase):
                 def get_out_ch(self):
                     return self.ae_out_ch
 
-                def init_weights(self):
-                    _cascade_init_weights(self)
-
-            class Decoder(LayerBase):
-                def __init__(self, in_ch, d_ch, d_mask_ch, name=None):
-                    super().__init__(name=name)
+            class Decoder(nn.ModelBase):
+                def on_build(self, in_ch, d_ch, d_mask_ch):
                     if 't' not in opts:
                         self.upscale0 = Upscale(in_ch, d_ch*8, kernel_size=3)
                         self.upscale1 = Upscale(d_ch*8, d_ch*4, kernel_size=3)
@@ -315,13 +257,9 @@ class DeepFakeArchi(nn.ArchiBase):
                         else:
                             self.out_convm = nn.Conv2D( d_mask_ch*2, 1, kernel_size=1, padding='SAME', dtype=conv_dtype)
 
-                    _build_leaf_weights(self)
-
-
+                
+                    
                 def forward(self, z):
-                    # official: no input cast here — with use_fp16 the inter
-                    # output already arrives in fp16 (Inter casts before its
-                    # return); the conv weights are fp16 via conv_dtype
                     x = self.upscale0(z)
                     x = self.res0(x)
                     x = self.upscale1(x)
@@ -334,12 +272,13 @@ class DeepFakeArchi(nn.ArchiBase):
                         x = self.res3(x)
 
                     if 'd' in opts:
-                        x = torch.sigmoid( nn.depth_to_space(torch.cat( (self.out_conv(x),
+                        x = tf.nn.sigmoid( nn.depth_to_space(tf.concat( (self.out_conv(x),
                                                                          self.out_conv1(x),
                                                                          self.out_conv2(x),
                                                                          self.out_conv3(x)), nn.conv2d_ch_axis), 2) )
                     else:
-                        x = torch.sigmoid(self.out_conv(x))
+                        x = tf.nn.sigmoid(self.out_conv(x))
+
 
                     m = self.upscalem0(z)
                     m = self.upscalem1(m)
@@ -353,20 +292,16 @@ class DeepFakeArchi(nn.ArchiBase):
                         if 'd' in opts:
                             m = self.upscalem3(m)
 
-                    m = torch.sigmoid(self.out_convm(m))
+                    m = tf.nn.sigmoid(self.out_convm(m))
 
                     if use_fp16:
-                        x = x.to(torch.float32)
-                        m = m.to(torch.float32)
+                        x = tf.cast(x, tf.float32)
+                        m = tf.cast(m, tf.float32)
 
                     return x, m
-
-                def init_weights(self):
-                    _cascade_init_weights(self)
 
         self.Encoder = Encoder
         self.Inter = Inter
         self.Decoder = Decoder
-
 
 nn.DeepFakeArchi = DeepFakeArchi

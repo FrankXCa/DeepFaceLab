@@ -26,7 +26,10 @@ subphases), optimizers/* (Phase 3E2 migrated the optimizer
 foundation, AdaBelief and RMSprop in torch; the TF reference is
 preserved in optimizers/optimizers_tf.py; only the gradient
 machinery - nn.gradients/average_gv_list - stays TF until the
-model/multi-GPU phases), archis/*, models/* (Phases 6-8).
+model/multi-GPU phases); archis/* (Phase 3F migrated ArchiBase and the
+DeepFakeArchi factory to torch - the official TF source is preserved in
+archis/archis_tf.py); models/* (Phases 6-8: the TF ModelBase/XSeg
+foundation).
 
 NCHW speed up training for 10-20%.
 """
@@ -72,15 +75,18 @@ class nn():
             # dssim, gaussian_blur, style_loss, pixel_norm, flatten,
             # reshape_4D, average_tensor_list, total_variation_mse;
             # Phase 3E2: torch optimizers - OptimizerBase, AdaBelief,
-            # RMSprop + the random_binomial op). The remaining leras
-            # subpackages (remaining ops, archis, models) are rebuilt in
-            # later Phase 3 subphases / model phases and are imported by
-            # their own subphase entry points.
+            # RMSprop + the random_binomial op; Phase 3F: torch archis -
+            # ArchiBase, the DeepFakeArchi factory (Encoder/Inter/Decoder
+            # block classes)). The remaining leras subpackages (remaining
+            # ops, the models foundation) are rebuilt in later Phase 3
+            # subphases / model phases and are imported by their own
+            # subphase entry points.
             import core.leras.layers  # noqa: F401
             import core.leras.initializers  # noqa: F401
             import core.leras.checkpoint  # noqa: F401
             import core.leras.ops  # noqa: F401
             import core.leras.optimizers  # noqa: F401  (Phase 3E2: torch optimizers)
+            import core.leras.archis  # noqa: F401  (Phase 3F: torch archis foundation)
 
         torch = nn.torch
 
