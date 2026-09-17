@@ -32,6 +32,27 @@ from core.leras import nn
 from .Saveable import Saveable
 
 
+def build_leaf_weights(module):
+    """Create the parameters of all Conv2D/Conv2DTranspose/Dense leaves
+    under ``module`` (torch equivalent of the official build phase that
+    runs after the tree placement — see the official ``ModelBase.build``
+    / ``build_weights`` two-phase lifecycle). Used by the Phase 3F archis
+    and discriminator classes. Idempotent: leaves that already own their
+    weights (built by their own ``__init__``) are left untouched."""
+    for m in module.modules():
+        if isinstance(m, (nn.Conv2D, nn.Conv2DTranspose, nn.Dense)) and not hasattr(m, "weight"):
+            m.build_weights()
+
+
+def cascade_init_weights(module):
+    """Apply every initializer registered in the sub-tree of ``module``.
+    The Phase 3A foundation initializes only direct parameters, while the
+    official archis/discriminators initialize all nested layers — the
+    official cascade, used by the Phase 3F archi/discriminator classes."""
+    for m in module.modules():
+        nn.init_weights(m)
+
+
 class LayerBase(torch.nn.Module, Saveable):
     def __init__(self, name=None, **kwargs):
         super().__init__()  # torch.nn.Module init (MRO)

@@ -28,8 +28,11 @@ preserved in optimizers/optimizers_tf.py; only the gradient
 machinery - nn.gradients/average_gv_list - stays TF until the
 model/multi-GPU phases); archis/* (Phase 3F migrated ArchiBase and the
 DeepFakeArchi factory to torch - the official TF source is preserved in
-archis/archis_tf.py); models/* (Phases 6-8: the TF ModelBase/XSeg
-foundation).
+archis/archis_tf.py; Phase 3F also migrated the official discriminator
+classes CodeDiscriminator/PatchDiscriminator/UNetPatchDiscriminator in
+core.leras.models to torch - the official TF source is preserved in
+models/discriminators_tf.py); models/* (Phases 6-8: the remaining TF
+ModelBase/XSeg foundation).
 
 NCHW speed up training for 10-20%.
 """
@@ -77,9 +80,12 @@ class nn():
             # Phase 3E2: torch optimizers - OptimizerBase, AdaBelief,
             # RMSprop + the random_binomial op; Phase 3F: torch archis -
             # ArchiBase, the DeepFakeArchi factory (Encoder/Inter/Decoder
-            # block classes)). The remaining leras subpackages (remaining
-            # ops, the models foundation) are rebuilt in later Phase 3
-            # subphases / model phases and are imported by their own
+            # block classes) and the official discriminator classes
+            # (CodeDiscriminator, PatchDiscriminator,
+            # UNetPatchDiscriminator - the remaining TF ModelBase/XSeg
+            # model foundation stays until Phases 6-8). The remaining
+            # leras subpackages (remaining ops) are rebuilt in later Phase
+            # 3 subphases / model phases and are imported by their own
             # subphase entry points.
             import core.leras.layers  # noqa: F401
             import core.leras.initializers  # noqa: F401
@@ -87,6 +93,7 @@ class nn():
             import core.leras.ops  # noqa: F401
             import core.leras.optimizers  # noqa: F401  (Phase 3E2: torch optimizers)
             import core.leras.archis  # noqa: F401  (Phase 3F: torch archis foundation)
+            import core.leras.models  # noqa: F401  (Phase 3F: torch discriminator classes)
 
         torch = nn.torch
 

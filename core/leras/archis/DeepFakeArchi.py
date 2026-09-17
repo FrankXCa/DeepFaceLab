@@ -51,25 +51,7 @@ Official behavior preserved (dead official TF reference: ``archis_tf.py``):
 import torch
 
 from core.leras import nn
-from core.leras.layers.LayerBase import LayerBase
-
-
-def _build_leaf_weights(module):
-    """Create the parameters of all Conv2D/Dense leaves under ``module``
-    (torch equivalent of the official build phase that runs after the
-    tree placement). Idempotent: leaves that already own their weights
-    (built by their own ``__init__``) are left untouched."""
-    for m in module.modules():
-        if isinstance(m, (nn.Conv2D, nn.Dense)) and not hasattr(m, "weight"):
-            m.build_weights()
-
-
-def _cascade_init_weights(module):
-    """Apply every initializer registered in the sub-tree (official
-    archis initialize all nested layers; the Phase 3A foundation
-    initializes only direct parameters, so archis cascade)."""
-    for m in module.modules():
-        nn.init_weights(m)
+from core.leras.layers.LayerBase import LayerBase, build_leaf_weights, cascade_init_weights
 
 
 class DeepFakeArchi(nn.ArchiBase):
@@ -107,7 +89,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     self.kernel_size = kernel_size
                     super().__init__(name=name)
                     self.conv1 = nn.Conv2D( self.in_ch, self.out_ch, kernel_size=self.kernel_size, strides=2, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
                 def forward(self, x):
                     x = self.conv1(x)
@@ -118,7 +100,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     return self.out_ch
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             class DownscaleBlock(LayerBase):
                 def __init__(self, in_ch, ch, n_downscales, kernel_size, name=None):
@@ -142,13 +124,13 @@ class DeepFakeArchi(nn.ArchiBase):
                     return x
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             class Upscale(LayerBase):
                 def __init__(self, in_ch, out_ch, kernel_size=3, name=None):
                     super().__init__(name=name)
                     self.conv1 = nn.Conv2D( in_ch, out_ch*4, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
                 def forward(self, x):
                     x = self.conv1(x)
@@ -157,14 +139,14 @@ class DeepFakeArchi(nn.ArchiBase):
                     return x
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             class ResidualBlock(LayerBase):
                 def __init__(self, ch, kernel_size=3, name=None):
                     super().__init__(name=name)
                     self.conv1 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
                     self.conv2 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
                 def forward(self, inp):
                     x = self.conv1(inp)
@@ -174,7 +156,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     return x
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             class Encoder(LayerBase):
                 def __init__(self, in_ch, e_ch, name=None):
@@ -195,7 +177,7 @@ class DeepFakeArchi(nn.ArchiBase):
                         # (this branch is only reached when 't' is not in opts)
                         self.down1 = DownscaleBlock(self.in_ch, self.e_ch, n_downscales=4, kernel_size=5)
 
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
                 def forward(self, x):
                     if use_fp16:
@@ -226,7 +208,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     return self.e_ch * 8
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             lowest_dense_res = resolution // (32 if 'd' in opts else 16)
 
@@ -240,7 +222,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     if 't' not in opts:
                         self.upscale1 = Upscale(ae_out_ch, ae_out_ch)
 
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
                 def forward(self, inp):
                     x = inp
@@ -263,7 +245,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     return self.ae_out_ch
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
             class Decoder(LayerBase):
                 def __init__(self, in_ch, d_ch, d_mask_ch, name=None):
@@ -315,7 +297,7 @@ class DeepFakeArchi(nn.ArchiBase):
                         else:
                             self.out_convm = nn.Conv2D( d_mask_ch*2, 1, kernel_size=1, padding='SAME', dtype=conv_dtype)
 
-                    _build_leaf_weights(self)
+                    build_leaf_weights(self)
 
 
                 def forward(self, z):
@@ -362,7 +344,7 @@ class DeepFakeArchi(nn.ArchiBase):
                     return x, m
 
                 def init_weights(self):
-                    _cascade_init_weights(self)
+                    cascade_init_weights(self)
 
         self.Encoder = Encoder
         self.Inter = Inter
