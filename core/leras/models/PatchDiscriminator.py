@@ -183,7 +183,7 @@ class UNetPatchDiscriminator(LayerBase):
             else:
                 rf += (k-1)*ts
 
-                ts *= s
+            ts *= s
 
         return rf
 

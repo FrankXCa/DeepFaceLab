@@ -393,7 +393,12 @@ def test_patch_discriminator_official_table():
 def test_unet_find_archi_official_search():
     init_cpu()
     d = dfl_nn.UNetPatchDiscriminator(patch_size=20, in_ch=3, base_ch=32, name="D")
-    assert d.find_archi(20) == [[3, 2], [3, 1], [3, 2], [3, 2], [3, 2]]
+    # the OFFICIAL discriminators_tf.py algorithm (its calc_receptive_
+    # field_size applies `ts *= s` to EVERY layer, including the first
+    # one): target 20 -> rf 19 via [2,1,2,2]. A real official SAEHD
+    # checkpoint (gan_patch_size=40) loads against exactly this
+    # archi search — see Phase 6A test_real_official_checkpoint_mapping
+    assert d.find_archi(20) == [[3, 2], [3, 1], [3, 2], [3, 2]]
     for target in (1, 5, 9, 20, 33, 46):
         layers = d.find_archi(target)
         assert layers[0] == [3, 2]
