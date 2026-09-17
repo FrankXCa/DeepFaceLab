@@ -209,8 +209,48 @@ Populated in Phase 3F:
   torch CUDA/CPU RNG streams differ per seed; measured device-noise
   band atol 1e-3, skip-if-CPU-only).
 
-Current counts (2026-09, after Phase 3F): CUDA environment 239
-passed; CPU environment 225 passed + 14 skipped.
+Populated in Phase 4 (1/2 — this commit; the optimizer-state
+conversion, file-level bidirectional round-trips, the 0-D iters
+counter under NumPy 2.x and the coverage-label checks follow in the
+next Phase 4 commit):
+
+- `test_checkpoint_conversion.py` — Phase 4 checkpoint
+  compatibility / conversion acceptance (`core/leras/convert.py`,
+  the centralized conversion engine — independent reimplementation;
+  concept sources: official DFL file-format contract (GPL-3.0),
+  EXTERNAL_A strict two-pass load (GPL-3.0), EXTERNAL_B component
+  mapping concepts (unlicensed, NOT copied)): official
+  file-format validation against the REAL official artifacts tracked
+  in the baseline (`facelib/*.npy` pickled dicts written by official
+  TF-era DFL code: S3FD/2DFAN float32 with 4-D singleton-padded
+  bias/BN forms, 3DFAN float32 1-D forms, FaceEnhancer float16) +
+  protocol-4 re-pickle round-trip + corrupt-file rejection
+  (truncated pickles, non-dict pickles, real `np.save` array files,
+  non-string keys, non-ndarray values); name mapping (torch dotted
+  <-> official slashed `:0`, `:0`-variant tolerance); declared
+  layout rules with UNIQUE-VALUE tensors (Conv2D HWIO<->OIHW,
+  Conv2DTranspose, DepthwiseConv2D, Dense official-layout identity,
+  the `broadcast_squeeze` rule for 1-D bias/BN parameters accepting
+  the 2/3/4-D singleton-padded official forms — no element-count
+  reshape fallback anywhere); strict two-pass all-or-nothing
+  conversion (missing required weights, unexpected extra keys,
+  same-element-count wrong shapes, dtype mismatch, ambiguous
+  mapping -> `CheckpointLoadError` with the full structured report,
+  nothing copied on failure); reverse export (torch -> official-
+  layout dict via the per-layer `convert_weight_to_official` hooks,
+  module-tree cascading for archis/discriminators) with explicit
+  `UnsupportedExportError` rejection of non-exportable state (no
+  silent drop/approximate/reshape/coerce); archi (canonical option
+  combos) + discriminator conversion; file-level round-trips
+  through write/read_official_checkpoint; Saveable.load_weights
+  agreement with the converter; no TensorFlow import / no direct
+  `torch.cuda.*` in the conversion source (AST). Parity: EXACT
+  (pure index rearrangement + value copy — torch.equal/
+  np.array_equal; the GPU copy test is bit-exact, RTX 4090,
+  skip-if-CPU-only).
+
+Current counts (2026-09, after Phase 4 commit 1/2): CUDA
+environment 269 passed; CPU environment 254 passed + 15 skipped.
 
 Environments (git-ignored, created with `uv`):
 

@@ -15,6 +15,13 @@ Phase 3A: torch-only foundation.
   (official DFL variable naming), core.leras.layers.Saveable
   (official-format serialization, strict load), and
   core.leras.initializers (initialization lifecycle)
++ Phase 4: core.leras.convert — the centralized checkpoint
+  compatibility/conversion engine: official pickled-dict format <->
+  torch, strict two-pass (all-or-nothing) conversion, declared
+  layout rules, optimizer-state mapping (iters/ms_/vs_/acc_),
+  structured deterministic reports, explicit reverse-export
+  rejection; no TensorFlow import (pickle + NumPy parsing of the
+  official format)
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D

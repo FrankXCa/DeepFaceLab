@@ -51,6 +51,17 @@ from core.leras import nn
 from core.leras import checkpoint as ckpt
 
 
+def _as_contig_value(value):
+    """NumPy 2.x ``np.ascontiguousarray`` upgrades 0-D arrays to
+    ``(1,)`` (NumPy 1.x keeps them 0-D); the official iteration
+    counter is a 0-D value, so 0-D inputs pass through untouched —
+    identical semantics under both pinned NumPy versions."""
+    value = np.asarray(value)
+    if value.ndim == 0:
+        return value
+    return np.ascontiguousarray(value)
+
+
 class Saveable():
     def __init__(self, name=None):
         self.name = name
@@ -84,7 +95,14 @@ class Saveable():
             if isinstance(new_w, torch.Tensor):
                 src = new_w.detach()
             elif isinstance(new_w, np.ndarray):
-                src = torch.from_numpy(np.ascontiguousarray(new_w))
+                # 0-D guard: NumPy 2.x ascontiguousarray upgrades 0-D
+                # arrays to (1,), which would break the strict shape
+                # check for 0-D values (the official iters counter);
+                # NumPy 1.x kept them 0-D — identical semantics both
+                # ways (see _as_contig_value)
+                arr = np.asarray(new_w)
+                src = torch.from_numpy(arr if arr.ndim == 0
+                                       else np.ascontiguousarray(arr))
             else:
                 src = torch.as_tensor(new_w)
 
@@ -198,7 +216,7 @@ class Saveable():
 
         # --- Pass 2: apply (all-or-nothing) ---
         for matched_key, value, param in planned:
-            value = np.ascontiguousarray(value)
+            value = _as_contig_value(value)
             with torch.no_grad():
                 param.copy_(
                     torch.from_numpy(value).to(device=param.device, dtype=param.dtype)
@@ -215,14 +233,41 @@ class Saveable():
         converter). Overriding this hook is how a layer declares its
         layout difference — the clean path for Phase 4, no ad-hoc
         reshaping elsewhere.
+
+        Module-TREE saveables (archis / discriminators, Phase 3F)
+        cascade: the base hook delegates to the owning leaf layer's
+        explicit hook, so ``load_weights`` / ``save_weights`` of a tree
+        resolve the per-layer layouts exactly like the tree's own
+        children do (Phase 4 — before this, tree saves fell back to
+        the base identity and wrote torch-layout kernels).
         """
-        return value
+        return self._layout_apply("convert_weight_layout", value, param)
 
     def convert_weight_to_official(self, value, param):
         """Inverse of ``convert_weight_layout``: torch-layout array ->
         official DFL checkpoint layout, applied by ``save_weights`` and
         ``get_weights_np`` so files on disk are always official-layout.
-        Identity unless the layer overrides it."""
+        Identity unless a layer overrides it (same module-tree
+        cascading as ``convert_weight_layout``)."""
+        return self._layout_apply("convert_weight_to_official", value, param)
+
+    def _layout_apply(self, hook_name, value, param):
+        """Resolve the layout hook for ``param``: on a module-tree
+        saveable the hook of the OWNING leaf layer applies (the layer
+        whose registered parameters/buffers include ``param``); on a
+        plain saveable — or when the owner declares no conversion —
+        the value is returned unchanged."""
+        if isinstance(self, torch.nn.Module):
+            for module in self.modules():
+                owned = {id(p) for p in module.parameters(recurse=False)}
+                owned |= {id(b) for b in module.buffers(recurse=False)}
+                if id(param) in owned:
+                    hook = getattr(type(module), hook_name, None)
+                    base = getattr(Saveable, hook_name, None)
+                    if (hook is not None and hook is not base
+                            and isinstance(module, Saveable)):
+                        return getattr(module, hook_name)(value, param)
+                    return value
         return value
 
     def get_param_initializers(self):
