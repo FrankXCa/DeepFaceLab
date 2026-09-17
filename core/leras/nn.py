@@ -194,6 +194,16 @@ class nn():
         if to_data_format == from_data_format:
             return x
 
+        # torch tensors use the native (autograd-safe) permute: np.transpose
+        # would route through Tensor.__array__ (Tensor.numpy()), which
+        # raises for tensors that require grad - breaking every NHWC
+        # forward pass under autograd (the official CPU training path)
+        if nn.torch is not None and isinstance(x, nn.torch.Tensor):
+            if to_data_format == "NHWC":
+                return x.permute(0, 2, 3, 1)
+            elif to_data_format == "NCHW":
+                return x.permute(0, 3, 1, 2)
+
         if to_data_format == "NHWC":
             return np.transpose(x, (0,2,3,1) )
         elif to_data_format == "NCHW":

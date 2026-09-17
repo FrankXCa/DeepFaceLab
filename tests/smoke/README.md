@@ -164,8 +164,51 @@ Populated in Phase 3E2:
   no-direct-CUDA AST check, and RTX 4090 execution through the
   Phase 2 abstraction with CPU-vs-GPU parity (skip-if-CPU-only).
 
-Current counts (2026-09, after Phase 3E2): CUDA environment 180
-passed; CPU environment 167 passed + 13 skipped.
+Populated in Phase 3F:
+
+- `test_archis.py` — Phase 3F acceptance for the official archis and
+  discriminators (official TF references preserved in
+  `core/leras/archis/archis_tf.py` and
+  `core/leras/models/discriminators_tf.py`, never imported by torch
+  paths): `DeepFakeArchi` factory construction across the official
+  option space ('' / 't' / 'd' / 'td' / 'u' / 'ud' / 'c' at
+  resolutions 64-256), the official `get_out_ch`/`get_out_res`
+  contracts, official encoder/inter/decoder tensor layouts for every
+  combo (full-resolution x/m heads), the official `use_fp16` conv
+  dtypes (construction + dtype checks; no fp16 numerics), the 'c'
+  CosRelu x*cos(x) branch (alpha ignored) vs the default
+  leaky_relu(0.1/0.2) branches, the 'u' pixel_norm branch
+  (official 1e-6 epsilon, cross-checked against an identical seeded
+  non-'u' twin), the `mod='quick'` official dead end (mirrored
+  NameError), block-level wiring through the instantiated
+  Encoder/Inter/Decoder submodules (the official block classes are
+  factory closures, not archi attributes), the depth_to_space flow
+  in Upscale/the 'd' decoder head vs an independent oracle mirroring
+  the official manual ops branch (the Phase 3C semantics; torch's
+  F.pixel_shuffle groups channels differently and is NOT the official
+  semantics), `CodeDiscriminator` (official
+  n_downscales = 1 + code_res//8, kernel 4 then 3),
+  `PatchDiscriminator` (the official 46-entry
+  patch_discriminator_kernels table, verified byte-for-byte against
+  the baseline), `UNetPatchDiscriminator` (official find_archi /
+  calc_receptive_field_size layer search, level_chs progression,
+  1x1 VALID out_conv/center convs, (center_out, x) outputs, even-
+  input requirement of the official skip concat - the official models
+  feed power-of-2 crops), official checkpoint key sets
+  (convs_<i>/downs_<i>/upconvs_<i> list scopes, singular
+  weight/bias, :0 suffix, deterministic), official-format
+  save/load round trip (pickled dict protocol 4, official HWIO
+  layouts, strict rejection of unexpected keys), flat deterministic
+  get_weights, backward reaching every conv/dense parameter, NCHW/
+  NHWC data-format equivalence (inputs fed in the active format),
+  no TensorFlow import and no direct torch.cuda.* in the migrated
+  sources (AST), and RTX 4090 execution with CPU/GPU parity
+  (weights generated on the CPU twin and copied to the GPU twin -
+  torch CUDA/CPU RNG streams differ per seed; measured device-noise
+  band atol 1e-3, skip-if-CPU-only).
+
+Current counts (2026-09, after Phase 3F): CUDA environment 239
+passed; CPU environment 225 passed + 14 skipped.
 
 Environments (git-ignored, created with `uv`):
 
