@@ -265,8 +265,92 @@ Populated in Phase 4:
   rearrangement + value copy — torch.equal/np.array_equal; the GPU
   copy test is bit-exact, RTX 4090, skip-if-CPU-only).
 
-Current counts (2026-09, after Phase 4): CUDA environment 278
-passed; CPU environment 263 passed + 15 skipped.
+Populated in Phase 5:
+
+- `test_leras_modelbase.py` — Phase 5 acceptance for the torch leras
+  model container (`core/leras/models/ModelBase.py`; the official TF
+  source is preserved verbatim in `ModelBase_tf.py`, never imported):
+  the container is a `torch.nn.Module` AND `nn.Saveable` (the official
+  inheritance preserved; the LayerBase dual pattern) so the Phase 4
+  conversion engine and Saveable round trips work on whole sub-models
+  unchanged; official two-phase build (`on_build` -> `build()`), the
+  official attribute/list/dict/LayerBase/ModelBase discovery loop with
+  the documented torch adaptations (torch child modules are discovered
+  through the `_modules` registry; torch-internal underscore
+  attributes are excluded so the dict branch never re-registers
+  children; built-in `sum` in `summary()` for the NumPy 2.x era),
+  registration order/names (official name -> attribute-name fallback),
+  nested-container flattening through `get_layers`, generator
+  `on_build`, the official `get_weights` concatenation order +
+  values, `__call__` auto-build, grad-capable forward (native torch
+  autograd), `build_for_run`/`run` (the official no-grad inference
+  boundary: NumPy in / NumPy out, explicit not-built/count-mismatch/
+  non-array failures, GPU placement through the Phase 2 abstraction),
+  official-format Saveable round trip (raw pickle protocol 4, the
+  official `.npy` misnomer), missing-file -> `False` / corrupt-file ->
+  strict raise with nothing copied, the official summary table, no
+  TensorFlow import / no direct `torch.cuda.*` in the foundation
+  sources (AST), and RTX 4090 execution (skip-if-CPU-only). Parity:
+  EXACT.
+- `test_model_lifecycle.py` + `Model_Dummy/` — Phase 5 acceptance for
+  the top-level training lifecycle (`models/ModelBase.py`, the
+  official source kept source-compatible with the torch foundation,
+  backend-neutral, with the documented USER_LEGACY hardenings:
+  `enable/disable_default_options_autosave()` hook defaulting to the
+  official autosave-True behavior, `errors='ignore'` on the summary
+  write, the `get_loss_history_preview` tail/finite hardening; the
+  USER_LEGACY `create_backup` comprehension change is deliberately NOT
+  adopted — it breaks the official `[[model, filename], ...]` pair
+  contract). The test-only `Model_Dummy` package follows the official
+  `Model_<Class>` folder convention (the lifecycle derives
+  `model_class_name` from the model class's folder name) and is NOT a
+  production architecture: construction (forced model name — no
+  interactive prompts; first-run vs `data.dat`-gated resume
+  restoration; the class-level `default_options.dat` snapshot and the
+  adopted autosave-disable hook), model-owned component registration
+  in `on_initialize` (leras container + `AdaBelief` +
+  `SampleGeneratorBase` — the official calling pattern, including the
+  official `get_weights()`-auto-build-before-`initialize_variables`
+  order and the official load/init loop of SAEHD lines 637-657 with
+  the Phase 4/5 strict policy: a missing required component file on
+  resume fails explicitly instead of the official silent re-init),
+  the model-owned training step (the model consumes its own samples
+  in `onTrainOneIter`; native `loss.backward()` + `get_update_op`;
+  torch adaptation: the official TF graph re-computed fresh
+  gradients per session run, so the model code clears
+  `param.grad` before each step — torch accumulates), the TWO
+  iteration counters kept distinct (model `iter` in `data.dat` vs the
+  optimizer `iters` in the optimizer file), save (summary +
+  `onSave` pairs + `data.dat` + the 24-slot autobackup ring via
+  `create_backup`), the required A/B resume-equivalence test (Run A =
+  init + 3 steps; Run B = identical init + 2 steps + save + recreate
+  + load + 1 step; parameters, optimizer state (iters + ms_/vs_),
+  iteration state and loss values EXACT — zero RNG: constant
+  initializers, deterministic weight fill, fixed sample batches),
+  strict failures (missing required file on resume, truncated
+  component pickle, malformed `data.dat` — no silent re-init /
+  first-run reinterpretation), official generator-validation
+  semantics (unset -> AttributeError quirk, non-`SampleGeneratorBase`
+  -> ValueError), `set_iter` loss-history truncation, the CPU
+  lifecycle and the RTX 4090 lifecycle (skip-if-CPU-only), and the
+  no-TF / no-direct-`torch.cuda` AST hygiene over the lifecycle
+  sources. Official DFL has no train/eval mode switch (its BatchNorm
+  is "not for training"; preview reuses the training forward) — the
+  base lifecycle performs no mode toggling; the inference boundary is
+  the container `run()`. Parity: EXACT on CPU; EXACT on GPU (f32,
+  same device both runs — bit-exact in this environment).
+- `conftest.py` (this directory, extended) — the shared `plain_tmp`
+  fixture PLUS a deterministic CPU-autograd test environment:
+  `OMP_NUM_THREADS=1` / `DNNL_MAX_NUM_THREADS=1` (set before any
+  torch import) plus `torch.set_num_threads(1)`. OneDNN's
+  multi-threaded f32 primitives are not guaranteed run-to-run
+  deterministic, and the Phase 5 EXACT resume-equivalence
+  comparisons require a deterministic CPU environment. This is a
+  test-environment measure only — no production code is affected and
+  CUDA tests are unaffected (GPU kernels do not use these pools).
+
+Current counts (2026-09, after Phase 5): CUDA environment 312
+passed; CPU environment 295 passed + 17 skipped.
 
 Environments (git-ignored, created with `uv`):
 

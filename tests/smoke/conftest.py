@@ -1,5 +1,18 @@
 """Shared fixtures for the smoke test package.
 
+Deterministic CPU autograd environment:
+    The Phase 5 resume-equivalence tests compare A/B training
+    histories bit-exactly (parameters, optimizer state, loss
+    values). The CPU tests therefore run single-threaded:
+    ``OMP_NUM_THREADS=1`` / ``DNNL_MAX_NUM_THREADS=1`` (set before
+    OneDNN initializes) plus ``torch.set_num_threads(1)`` — a
+    standard reproducibility guard for exact cross-instance
+    comparisons, because OneDNN's multi-threaded f32 primitives are
+    not guaranteed run-to-run deterministic. This is a
+    test-environment measure only: no production code is affected,
+    and CUDA tests are unaffected (GPU kernels do not use these
+    pools).
+
 ``plain_tmp``: pytest 9 uses extended-length (``\\\\?\\``) temporary
 paths on Windows, which the local sandbox rejects; directories created
 through open-based calls (tempfile.mkdtemp / TemporaryDirectory) also
@@ -12,6 +25,16 @@ git-ignored ``<repo>/.pytest-tmp`` directory (same pattern as the Phase
 
 import os
 import random
+
+# --- BEFORE any torch import (see the module docstring) -------------------
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("DNNL_MAX_NUM_THREADS", "1")
+try:  # no-op when torch is unavailable; harmless when it is
+    import torch as _torch
+
+    _torch.set_num_threads(1)
+except ImportError:  # pragma: no cover
+    pass
 
 import pytest
 
