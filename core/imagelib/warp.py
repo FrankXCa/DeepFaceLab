@@ -105,6 +105,10 @@ def gen_pts(W, H, rnd_state=None):
     
     
 def gen_warp_params (w, flip=False, rotation_range=[-10,10], scale_range=[-0.5, 0.5], tx_range=[-0.05, 0.05], ty_range=[-0.05, 0.05], rnd_state=None, warp_rnd_state=None  ):
+    # OpenCV >= 5 rejects numpy scalars inside the `center` sequence of
+    # getRotationMatrix2D, and checkpoint-stored options (data.dat) are
+    # numpy-typed — coerce to plain Python types (semantics unchanged)
+    w = int(w)
     if rnd_state is None:
         rnd_state = np.random
     if warp_rnd_state is None:
