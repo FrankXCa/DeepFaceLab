@@ -39,17 +39,22 @@ core/leras/archis/archis_tf.py and core/leras/models/discriminators_tf.py):
   migrated sources (AST checks)
 
 Parity labels: EXACT for same-dtype torch-vs-torch comparisons
-(activation branches, depth_to_space flow vs the official manual RRC
+(activation branches, depth_to_space flow vs the official RRC
 rearrangement oracle, checkpoint key sets, save/load round trip);
 WITHIN_TOLERANCE (1e-5) for f32 flow vs f64 NumPy references and
 (1e-3) for the CPU/GPU execution parity band (measured RTX 4090 worst
 case ~2.1e-4 f32 device noise); NOT_VERIFIED for TF runtime parity
 (no TF environment in the tested venvs - no TF runtime parity is
-claimed). Note: the official depth_to_space op has two source branches
-in the baseline (the manual reshape/transpose code for CPU/NHWC and
-the tf.depth_to_space built-in for NCHW-GPU, which groups channels
-differently); the Phase 3C op reproduces the manual branch
-data-format-independently, which is what these tests pin.
+claimed for these stacks). Note: the official depth_to_space op has
+two source branches in the baseline (the manual reshape/transpose
+code for NCHW-CPU/NHWC and the tf.depth_to_space built-in for
+NCHW-GPU); the Phase 3F P0 re-audit verified (TF v2.4.0 kernel
+source of the official DFL era + TF 2.21 runtime probe) that BOTH
+branches use the SAME R-R-C channel grouping, so the Phase 3C op -
+which reproduces it data-format-independently - matches every
+official path and official checkpoints of any training path need no
+dts re-mapping. Torch's F.pixel_shuffle (C-R-R) is NOT the official
+semantics in any branch.
 """
 
 import ast
@@ -118,11 +123,13 @@ OFFICIAL_COMBOS = [
 
 
 def _ref_official_depth_to_space(x, size):
-    """Independent oracle mirroring the official manual ops
-    implementation (core/leras/ops/__init__.py, the CPU/NHWC branch the
-    Phase 3C op reproduces): channel index c = i*size*c_out + j*c_out + g
-    maps to (group g, spatial h*size+i, w*size+j). Written with only
-    reshape/permute so it is independent of the op's internal
+    """Independent oracle mirroring the official R-R-C grouping:
+    channel index c = i*size*c_out + j*c_out + g maps to (group g,
+    spatial h*size+i, w*size+j). All official branches use this
+    grouping (the manual NCHW-CPU/NHWC code; the NCHW-GPU
+    tf.depth_to_space built-in per the Phase 3F P0 re-audit), and the
+    Phase 3C op reproduces it data-format-independently. Written with
+    only reshape/permute so it is independent of the op's internal
     pre-permutation + F.pixel_shuffle implementation. NCHW in/out."""
     n, c_in, h, w = x.shape
     c_out = c_in // (size * size)
@@ -273,10 +280,10 @@ def test_downscale_block_channel_progression():
 def test_upscale_depth_to_space_flow_parity():
     # EXACT: the Upscale block (via inter.upscale1) output must equal
     # conv -> act -> depth_to_space, where the oracle mirrors the
-    # official manual ops implementation (the official CPU/NHWC branch
-    # that the Phase 3C op reproduces data-format-independently; note
-    # torch's F.pixel_shuffle groups channels differently and is
-    # deliberately NOT the official semantics)
+    # official R-R-C grouping (all official branches - manual and the
+    # NCHW-GPU built-in - use it, per the Phase 3F P0 re-audit; note
+    # torch's F.pixel_shuffle groups channels C-R-R and is deliberately
+    # NOT the official semantics in any branch)
     init_cpu()
     archi = dfl_nn.DeepFakeArchi(64, opts="")
     inter = archi.Inter(in_ch=16, ae_ch=4, ae_out_ch=4, name="inter")

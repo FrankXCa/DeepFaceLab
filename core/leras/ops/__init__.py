@@ -38,9 +38,14 @@ depth_to_space (Phase 3C)
 The official DFL op (``ops/__init__.py``) uses TensorFlow
 ``depth_to_space`` semantics in BOTH of its NCHW branches (native
 ``tf.depth_to_space`` on GPU and DFL's manual CPU fallback) and in its
-NHWC branch. The index mapping (derived from the official source,
-verified by the exact-placement tests in
-``tests/smoke/test_depth_to_space.py``) is:
+NHWC branch. The Phase 3F P0 re-audit verified (TF v2.4.0 kernel
+source of the official DFL era - the GPU ``D2S_NCHW`` kernel documents
+its input ordering as ``n, bY, bX, oC, iY, iX`` - plus a TF 2.21
+runtime probe) that the native built-in uses this SAME R-R-C
+grouping, i.e. ALL official branches are identical and official
+checkpoints of any training path need no dts re-mapping. The index
+mapping (derived from the official source, verified by the
+exact-placement tests in ``tests/smoke/test_depth_to_space.py``) is:
 
     official (TF, R-R-C):
         out[n, c, h*r+i, w*r+j] = in[n, (i*r+j)*C_out + c, h, w]

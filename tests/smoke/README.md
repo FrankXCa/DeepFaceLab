@@ -184,9 +184,11 @@ Populated in Phase 3F:
   Encoder/Inter/Decoder submodules (the official block classes are
   factory closures, not archi attributes), the depth_to_space flow
   in Upscale/the 'd' decoder head vs an independent oracle mirroring
-  the official manual ops branch (the Phase 3C semantics; torch's
-  F.pixel_shuffle groups channels differently and is NOT the official
-  semantics), `CodeDiscriminator` (official
+  the official R-R-C grouping (all official branches - the manual
+  NCHW-CPU/NHWC code and the NCHW-GPU tf.depth_to_space built-in -
+  use it, per the Phase 3F P0 re-audit; torch's F.pixel_shuffle
+  groups channels C-R-R and is NOT the official semantics),
+  `CodeDiscriminator` (official
   n_downscales = 1 + code_res//8, kernel 4 then 3),
   `PatchDiscriminator` (the official 46-entry
   patch_discriminator_kernels table, verified byte-for-byte against

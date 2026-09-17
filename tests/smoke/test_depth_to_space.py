@@ -5,7 +5,14 @@ TensorFlow depth_to_space semantics:
 
     out[n, c, h*r+i, w*r+j] = in[n, (i*r+j)*C_out + c, h, w]
 
-PyTorch's F.pixel_shuffle uses C-R-R channel grouping, so the migrated
+The Phase 3F P0 re-audit verified (TF v2.4.0 kernel source of the
+official DFL era + TF 2.21 runtime probe) that the official
+tf.depth_to_space BUILT-IN - used by the official NCHW-GPU path -
+uses this SAME R-R-C grouping (its GPU D2S_NCHW kernel documents the
+input ordering "n, bY, bX, oC, iY, iX"), so ALL official branches are
+identical and official checkpoints of any training path need no dts
+re-mapping in Phase 4. PyTorch's F.pixel_shuffle uses C-R-R channel
+grouping (NOT the official semantics in any branch), so the migrated
 op applies the required channel permutation first (view/permute, no
 gather). These tests prove the exact R-R-C placement (deterministic
 unique-value tensors, every output cell checked against an independent
@@ -17,7 +24,10 @@ Parity labels: EXACT for the index placement and for CPU-vs-GPU
 comparison (the op is a pure index rearrangement - no arithmetic).
 TensorFlow runtime parity: NOT_VERIFIED in this phase (no TF
 environment in the tested venvs); parity is against the official
-index formula derived from the official source.
+index formula derived from the official source. The built-in kernel
+was subsequently runtime-probed (TF 2.21) and source-verified (TF
+v2.4.0, official DFL era) by the Phase 3F P0 re-audit, confirming
+the same R-R-C placement for all official branches.
 """
 
 import ast
