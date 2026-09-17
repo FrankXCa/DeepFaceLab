@@ -27,6 +27,15 @@
 torch==2.14.0+cu130
 numpy==2.5.3
 
+# Phase 5: the official model lifecycle (models/ModelBase.py) imports
+# core.imagelib, whose morph module requires scipy and whose
+# color_transfer module requires numexpr (official baseline pinned
+# scipy==1.4.1 and left numexpr unpinned for the TF era; the pinned
+# versions here are the py3.12/NumPy-2.x lines) — runtime dependencies
+# of the model/training phases.
+scipy==1.18.1
+numexpr==2.14.2
+
 # --- optional (not part of the Phase 1 baseline) ---
 # torchvision — revisit in Phase 9 (extractors) if needed
 # onnx          — required in Phase 11 (DFM/ONNX export)

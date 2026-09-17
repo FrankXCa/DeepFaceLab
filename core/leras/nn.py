@@ -22,6 +22,15 @@ Phase 3A: torch-only foundation.
   structured deterministic reports, explicit reverse-export
   rejection; no TensorFlow import (pickle + NumPy parsing of the
   official format)
++ Phase 5: core.leras.models.ModelBase (nn.ModelBase) is the torch model
+  container (official TF session concepts replaced by native torch
+  execution: no variable_scope, no placeholder/feed_dict/tf_sess.run;
+  run() = no_grad forward returning NumPy) and models/ModelBase.py (the
+  top-level training lifecycle) runs on the torch foundation unchanged
+  except documented hardenings; the official TF leras ModelBase source is
+  preserved in core.leras.models.ModelBase_tf.py; model phases use native
+  torch autograd in onTrainOneIter (nn.tf.gradients is not stubbed);
+  nn.average_gv_list stays TF until the multi-GPU phase
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
@@ -31,15 +40,19 @@ total_variation_mse; Phase 3E2 migrated random_binomial; the rest of
 the official ops are preserved in ops/ops_tf.py and rebuilt in later
 subphases), optimizers/* (Phase 3E2 migrated the optimizer
 foundation, AdaBelief and RMSprop in torch; the TF reference is
-preserved in optimizers/optimizers_tf.py; only the gradient
-machinery - nn.gradients/average_gv_list - stays TF until the
-model/multi-GPU phases); archis/* (Phase 3F migrated ArchiBase and the
+preserved in optimizers/optimizers_tf.py; the TF gradient
+machinery - nn.gradients/average_gv_list - is NOT stubbed under
+torch: Phase 5 single-device model code uses native torch autograd;
+average_gv_list (multi-GPU gradient averaging) stays TF until the
+multi-GPU phase); archis/* (Phase 3F migrated ArchiBase and the
 DeepFakeArchi factory to torch - the official TF source is preserved in
 archis/archis_tf.py; Phase 3F also migrated the official discriminator
 classes CodeDiscriminator/PatchDiscriminator/UNetPatchDiscriminator in
 core.leras.models to torch - the official TF source is preserved in
-models/discriminators_tf.py); models/* (Phases 6-8: the remaining TF
-ModelBase/XSeg foundation).
+models/discriminators_tf.py); models/* (Phase 5 migrated the leras
+ModelBase container to torch - the official TF source is preserved in
+models/ModelBase_tf.py; Phases 6-8: the remaining TF XSeg foundation
+and the model phases).
 
 NCHW speed up training for 10-20%.
 """
@@ -100,7 +113,10 @@ class nn():
             import core.leras.ops  # noqa: F401
             import core.leras.optimizers  # noqa: F401  (Phase 3E2: torch optimizers)
             import core.leras.archis  # noqa: F401  (Phase 3F: torch archis foundation)
-            import core.leras.models  # noqa: F401  (Phase 3F: torch discriminator classes)
+            import core.leras.models  # noqa: F401  (Phase 3F: torch discriminator classes;
+                                          #  Phase 5: torch nn.ModelBase container — the
+                                          #  official TF XSeg foundation stays behind the
+                                          #  hasattr(nn, 'tf') guard in that __init__)
 
         torch = nn.torch
 

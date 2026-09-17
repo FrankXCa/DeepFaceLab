@@ -1,3 +1,42 @@
+"""Top-level training lifecycle (models.ModelBase) — Phase 5.
+
+Official DeepFaceLab source (baseline e4b7543ffa1d73b26fce1e31852727f658ba490c)
+kept source-compatible with the torch foundation: every dependency of this
+file is backend-neutral (interact / cv2 / pathex / imagelib / pickle / the
+torch ``core.leras.nn`` — only ``nn.initialize`` / ``nn.DeviceConfig`` /
+``nn.close_session`` are used from leras, all of which exist in the torch
+foundation), so no TF session, placeholder or feed_dict concept appears
+here. The model-owned hooks (``on_initialize_options`` / ``on_initialize`` /
+``onSave`` / ``onTrainOneIter`` / ``onGetPreview``) are what the torch model
+phases (SAEHD/AMP/XSeg/Quick96) implement on top of this lifecycle; the
+training step itself (forward/loss/backward/optimizer) is model-owned in
+official DFL and stays model-owned in torch (native autograd — the
+optimizer's ``get_update_op`` is the official step contract).
+
+Phase 5 hardenings adopted from USER_LEGACY (see docs record; the rest of
+the file is the official code verbatim):
+
+- ``enable_default_options_autosave()`` / ``disable_default_options_autosave()``
+  hook (official behavior is the default — ``_default_options_autosave``
+  starts True so first-run models still snapshot ``default_options.dat``
+  exactly like official DFL; USER_LEGACY flipped the default, which would
+  have silently changed official model behavior, so only the escape hatch
+  was adopted — AMP's torch model calls ``disable_default_options_autosave()``);
+- ``save()`` writes the summary text with ``encoding='utf-8',
+  errors='ignore'`` (official write crashed on non-ASCII option values
+  under non-UTF-8 console code pages; ASCII output is byte-identical);
+- ``get_loss_history_preview`` hardening: the auto-scale for the loss
+  history strip uses the last-1/5 tail with an empty-tail fallback and an
+  ``isfinite``/positive guard (official: the raw last-1/5 mean crashed on
+  very short histories and produced NaN scaling on non-finite losses).
+
+Deliberately NOT adopted from USER_LEGACY: its ``create_backup`` filename
+comprehension change (``for filename in ...`` instead of ``for _, filename
+in ...``) — that change only works because legacy models return bare
+filename strings, which breaks the official ``[[model, filename], ...]``
+contract this class documents and that official SAEHD and the external
+torch ports all use.
+"""
 import colorsys
 import inspect
 import json
@@ -166,6 +205,11 @@ class ModelBase(object):
         ####
         self.default_options_path = saved_models_path / f'{self.model_class_name}_default_options.dat'
         self.default_options = {}
+        # Phase 5 (USER_LEGACY hook, official behavior kept as default):
+        # USER_LEGACY started this False (its torch AMP disables the
+        # snapshot); official DFL always snapshots first-run options, so
+        # the default stays True and models may opt out explicitly.
+        self._default_options_autosave = True
         if self.default_options_path.exists():
             try:
                 self.default_options = pickle.loads ( self.default_options_path.read_bytes() )
@@ -179,7 +223,7 @@ class ModelBase(object):
         io.input_skip_pending()
         self.on_initialize_options()
 
-        if self.is_first_run():
+        if self._default_options_autosave and self.is_first_run():
             # save as default options only for first run model initialize
             self.default_options_path.write_bytes( pickle.dumps (self.options) )
 
@@ -388,7 +432,10 @@ class ModelBase(object):
         return self.preview_history_writer
 
     def save(self):
-        Path( self.get_summary_path() ).write_text( self.get_summary_text() )
+        # Phase 5 (USER_LEGACY hardening): utf-8 + errors='ignore' so
+        # non-ASCII option values cannot crash the save on non-UTF-8
+        # console code pages (ASCII output is byte-identical).
+        Path( self.get_summary_path() ).write_text( self.get_summary_text(), encoding='utf-8', errors='ignore' )
 
         self.onSave()
 
@@ -507,6 +554,12 @@ class ModelBase(object):
     def finalize(self):
         nn.close_session()
 
+    def enable_default_options_autosave(self):
+        self._default_options_autosave = True
+
+    def disable_default_options_autosave(self):
+        self._default_options_autosave = False
+
     def is_first_run(self):
         return self.iter == 0
 
@@ -617,7 +670,17 @@ class ModelBase(object):
                             for col in range(w)
                         ]
 
-            plist_abs_max = np.mean(loss_history[ len(loss_history) // 5 : ]) * 2
+            # Phase 5 (USER_LEGACY hardening): the auto-scale for the
+            # loss strip uses the last-1/5 tail with an empty-tail
+            # fallback and a finite/positive guard — the official raw
+            # mean crashed on very short histories and produced NaN
+            # scaling on non-finite losses.
+            tail = loss_history[len(loss_history) // 5 :]
+            if tail.size == 0:
+                tail = loss_history
+            plist_abs_max = float(np.mean(tail) * 2.0)
+            if not np.isfinite(plist_abs_max) or plist_abs_max <= 0.0:
+                plist_abs_max = max(1.0, float(np.max(np.abs(loss_history)) or 1.0))
 
             for col in range(0, w):
                 for p in range(0,loss_count):
