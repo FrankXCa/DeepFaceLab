@@ -290,7 +290,17 @@ Populated in Phase 5:
   official `.npy` misnomer), missing-file -> `False` / corrupt-file ->
   strict raise with nothing copied, the official summary table, no
   TensorFlow import / no direct `torch.cuda.*` in the foundation
-  sources (AST), and RTX 4090 execution (skip-if-CPU-only). Parity:
+  sources (AST), the Phase 5 publish-audit contracts (`__call__`
+  routes through the real torch Module call machinery — forward
+  pre-hooks/forward hooks/full backward hooks fire exactly once per
+  call on the first call (lazy build) and on every later call, with
+  gradients propagating; `run()` is pinned as the exclusive
+  inference/no-grad boundary while the normal model call stays
+  grad-capable for training; underscore-prefixed registered
+  submodules are rejected with an explicit `ValueError` at build
+  time; the still-unmigrated official model packages keep a clean
+  import boundary, unchanged from the Phase 4 baseline), and RTX 4090
+  execution (skip-if-CPU-only). Parity:
   EXACT.
 - `test_model_lifecycle.py` + `Model_Dummy/` — Phase 5 acceptance for
   the top-level training lifecycle (`models/ModelBase.py`, the
@@ -349,8 +359,8 @@ Populated in Phase 5:
   test-environment measure only — no production code is affected and
   CUDA tests are unaffected (GPU kernels do not use these pools).
 
-Current counts (2026-09, after Phase 5): CUDA environment 312
-passed; CPU environment 295 passed + 17 skipped.
+Current counts (2026-09, after the Phase 5 publish audit): CUDA environment 316
+passed; CPU environment 299 passed + 17 skipped.
 
 Environments (git-ignored, created with `uv`):
 

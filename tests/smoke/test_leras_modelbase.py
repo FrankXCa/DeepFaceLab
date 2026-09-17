@@ -14,7 +14,12 @@ Phase 5 section):
 - ``get_weights()`` concatenates the registered components' weights in
   registration order (the official order — the checkpoint key order the
   Phase 4 engine consumes);
-- ``__call__`` auto-builds and runs ``forward`` (torch eager);
+- ``__call__`` auto-builds on first use (exactly once) and then routes
+  through the real ``nn.Module.__call__`` call machinery — pinned by
+  the Phase 5 publish-audit hook test: forward pre-hooks, forward
+  hooks and full backward hooks fire exactly once per call, on the
+  first call (lazy build) and on every later call, and gradients
+  propagate through the returned tensor;
 - ``build_for_run``/``run``: the official inference API with the TF
   session concepts removed — recorded input contract instead of
   placeholders, ``torch.no_grad()`` forward instead of
@@ -26,6 +31,23 @@ Phase 5 section):
 - the container is a Phase 4 Saveable: ``save_weights``/``load_weights``
   round-trip the official raw pickle protocol-4 stream (leading bytes
   pinned) through the strict engine, all-or-nothing;
+- the ``run()``/``no_grad`` boundary contract (Phase 5 publish audit):
+  ``run()`` is exclusively an inference/evaluation convenience (the
+  official ``tf_sess.run`` — no gradient bookkeeping, detached CPU
+  NumPy out); the training path is the normal model call
+  (``model(x)`` -> ``loss.backward()``) and is pinned to stay
+  grad-capable on the same model;
+- the underscore-name contract (Phase 5 publish audit): a registered
+  submodule whose attribute name starts with an underscore is rejected
+  with an explicit ``ValueError`` at build time (underscore names are
+  reserved for torch module internals and would make the container's
+  persistent state inconsistent — torch treats underscore buffers as
+  non-persistent) rather than silently registered or omitted;
+- the import boundary of the still-unmigrated official model packages
+  (``Model_SAEHD`` / ``Model_AMP`` / ``Model_Quick96`` / ``Model_XSeg``)
+  is unchanged by the Phase 5 foundation (publish audit: worktree
+  comparison against the Phase 4 baseline) — clean import, execution
+  NOT_YET_IMPLEMENTED, no foundation-caused import crash;
 - GPU: the same ``run()`` inference path on the RTX 4090 (skip on
   CPU-only environments);
 - AST hygiene: no TensorFlow import and no direct ``torch.cuda.*`` /
@@ -413,3 +435,162 @@ def test_nn_modelbase_bound_on_nn_class():
     # the class bound on the nn class IS the torch module's class
     assert dfl_nn.ModelBase is module.ModelBase
     assert issubclass(dfl_nn.ModelBase, dfl_nn.Saveable)
+
+
+# --- Phase 5 publish audit: __call__ contract, run() boundary,
+#     underscore-name contract ---------------------------------------------
+
+class UnderscoreChildNet(dfl_nn.ModelBase):
+    """Registers a valid child under an underscore-prefixed attribute
+    name — the Phase 5 contract REJECTS this explicitly at build time
+    (underscore names are reserved for torch module internals)."""
+
+    def on_build(self):
+        self.head = dfl_nn.Conv2D(
+            3, 4, kernel_size=3, padding="SAME", use_bias=False,
+            kernel_initializer=dfl_nn.initializers.zeros)
+        self._hidden = dfl_nn.Conv2D(
+            4, 2, kernel_size=3, padding="SAME", use_bias=False,
+            kernel_initializer=dfl_nn.initializers.zeros)
+
+    def forward(self, x):
+        return self._hidden(self.head(x))
+
+
+def test_call_routes_through_torch_module_call_path():
+    """Publish audit (A): ``model(x)`` must route through the real
+    ``nn.Module.__call__`` machinery (not a direct ``forward``
+    dispatch) — on the FIRST call (lazy build happens before the
+    delegation, exactly once) and on every LATER call — so forward
+    pre-hooks, forward hooks and full backward hooks fire exactly once
+    per call and gradients propagate through the returned tensor."""
+    _init_cpu()
+    model = TwoLayerNet(name="hooks")
+
+    pre_calls, post_calls, bwd_calls = [], [], []
+
+    def pre_hook(m, inputs):
+        pre_calls.append(inputs)
+
+    def post_hook(m, inputs, output):
+        post_calls.append(output)
+
+    def full_bwd_hook(m, grad_input, grad_output):
+        bwd_calls.append(grad_output)
+
+    model.register_forward_pre_hook(pre_hook)
+    model.register_forward_hook(post_hook)
+    model.register_full_backward_hook(full_bwd_hook)
+
+    x = torch.full((1, 8, 8, 3), 0.25, requires_grad=True)
+
+    # first call — the lazy build occurs, then the real call path
+    assert model.built is False
+    y = model(x)
+    assert model.built is True
+    # zero kernels + bias ones -> all-ones output (both layers)
+    assert torch.equal(y, torch.ones(1, 8, 8, 2))
+    # every hook ran exactly once, seeing the same tensors as the call
+    assert len(pre_calls) == 1 and torch.equal(pre_calls[0][0], x)
+    assert len(post_calls) == 1 and torch.equal(post_calls[0], y)
+    # gradients propagate through the returned tensor
+    assert y.requires_grad
+    y.sum().backward()
+    assert len(bwd_calls) == 1
+    for p in model.parameters():
+        assert p.grad is not None
+    # the dense bias (2 output channels) receives the full output
+    # reduction (64 x 1.0 each); the conv1 parameters get ZERO
+    # gradient (not None) because the dense kernel is zero on this
+    # vehicle — backward still reached them through the module call path
+    assert torch.equal(model.dense.bias.grad, torch.full((2,), 64.0))
+    assert torch.equal(model.conv1.bias.grad, torch.zeros(4))
+    assert x.grad is not None
+
+    # second call — already built: the SAME Module call path, every
+    # forward hook exactly once again
+    for p in model.parameters():
+        p.grad = None
+    y2 = model(x)
+    assert torch.equal(y2, torch.ones(1, 8, 8, 2))
+    assert len(pre_calls) == 2
+    assert len(post_calls) == 2
+    # full backward hooks fire in backward(), not in the forward call —
+    # still exactly the one from the first backward so far
+    assert len(bwd_calls) == 1
+    y2.sum().backward()
+    assert len(bwd_calls) == 2
+    for p in model.parameters():
+        assert p.grad is not None
+
+
+def test_run_is_inference_boundary_normal_call_trains():
+    """Publish audit (B): ``run()`` is the official ``tf_sess.run``
+    boundary — exclusively an inference/evaluation convenience (the
+    official callers: preview/merge/AE inference); it creates no
+    gradient bookkeeping and returns detached CPU NumPy. Training code
+    must use the normal model call (``loss.backward()`` + the
+    optimizer's ``get_update_op``), which stays grad-capable on the
+    very same model — the ``no_grad`` wrap of ``run()`` mirrors the
+    official session run and cannot suppress any training path, since
+    no official training path goes through ``run()``."""
+    _init_cpu()
+    model = TwoLayerNet(name="boundary")
+    model.build_for_run([(torch.float32, (1, 8, 8, 3))])
+
+    # inference path: NumPy in / NumPy out, no gradient bookkeeping
+    x = np.zeros((1, 8, 8, 3), dtype=np.float32)
+    out = model.run([x])
+    assert isinstance(out, np.ndarray)
+    for p in model.parameters():
+        assert p.grad is None
+
+    # training path on the same model: the normal call is grad-capable
+    xt = torch.full((1, 8, 8, 3), 0.25)
+    y = model(xt)
+    assert y.requires_grad
+    y.sum().backward()
+    for p in model.parameters():
+        assert p.grad is not None
+
+
+def test_unmigrated_model_packages_still_import():
+    """Publish audit (D): the Phase 5 foundation must not break the
+    import/discovery of the still-unmigrated official model packages
+    (``Model_SAEHD`` / ``Model_AMP`` / ``Model_Quick96`` /
+    ``Model_XSeg``): their imports stay clean exactly as on the Phase 4
+    baseline (verified by a worktree comparison at the Phase 4
+    boundary) — module level is imports and class definitions only, so
+    the TF-era method bodies are never executed at import time. The
+    compatibility boundary is that EXECUTION of those packages remains
+    NOT_YET_IMPLEMENTED (Phase 9); it must not become a raw
+    AttributeError/import crash caused by the torch foundation."""
+    import importlib
+
+    import models  # the top-level lifecycle package (torch-compatible)
+
+    for pkg in ("Model_SAEHD", "Model_AMP", "Model_Quick96", "Model_XSeg"):
+        importlib.import_module(f"models.{pkg}.Model")  # noqa: F401
+
+
+def test_underscore_prefixed_submodule_rejected_explicitly():
+    """Publish audit (C): a registered submodule whose attribute name
+    starts with an underscore is rejected with an explicit ValueError
+    at build time (every discovery pass, including the auto-build of
+    the first call) — never silently registered or omitted, so the
+    container's persistent state can never diverge from the Phase 4
+    engine's module enumeration. Plain attribute names are the
+    supported mechanism (pinned by the registration tests above)."""
+    _init_cpu()
+    x = torch.zeros(1, 8, 8, 3, dtype=torch.float32)
+
+    # auto-build path: the first call triggers build() -> rejection
+    model = UnderscoreChildNet(name="underscore")
+    with pytest.raises(ValueError, match="must not start with '_'"):
+        model(x)
+    assert model.built is False
+
+    # explicit build() path: the same deterministic rejection
+    model2 = UnderscoreChildNet(name="underscore2")
+    with pytest.raises(ValueError, match="must not start with '_'"):
+        model2.build()

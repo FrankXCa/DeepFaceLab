@@ -28,8 +28,17 @@ Official semantics preserved (identical public API):
   weights in registration order (the official order — the checkpoint
   key order); auto-builds on first use (official).
 - ``get_layer_by_name`` / ``get_layers`` (flattens nested containers
-  down to ``nn.LayerBase``) / ``__call__`` (auto-build + ``forward``) /
-  ``summary`` (the official text table) — unchanged.
+  down to ``nn.LayerBase``) / ``summary`` (the official text table) —
+  unchanged.
+- ``__call__`` — the official auto-build on first use (exactly once,
+  the ``built`` flag), then DELEGATES to ``nn.Module.__call__``
+  (``super().__call__``) instead of calling ``forward`` directly: the
+  official TF ``__call__`` was a plain dispatch (TF has no hook
+  machinery), but this container is a torch module and must behave
+  like one — forward pre-hooks, forward hooks and full backward hooks
+  registered on the container work on the first call (the build
+  happens before the delegation) and on every later call through the
+  same PyTorch Module call path.
 
 Torch adaptations (documented, minimal):
 
@@ -47,11 +56,22 @@ Torch adaptations (documented, minimal):
   ``sub_model.load_weights(filename)`` works unchanged (official SAEHD
   saves its encoder/inter/decoder containers this way).
 - child modules live in torch's ``_modules`` registry rather than in
-  ``vars(self)``: the discovery set is therefore extended with the
+  ``vars(self)`` (torch 2.14 stores submodule assignments ONLY in
+  ``_modules``; attribute access resolves through the module
+  ``__getattr__``): the discovery set is therefore extended with the
   registered module names (insertion order — still deterministic), and
   torch-internal attributes (``_parameters`` / ``_buffers`` /
   ``_modules``) are excluded from the attribute scan so the official
-  ``dict`` branch never re-registers the children.
+  ``dict`` branch never re-registers the children. A registered
+  submodule whose attribute name starts with an underscore is REJECTED
+  with an explicit ``ValueError`` at build time (Phase 5 publish
+  audit): torch treats underscore names specially (underscore buffers
+  become non-persistent and drop out of the state-dict enumeration),
+  which would make the container's persistent state inconsistent with
+  the official all-state naming contract and the Phase 4 engine's
+  enumeration; underscore names are reserved for torch module
+  internals and the official DFL model code never names components
+  that way — register components under plain names.
 - ``build_for_run(shapes_list)`` no longer creates ``tf.placeholder``s
   and no longer pre-evaluates the graph: it records the input contract
   (the official ``run_placeholders`` attribute now holds the
@@ -61,7 +81,16 @@ Torch adaptations (documented, minimal):
 - ``run(inputs)`` no longer runs a ``tf_sess.run(feed_dict=...)``: it
   executes the built model's forward pass with ``torch.no_grad()`` —
   the inference/no-grad boundary (the official session run created no
-  gradient bookkeeping either). Inputs may be torch tensors or NumPy
+  gradient bookkeeping either). ``run()`` is exclusively an
+  inference/evaluation convenience (the official callers: preview,
+  merge, AE inference); NO training code may use it — the official
+  training step runs the gradient graph, and the torch equivalent is
+  the normal model call (``model(x)`` -> ``loss.backward()`` -> the
+  optimizer's ``get_update_op``), because ``run()`` returns detached
+  CPU NumPy and creates no gradient path (the ``no_grad`` wrap mirrors
+  the official session run exactly; it cannot suppress gradients of
+  any training path, since no training path goes through ``run()``).
+  Inputs may be torch tensors or NumPy
   arrays (converted to ``nn.device``/the declared spec dtype — the
   official ``feed_dict`` placement semantics); outputs are returned as
   NumPy (the official caller contract, e.g. preview code). Calling
@@ -195,6 +224,31 @@ class ModelBase(torch.nn.Module, nn.Saveable):
                 except StopIteration:
                     generator = None
 
+            # Phase 5 publish audit contract: a registered submodule
+            # whose attribute name starts with an underscore is
+            # rejected explicitly, on every discovery pass. Such an
+            # assignment is a legitimate torch mechanism (torch 2.14
+            # stores submodules only in ``_modules``, so it would be
+            # picked up by the discovery below) but it is NOT part of
+            # the component contract: torch treats underscore names
+            # specially (underscore buffers become non-persistent and
+            # drop out of the state-dict enumeration), which would make
+            # the container's persistent state inconsistent with both
+            # the official all-state naming contract and the Phase 4
+            # engine's enumeration. The official DFL model code never
+            # names components with an underscore prefix — fail loudly
+            # instead of registering or omitting such state.
+            for k in self._modules:
+                if k.startswith("_"):
+                    raise ValueError(
+                        f"submodule attribute '{k}' must not start "
+                        "with '_': underscore-prefixed names are "
+                        "reserved for torch module internals and are "
+                        "not part of the official component naming "
+                        "contract — register components under plain "
+                        "names (see the module docstring)"
+                    )
+
             # torch adaptation (documented in the module docstring): child
             # modules live in the ``_modules`` registry, not in
             # ``vars(self)``, so the discovery set is the plain attributes
@@ -265,7 +319,16 @@ class ModelBase(torch.nn.Module, nn.Saveable):
         if not self.built:
             self.build()
 
-        return self.forward(*args, **kwargs)
+        # torch (Phase 5 publish audit): the official TF ``__call__`` was
+        # a plain dispatch (TF has no module hook machinery), but this
+        # container IS a torch.nn.Module — it must route through the real
+        # Module call path (``nn.Module.__call__`` -> ``_call_impl``) so
+        # that forward pre-hooks, forward hooks and full backward hooks
+        # registered on the container work on the FIRST call (lazy build
+        # happens before the delegation, exactly once) and on every
+        # later call. Calling ``self.forward`` directly here would
+        # silently bypass all of that machinery.
+        return super().__call__(*args, **kwargs)
 
     def build_for_run(self, shapes_list):
         if not isinstance(shapes_list, list):
