@@ -685,6 +685,71 @@ def test_rmsprop_optimizer_state_roundtrip():
                    opt2.accumulators_dict.values()))
 
 
+def test_optimizer_state_official_layout_rule():
+    # State LAYOUT (OptimizerBase module docstring): the official
+    # optimizer state tensors have the layout of the trained variable
+    # they track — a conv kernel state is stored on disk in the
+    # official (kH, kW, in, out) orientation and converted back to the
+    # torch (out, in, kH, kW) state-slot layout on load. Parameters
+    # without a ``_dfl_owner_layer`` binding keep the legacy identity
+    # behavior (iters / plain layers / unbound state).
+    init_cpu()
+    c, ps = _bound_conv()
+    for p in ps:  # owner binding: the layer owning each parameter
+        p._dfl_owner_layer = c
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+
+    # torch -> official: the conv kernel state is OFFICIAL-orientation
+    od = cv.convert_optimizer_state_torch_to_official(opt)
+    w = ps[0]
+    t = tuple(w.shape)  # torch (out, in, kH, kW)
+    assert od["ms_encoder/weight_0:0"].shape == (t[3], t[2], t[1], t[0])
+    ms_buf = dict(opt._iter_official_weights())["ms_encoder/weight_0:0"]
+    assert np.array_equal(
+        od["ms_encoder/weight_0:0"],
+        ms_buf.detach().cpu().numpy().transpose(2, 3, 1, 0))
+    # the 1-D bias state has no layout difference (identity)
+    b_buf = dict(opt._iter_official_weights())["ms_encoder/bias_0:0"]
+    assert np.array_equal(od["ms_encoder/bias_0:0"],
+                          b_buf.detach().cpu().numpy())
+
+    # official -> torch on a fresh optimizer: the value is converted
+    # back through the owning layer and the torch-layout state is
+    # restored EXACT
+    c2, ps2 = _bound_conv()
+    for p2 in ps2:
+        p2._dfl_owner_layer = c2
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt2, od,
+                                                       saveable=c2,
+                                                       component="opt2")
+    assert rep.result == "PASS"
+    layout_maps = [m for m in rep.mapped if m.rule == "layout_converted"]
+    assert [m.destination_name for m in layout_maps] == [
+        "ms_encoder/weight_0:0", "vs_encoder/weight_0:0"]
+    assert all(m.status == "MAPPED_LAYOUT_CONVERTED" for m in layout_maps)
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.ms_dict.values(), opt2.ms_dict.values()))
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.vs_dict.values(), opt2.vs_dict.values()))
+
+    # without the owner binding the legacy identity behavior stands:
+    # the state slot is stored value-exact in its torch layout
+    _, ps3 = _bound_conv()
+    opt3 = dfl_nn.AdaBelief(name="opt3", lr=0.01)
+    opt3.initialize_variables(ps3, vars_on_cpu=True)
+    _two_steps(opt3, ps3)
+    od3 = cv.convert_optimizer_state_torch_to_official(opt3)
+    assert tuple(od3["ms_encoder/weight_0:0"].shape) == tuple(ps3[0].shape)
+    rep3 = cv.convert_optimizer_state_official_to_torch(opt3, od3,
+                                                        component="opt3")
+    assert rep3.result == "PASS"
+    assert all(m.rule == "identity" for m in rep3.mapped)
+
+
 def test_iters_int32_official_widening():
     # official TF stored iters as int32; the torch counter is int64 —
     # declared exact widening, reported (not a silent cast)
@@ -704,6 +769,56 @@ def test_iters_int32_official_widening():
     iters_map = [m for m in rep.mapped if m.destination_name == "iters:0"][0]
     assert iters_map.rule == "iters_int_widening"
     assert int(opt2.iterations) == 2
+
+
+def test_iters_bare_int_official_format(plain_tmp):
+    # official modernization-era builds store the optimizer iters
+    # counter as a BARE int (the real 256-DF-UDT checkpoint set does);
+    # the older TF-era builds stored a 0-D int32 array. Both are valid
+    # official formats — the engine accepts the int (file level and
+    # state level) and restores the EXACT counter (identity rule,
+    # both sides int64); every other state value must still be an
+    # ndarray (strictness preserved).
+    init_cpu()
+    c, ps = _bound_conv()
+    for p in ps:
+        p._dfl_owner_layer = c
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    od = cv.convert_optimizer_state_torch_to_official(opt)
+    od["iters:0"] = int(opt.iterations)  # bare int, newer official build
+
+    # file level: write + read accept the bare int (no CORRUPT)
+    p = str(Path(plain_tmp) / "opt_int.npy")
+    cv.write_official_checkpoint(p, od)
+    back = cv.read_official_checkpoint(p)
+    assert isinstance(back["iters:0"], int)
+
+    # state level: a fresh optimizer strict-loads it exactly
+    c2, ps2 = _bound_conv()
+    for p2 in ps2:
+        p2._dfl_owner_layer = c2
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt2, back,
+                                                       saveable=c2,
+                                                       component="opt2")
+    assert rep.result == "PASS"
+    iters_map = [m for m in rep.mapped
+                 if m.destination_name == "iters:0"][0]
+    assert iters_map.rule == "identity"
+    assert int(opt2.iterations) == int(opt.iterations)
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.ms_dict.values(), opt2.ms_dict.values()))
+
+    # strictness preserved: a non-array value for a state other than
+    # iters is still corrupt
+    bad = dict(back)
+    bad["ms_encoder/weight_0:0"] = 7
+    with pytest.raises(dfl_ckpt.CheckpointLoadError):
+        cv.convert_optimizer_state_official_to_torch(opt2, bad,
+                                                     component="opt2")
 
 
 def test_optimizer_state_strict_failures():

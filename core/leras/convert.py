@@ -297,9 +297,15 @@ def read_official_checkpoint(path):
 
     The file must contain a pickled ``dict[str, np.ndarray]``
     (protocol 4, written by the official DFL ``save_weights`` and by
-    this project's torch ``save_weights``). Anything else — a non-dict
-    pickle, a real ``np.save``-format array file, a truncated/corrupt
-    pickle — is ``CORRUPT_CHECKPOINT``.
+    this project's torch ``save_weights``). Official builds from the
+    modernization era onward additionally store the optimizer
+    iteration counter (``iters:0``) as a bare ``int`` instead of a
+    0-D array — both spellings are valid official format (a bare
+    ``int``/``np.integer`` value is accepted anywhere a state value
+    appears and normalized to a 0-D array). Anything else — a
+    non-dict pickle, a real ``np.save``-format array file, a
+    truncated/corrupt pickle, a list/str/float state value — is
+    ``CORRUPT_CHECKPOINT``.
     """
     name = Path(path).name
     try:
@@ -328,10 +334,14 @@ def read_official_checkpoint(path):
                 f"{ERR_CORRUPT_CHECKPOINT}: {name} has a non-string key "
                 f"{key!r}"
             )
-        if not isinstance(value, np.ndarray):
+        # official newer builds store the optimizer iters counter as
+        # a bare int (older TF-era builds: a 0-D array) — both valid
+        if not isinstance(value, np.ndarray) and \
+                not isinstance(value, (int, np.integer)):
             raise ckpt.CheckpointLoadError(
                 f"{ERR_CORRUPT_CHECKPOINT}: {name} value for '{key}' is "
-                f"{type(value).__name__}, expected numpy array"
+                f"{type(value).__name__}, expected numpy array (or a "
+                f"bare int for the official optimizer iters counter)"
             )
     return d
 
@@ -723,6 +733,32 @@ def _state_key_of(param, index):
     return key
 
 
+def _state_param_for(state_sub_name, params_by_name):
+    """Official state sub-name -> the tracked parameter it belongs to
+    (via the name binding), or None when the slot tracks no bound
+    variable (the ``iters`` counter, a well-formed-but-unbound name,
+    or a positional ``param_<i>`` key that is itself bound)."""
+    for _prefix, varname in _state_varname_candidates(
+            ckpt.strip_zero_suffix(state_sub_name)):
+        hit = params_by_name.get(varname)
+        if hit is not None:
+            return hit[0]
+    return None
+
+
+def _state_layout_layer(tracked):
+    """The layer whose layout rule applies to a state tensor that
+    tracks ``tracked`` (module docstring of OptimizerBase, 'State
+    LAYOUT'): the owning layer binding the model code attaches to
+    every optimized parameter. None when unbound — the value then
+    passes through unchanged (official identity case)."""
+    layer = getattr(tracked, "_dfl_owner_layer", None) \
+        if tracked is not None else None
+    if layer is None or not isinstance(layer, Saveable):
+        return None
+    return layer
+
+
 def _state_varname_candidates(state_sub_name):
     """Official state sub-name -> list of (prefix, variable official
     sub-name) candidates, in preference order.
@@ -846,10 +882,16 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
             f"from iteration 0; this project must not)"
         )
     elif iters_value is not None:
+        # official newer builds store iters as a bare int — normalize
+        # to a 0-D array before the standard array validation
+        if not isinstance(iters_value, np.ndarray) and \
+                isinstance(iters_value, (int, np.integer)):
+            iters_value = np.asarray(iters_value)
         if not isinstance(iters_value, np.ndarray):
             report.errors.append(
                 f"{ERR_CORRUPT_CHECKPOINT}: value for 'iters:0' is "
-                f"{type(iters_value).__name__}, expected numpy array"
+                f"{type(iters_value).__name__}, expected numpy array "
+                f"(or a bare int, the official newer-build format)"
             )
         else:
             dt_err = _dtype_mismatch_text(iters_value.dtype, iters_param.dtype)
@@ -900,17 +942,10 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
         if dt_err is not None:
             report.errors.append(f"{dt_err} (state '{name}')")
             continue
-        if tuple(np.asarray(value).shape) != tuple(tensor.shape):
-            report.errors.append(
-                f"{ERR_SHAPE_MISMATCH}: optimizer state '{name}' has "
-                f"shape {tuple(np.asarray(value).shape)}, expected "
-                f"{tuple(tensor.shape)} (optimizer state is copied "
-                f"value-exact; no reshape)"
-            )
-            continue
 
         # name-driven cross-check: the source key and the torch state
-        # slot must bind to the SAME variable
+        # slot must bind to the SAME variable (also resolves the
+        # tracked variable for the state LAYOUT rule below)
         src_varname, err = _bound_varname(matched_key, "source")
         if err:
             report.errors.append(err)
@@ -928,6 +963,31 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
             )
             continue
 
+        # State LAYOUT (OptimizerBase module docstring): the official
+        # state tensor has the layout of the trained variable it
+        # tracks — apply the owning layer's official->torch layout
+        # hook BEFORE the shape check (the torch state slot has the
+        # parameter's torch layout; without this the strict shape
+        # check fails on every official-layout conv kernel state).
+        tracked = params_by_name[src_varname][0]
+        layer = _state_layout_layer(tracked)
+        if layer is not None:
+            converted = layer.convert_weight_layout(value, tracked)
+            # identity hooks return the input unchanged (same object);
+            # a real layout conversion produces a new array
+            layout = converted is not value
+            value_cmp = converted if layout else value
+        else:
+            layout = False
+            value_cmp = value
+        if tuple(np.asarray(value_cmp).shape) != tuple(tensor.shape):
+            report.errors.append(
+                f"{ERR_SHAPE_MISMATCH}: optimizer state '{name}' has "
+                f"shape {tuple(np.asarray(value_cmp).shape)}, expected "
+                f"{tuple(tensor.shape)} (the value is converted through "
+                f"the tracked variable's layout rule; no reshape)"
+            )
+            continue
         report.mapped.append(TensorMapping(
             source_name=matched_key,
             destination_name=name,
@@ -935,8 +995,9 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
             destination_shape=tuple(tensor.shape),
             source_dtype=np.dtype(value.dtype).name,
             destination_dtype=str(tensor.dtype),
-            rule="identity",
-            status="MAPPED_IDENTITY",
+            rule="layout_converted" if layout else "identity",
+            status="MAPPED_LAYOUT_CONVERTED" if layout
+            else "MAPPED_IDENTITY",
         ))
 
     expected_state_names = {ckpt.strip_zero_suffix(n) for n in names}
@@ -981,6 +1042,15 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
         arr = _as_contig(value)
         if target.dtype == torch.int64 and arr.dtype == np.int32:
             arr = arr.astype(np.int64)  # declared iters widening
+        # State LAYOUT: official-layout state value -> torch layout
+        # through the tracked variable's owning layer (iters and
+        # unbound/plain slots: identity — the shape check in pass 1
+        # already validated the converted value).
+        if target is not state_map.get("iters:0"):
+            tracked = _state_param_for(matched_key, params_by_name)
+            layer = _state_layout_layer(tracked)
+            if layer is not None:
+                arr = np.asarray(layer.convert_weight_layout(arr, tracked))
         with torch.no_grad():
             target.copy_(torch.from_numpy(arr).to(device=target.device,
                                                   dtype=target.dtype))
@@ -993,8 +1063,25 @@ def convert_optimizer_state_torch_to_official(optimizer, component=None):
     exact on the torch side via ``_iter_official_weights``). The
     iteration counter is stored as int64 (torch.long); the official TF
     implementation used int32 — the value is exact and the official
-    loader casts to its variable dtype on load."""
+    loader casts to its variable dtype on load.
+
+    State LAYOUT (OptimizerBase module docstring): the on-disk dict
+    is official-layout, so each state tensor is converted through the
+    layout hook of the OWNING LAYER of the tracked parameter (the
+    in-memory state buffers have the parameter's torch layout) —
+    identity for ``iters`` and for parameters without a
+    ``_dfl_owner_layer`` binding."""
     d = {}
+    weights = list(getattr(optimizer, "_weights", []))
+    params_by_name = {
+        _state_key_of(p, i): (p, i) for i, p in enumerate(weights)
+    }
     for name, tensor in optimizer._iter_official_weights():
-        d[name] = tensor.detach().cpu().numpy().copy()
+        value = tensor.detach().cpu().numpy().copy()
+        if name != "iters:0":
+            tracked = _state_param_for(name, params_by_name)
+            layer = _state_layout_layer(tracked)
+            if layer is not None:
+                value = layer.convert_weight_to_official(value, tracked)
+        d[name] = value
     return d

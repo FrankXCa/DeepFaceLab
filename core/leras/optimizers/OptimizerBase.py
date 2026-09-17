@@ -45,6 +45,26 @@ torch, so the torch model code assigns ``param._dfl_name =
 ``param_<index>`` key. Object ids are never used (state ordering
 must not depend on them).
 
+State LAYOUT (checkpoint compatibility, Phase 4): the official
+optimizer state variables have the SAME layout as the trained
+variables they track (official NHWC conv kernels on disk, whatever
+the runtime layout), while the torch state buffers have the
+parameter's torch layout. So an optimizer's ``load_weights`` /
+``save_weights`` (inherited ``Saveable`` contract) must convert a
+state tensor through the layout hook of the OWNING LAYER of the
+parameter it tracks — the model code attaches that binding to every
+optimized parameter exactly like the name binding:
+``param._dfl_owner_layer = <the leaf layer whose registered
+parameters include it>``. Without the binding (or when the owning
+layer declares no layout difference) the value passes through
+unchanged — the rule applies to the ``iters`` counter and to plain
+layers (Dense/bias) exactly as to the official identity case. The
+Phase 4 converter (``convert_optimizer_state_*``) applies the same
+rule. Evidence (real official checkpoint): official-layout (NHWC)
+state tensors read without this conversion fail the strict shape
+check against the torch-layout state buffers (62 NHWC/NCHW
+mismatches on a real 320-liae SAEHD ``src_dst_opt.npy``).
+
 Documented semantics (official behavior preserved):
 - **epsilon** = the official ``np.finfo(g.dtype).resolution`` —
   the DECIMAL resolution ``10 ** ceil(log10(machine eps))``, which
@@ -132,6 +152,10 @@ class OptimizerBase(torch.nn.Module, Saveable):
         # official sub-name for every state tensor, aligned with
         # get_weights() (after the leading 'iters:0')
         self._state_official_names = []
+        # id(state buffer) -> the tracked parameter it was created for
+        # (filled by _zero_state) — the state LAYOUT delegation key
+        # (module docstring, 'State LAYOUT')
+        self._state_owner = {}
 
     # --- official initialize_variables contract -------------------------
 
@@ -159,6 +183,7 @@ class OptimizerBase(torch.nn.Module, Saveable):
         buf = torch.zeros(param.shape, dtype=param.dtype,
                           device=param.device)
         self.register_buffer(attr, buf)
+        self._state_owner[id(buf)] = param  # state LAYOUT delegation
         return buf
 
     def initialize_variables(self, trainable_weights, vars_on_cpu=True,
@@ -176,6 +201,7 @@ class OptimizerBase(torch.nn.Module, Saveable):
         self._weight_keys = {
             id(v): self._weight_key(v, i) for i, v in enumerate(trainable_weights)
         }
+        self._state_owner = {}
         if nn.device is not None and self.iterations.device != nn.device:
             self.iterations.data = self.iterations.data.to(nn.device)
         self._build_state(trainable_weights)
@@ -192,6 +218,37 @@ class OptimizerBase(torch.nn.Module, Saveable):
                 "was not registered by initialize_variables"
             )
         return key
+
+    # --- official state LAYOUT delegation (module docstring) --------------
+
+    def convert_weight_layout(self, value, param):
+        """Official -> torch layout for a checkpoint value of THIS
+        saveable. The optimizer's own tensors are the zero-state
+        buffers; a state buffer is converted through the layout hook
+        of the OWNING LAYER of the parameter it tracks (the official
+        state tensor has the tracked variable's layout). Untracked
+        values (the ``iters`` counter) and tracked parameters without
+        a ``_dfl_owner_layer`` binding pass through unchanged —
+        identical to the base identity behavior."""
+        tracked = self._state_owner.get(id(param))
+        if tracked is None:
+            return value
+        layer = getattr(tracked, "_dfl_owner_layer", None)
+        if layer is None or not isinstance(layer, Saveable):
+            return value
+        return layer.convert_weight_layout(value, tracked)
+
+    def convert_weight_to_official(self, value, param):
+        """Torch -> official layout, inverse of ``convert_weight_layout``
+        (applied by ``save_weights`` so the file on disk is
+        official-layout, exactly like the component weights)."""
+        tracked = self._state_owner.get(id(param))
+        if tracked is None:
+            return value
+        layer = getattr(tracked, "_dfl_owner_layer", None)
+        if layer is None or not isinstance(layer, Saveable):
+            return value
+        return layer.convert_weight_to_official(value, tracked)
 
     # --- official get_update_op contract ---------------------------------
 
