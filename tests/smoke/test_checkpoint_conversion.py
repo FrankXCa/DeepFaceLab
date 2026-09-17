@@ -1,11 +1,11 @@
-"""Phase 4 acceptance: checkpoint compatibility and conversion (1/2).
+"""Phase 4 acceptance: checkpoint compatibility and conversion.
 
 Covers the Phase 4 centralized conversion engine
-(``core/leras/convert.py`` — independent reimplementation; concept
+(``core.leras/convert.py`` — independent reimplementation; concept
 sources per docs/PHASE4_PLAN.md items 16-19: official DFL file format
-contract (GPL-3.0), EXTERNAL_A strict two-pass load concept
-(GPL-3.0), EXTERNAL_B component mapping concepts (unlicensed — NOT
-copied)) for the generic-component (weights) direction:
+contract (GPL-3.0), EXTERNAL_A strict two-pass load concept (GPL-3.0),
+EXTERNAL_B component/optimizer-state mapping concepts (unlicensed —
+NOT copied)):
 
 - official file format (a pickled ``dict[str, np.ndarray]``, protocol
   4, keys ``{sub}:0`` — parsed with pickle + NumPy, NO TensorFlow):
@@ -34,35 +34,40 @@ copied)) for the generic-component (weights) direction:
   one source key), corrupt values -> ``CheckpointLoadError`` with the
   full structured report; on failure NOTHING is copied;
 - reverse export (torch -> official): the official-layout dict via
-  the per-layer ``convert_weight_to_official`` hooks (module-tree
-  cascading — archi/discriminator files carry official layouts);
-  explicit rejection with ``UnsupportedExportError`` (never a silent
-  drop / approximation / reshape / coercion) when a state is flagged
+  the per-layer ``convert_weight_to_official`` hooks; explicit
+  rejection with ``UnsupportedExportError`` (never a silent drop /
+  approximation / reshape / coercion) when a state is flagged
   non-exportable;
-- archis (canonical option combos) and discriminators converted as
-  named Saveables; file-level round-trips through
-  write_official_checkpoint / read_official_checkpoint;
-  Saveable.load_weights agreement with the converter;
+- optimizer state: official ``iters:0`` + ``ms_*``/``vs_*``/``acc_*``
+  sub-names mapped NAME-driven (the state key embeds the variable's
+  official name; the initialize_variables order only names positional
+  parameters — never the sole identity): AdaBelief and RMSprop,
+  value-exact resume equivalence (iters + all states ``torch.equal``
+  after a fresh optimizer), the declared official int32 -> torch
+  int64 iteration-counter widening, and the strict failures (missing
+  iters, missing one state, extra state, unrecognized prefix, state
+  referencing a variable outside the given saveable);
+- file-level round-trips through write_official_checkpoint /
+  read_official_checkpoint: torch -> official -> torch and official
+  -> torch -> official for layers, archis (canonical option combos)
+  and discriminators;
+- Saveable.load_weights agreement: the Phase 3A strict loader and the
+  Phase 4 converter agree on every value for the same file; the
+  0-D ``iters`` counter survives under both pinned NumPy versions
+  (the NumPy 2.x ``ascontiguousarray`` 0-D -> (1,) upgrade is
+  guarded);
 - GPU: device-neutral engine (CPU/NumPy arrays copied onto the
   parameter device), RTX 4090 conversion into a GPU module with
   bit-exact CPU-twin parity (skip on CPU-only environments);
 - import boundary: no TensorFlow import and no direct
   ``torch.cuda.*`` in the conversion source (AST).
 
-The next Phase 4 commit (2/2) adds the optimizer-state conversion
-(iters / ms_ / vs_ / acc_, value-exact resume equivalence, the
-declared int32 -> int64 iteration-counter widening, optimizer
-strict-failure paths), the file-level bidirectional round-trip
-tests, the 0-D iters counter under NumPy 2.x, and the coverage-label
-checks (SAEHD/AMP/Quick96/XSeg full-model checkpoint compatibility:
-NOT_YET_IMPLEMENTED, Phases 6-8; facelib extractor models: Phase 9 —
-their real files validate the FORMAT contract here).
-
 Parity labels: EXACT for the value/layout/key/dtype round-trips
 (pure index rearrangement + value copy — ``torch.equal`` /
 ``np.array_equal``; the GPU copy is bit-exact); the real facelib
 files validate the FORMAT contract (EXACT), not extractor-model
-compatibility.
+compatibility (Phase 9); SAEHD/AMP/Quick96/XSeg full-model
+checkpoint compatibility: NOT_YET_IMPLEMENTED (Phases 6-8).
 """
 
 import ast
@@ -492,6 +497,139 @@ def test_reverse_export_rejects_non_exportable_state():
 
 
 # ---------------------------------------------------------------------------
+# Optimizer state conversion
+# ---------------------------------------------------------------------------
+
+def _bound_conv(name="encoder"):
+    c = dfl_nn.Conv2D(3, 4, kernel_size=5, padding='SAME', name=name)
+    c.build_weights()
+    ps = list(c.parameters())
+    ps[0]._dfl_name = f"{name}/weight:0"
+    ps[1]._dfl_name = f"{name}/bias:0"
+    return c, ps
+
+
+def _two_steps(opt, params):
+    # per-parameter constant gradients (deterministic, no RNG)
+    with torch.no_grad():
+        opt.get_update_op([(torch.full_like(p, 0.5), p) for p in params])()
+        opt.get_update_op([(torch.full_like(p, -0.25), p) for p in params])()
+
+
+def test_adabelief_optimizer_state_roundtrip():
+    init_cpu()
+    _, ps = _bound_conv()
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    od = cv.convert_optimizer_state_torch_to_official(opt)
+    # official names, exactly
+    assert sorted(od) == sorted(["iters:0",
+                                 "ms_encoder/weight_0:0",
+                                 "ms_encoder/bias_0:0",
+                                 "vs_encoder/weight_0:0",
+                                 "vs_encoder/bias_0:0"])
+    assert int(od["iters:0"]) == 2
+    assert np.dtype(od["iters:0"].dtype) == np.int64
+
+    # fresh optimizer + matching saveable: official -> torch
+    saveable2, ps2 = _bound_conv()
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt2, od,
+                                                       saveable=saveable2,
+                                                       component="opt2")
+    assert rep.result == "PASS"
+    assert int(opt2.iterations) == 2  # value-exact resume
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.ms_dict.values(), opt2.ms_dict.values()))
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.vs_dict.values(), opt2.vs_dict.values()))
+
+
+def test_rmsprop_optimizer_state_roundtrip():
+    init_cpu()
+    _, ps = _bound_conv()
+    opt = dfl_nn.RMSprop(name="opt", lr=0.001, rho=0.9)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    od = cv.convert_optimizer_state_torch_to_official(opt)
+    assert sorted(od) == sorted(["iters:0",
+                                 "acc_encoder/weight_0:0",
+                                 "acc_encoder/bias_0:0"])
+    _, ps2 = _bound_conv()
+    opt2 = dfl_nn.RMSprop(name="opt2", lr=0.001, rho=0.9)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt2, od,
+                                                       component="opt2")
+    assert rep.result == "PASS"
+    assert int(opt2.iterations) == 2
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.accumulators_dict.values(),
+                   opt2.accumulators_dict.values()))
+
+
+def test_iters_int32_official_widening():
+    # official TF stored iters as int32; the torch counter is int64 —
+    # declared exact widening, reported (not a silent cast)
+    init_cpu()
+    _, ps = _bound_conv()
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    od = {k: (v.astype(np.int32) if k == "iters:0" else v)
+          for k, v in cv.convert_optimizer_state_torch_to_official(opt).items()}
+    assert np.dtype(od["iters:0"].dtype) == np.int32
+    _, ps2 = _bound_conv()
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt2, od, component="opt2")
+    assert rep.result == "PASS"
+    iters_map = [m for m in rep.mapped if m.destination_name == "iters:0"][0]
+    assert iters_map.rule == "iters_int_widening"
+    assert int(opt2.iterations) == 2
+
+
+def test_optimizer_state_strict_failures():
+    init_cpu()
+    _, ps = _bound_conv()
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    od = cv.convert_optimizer_state_torch_to_official(opt)
+
+    _, ps2 = _bound_conv()
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+
+    def _load(d):
+        with pytest.raises(dfl_ckpt.CheckpointLoadError) as ei:
+            cv.convert_optimizer_state_official_to_torch(opt2, d, component="x")
+        return ei.value.args[0]
+
+    # missing iteration state
+    t = _load({k: v for k, v in od.items() if k != "iters:0"})
+    assert "MISSING_REQUIRED_STATE" in t and "iters:0" in t
+    # missing one state (no silent optimizer reset)
+    t = _load({k: v for k, v in od.items() if k != "vs_encoder/weight_0:0"})
+    assert "MISSING_REQUIRED_STATE" in t and "vs_encoder/weight_0:0" in t
+    # unexpected extra state (no silent ignore)
+    t = _load({**od, "zz_w_0:0": np.zeros((), np.int64)})
+    assert "UNEXPECTED_EXTRA_STATE" in t and "zz_w_0:0" in t
+    # duplicate ':0' variant forms for one state (never pick one variant
+    # silently)
+    t = _load({**od, "iters": od["iters:0"]})
+    assert "DUPLICATE_MAPPING" in t and "iters" in t
+    # a state referencing a variable outside the given saveable
+    other = dfl_nn.Conv2D(2, 2, kernel_size=3, padding='SAME', name="other")
+    other.build_weights()
+    with pytest.raises(dfl_ckpt.CheckpointLoadError) as ei:
+        cv.convert_optimizer_state_official_to_torch(opt2, od, saveable=other,
+                                                     component="x")
+    assert "not part of the given saveable" in ei.value.args[0]
+
+
+# ---------------------------------------------------------------------------
 # Archi / discriminator conversion (Phase 3F components)
 # ---------------------------------------------------------------------------
 
@@ -645,6 +783,36 @@ def test_saveable_loader_and_converter_agree(plain_tmp):
         assert torch.equal(p1.detach(), p2.detach()), n1
 
 
+def test_zero_d_iters_survives_numpy2(plain_tmp):
+    # the 0-D iters counter through the Phase 3A save/load path under
+    # NumPy 2.x (ascontiguousarray 0-D -> (1,) upgrade guarded)
+    init_cpu()
+    _, ps = _bound_conv()
+    opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
+    opt.initialize_variables(ps, vars_on_cpu=True)
+    _two_steps(opt, ps)
+    p = str(Path(plain_tmp) / "opt.npy")
+    opt.save_weights(p)
+    raw = pickle.loads(Path(p).read_bytes())
+    assert np.dtype(raw["iters:0"].dtype) in (np.int32, np.int64)
+    assert raw["iters:0"].ndim in (0, 1)
+
+    _, ps2 = _bound_conv()
+    opt2 = dfl_nn.AdaBelief(name="opt2", lr=0.01)
+    opt2.initialize_variables(ps2, vars_on_cpu=True)
+    assert opt2.load_weights(p) is True
+    assert int(opt2.iterations) == int(opt.iterations)
+    assert all(torch.equal(a, b) for a, b in
+               zip(opt.ms_dict.values(), opt2.ms_dict.values()))
+    # and the converter path agrees
+    _, ps3 = _bound_conv()
+    opt3 = dfl_nn.AdaBelief(name="opt3", lr=0.01)
+    opt3.initialize_variables(ps3, vars_on_cpu=True)
+    rep = cv.convert_optimizer_state_official_to_torch(opt3, raw, component="opt3")
+    assert rep.result == "PASS"
+    assert int(opt3.iterations) == int(opt.iterations)
+
+
 # ---------------------------------------------------------------------------
 # Device neutrality / GPU
 # ---------------------------------------------------------------------------
@@ -672,3 +840,25 @@ def test_gpu_conversion_bitexact_with_cpu_twin():
 # ---------------------------------------------------------------------------
 # Boundaries / labels
 # ---------------------------------------------------------------------------
+
+def test_no_tf_no_cuda_in_converter():
+    src = (REPO_ROOT / "core" / "leras" / "convert.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                assert not a.name.startswith("tensorflow"), a.name
+        elif isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith("tensorflow"), node.module
+    assert "torch.cuda" not in src
+
+
+def test_coverage_labels_present():
+    doc = cv.__doc__ or ""
+    # explicit labels: generic EXACT, models NOT_YET_IMPLEMENTED
+    assert "EXACT" in doc
+    assert "NOT_YET_IMPLEMENTED" in doc
+    for model in ("SAEHD", "AMP", "Quick96", "XSeg"):
+        assert model in doc
+    # the file format is the official pickled dict, not .pth
+    assert "official_dfl_pickled_dict_v4" in cv.OFFICIAL_FORMAT

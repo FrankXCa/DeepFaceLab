@@ -60,15 +60,31 @@ reused, not duplicated):
    phases (this phase has no model-specific tables — the generic
    components need none).
 
-Phase 4 scope: this commit lands the conversion engine for the
-generic components (weights) — the official pickled-dict format
-bridge, name mapping, declared layout rules, strict two-pass
-conversion, and the reverse export (with explicit rejection of
-non-exportable state). Optimizer-state conversion (iters /
-ms_ / vs_ / acc_) and the bidirectional file-level round-trip
-tests follow in the next Phase 4 commit; the later model phases
-(SAEHD/AMP/XSeg/Quick96, Phases 6-8) plug their model-specific
-name/layout tables into this engine.
+Phase 4 coverage (parity labels, see docs/COMPATIBILITY.md):
+- EXACT (weight-level, both directions, file-level round-trip): the
+  Phase 3B layers (Conv2D, Conv2DTranspose, DepthwiseConv2D with
+  layout rules; Dense / DenseNorm / BatchNorm2D / InstanceNorm2D /
+  FRNorm2D with identity + the broadcast-squeeze rule for the 1-D
+  bias/BN forms found in real official files), the Phase 3F archis
+  (DeepFakeArchi Encoder/Inter/Decoder, all official option combos)
+  and discriminators (CodeDiscriminator, PatchDiscriminator,
+  UNetPatchDiscriminator) as named Saveables, and the Phase 3E2
+  optimizers (AdaBelief, RMSprop — iters + ms_/vs_/acc_ states,
+  value-exact including the official int32 -> torch int64 iteration
+  counter widening);
+- EXACT format contract on real official artifacts (facelib/*.npy
+  pickled-dict files tracked in the baseline): parsing, key
+  conventions, layouts, dtypes (incl. float16 FaceEnhancer);
+- NOT_YET_IMPLEMENTED (full model checkpoint compatibility): SAEHD
+  (liae/df), AMP, Quick96 and XSeg model classes migrate in Phases
+  6-8 on top of this engine (model-specific name/layout tables land
+  with those phases); the facelib extractor models (S3FD/2DFAN/3DFAN/
+  FaceEnhancer, incl. S3FD's L2Norm 4-D weight rule) migrate in
+  Phase 9 — their real checkpoints validate the FORMAT here, not the
+  models;
+- TF runtime parity for the file format is not required: the format
+  is verified against the official artifacts directly (no TF import
+  in this module).
 """
 
 import pickle
@@ -642,3 +658,290 @@ def convert_torch_to_official(saveable, component=None, non_exportable=None):
         ))
     report.payload = d
     return report
+
+
+# --- optimizer state (items 14-15) -----------------------------------------
+
+def _state_key_of(param, index):
+    """Mirror of OptimizerBase._weight_key (the stable state key)."""
+    key = getattr(param, "name", None) or getattr(param, "_dfl_name", None)
+    if key is None:
+        key = f"param_{index}"
+    return key
+
+
+def _state_varname_candidates(state_sub_name):
+    """Official state sub-name -> list of (prefix, variable official
+    sub-name) candidates, in preference order.
+
+    Official: ``f"{prefix}_{varname}".replace(":", "_") + ":0"`` where
+    ``varname`` ends with ``':0'`` — the ONLY ':' turned into '_' is
+    the trailing one of the LAST path segment. The last segment of a
+    state name that ends in ``'_0'`` is therefore ambiguous: it is
+    EITHER the restored ``<param>:0`` (marker interpretation) OR the
+    literal name (a torch positional key like ``param_0``). Both
+    candidates are returned; the caller binds them against the
+    optimizer's actual parameters, so the ambiguity is resolved by
+    identity, never guessed.
+    """
+    base = ckpt.strip_zero_suffix(state_sub_name)
+    for prefix in _WEIGHT_STATE_PREFIXES:
+        if not base.startswith(prefix):
+            continue
+        rest = base[len(prefix):]
+        head, sep, last = rest.rpartition("/")
+        cands = []
+        if last.endswith("_0"):
+            cands.append((prefix,
+                          f"{head}/{last[:-2]}:0" if sep else f"{last[:-2]}:0"))
+        cands.append((prefix, rest))  # literal (no ':' marker)
+        return cands
+    return []
+
+
+def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
+                                              component=None):
+    """Strictly convert official optimizer-state keys (``iters:0``,
+    ``ms_*``/``vs_*``/``acc_*``) from dict ``d`` into the torch
+    ``optimizer`` (two-pass, all-or-nothing) and return the report.
+
+    Identity is NAME-driven: each state key embeds the trainable
+    variable's official name (``ms_<varname>_0:0``), which resolves to
+    the parameter (via the parameter's official name binding,
+    ``param.name``/``param._dfl_name``) and then to the optimizer's
+    state tensor for that parameter. The ``initialize_variables``
+    order is used only to name POSITIONAL (unbound) parameters — never
+    as the sole identity. ``saveable`` optionally cross-validates that
+    each referenced variable belongs to the given model saveable.
+    """
+    component = component or getattr(optimizer, "name", None) \
+        or type(optimizer).__name__
+
+    report = ConversionReport(
+        direction=OFFICIAL_TO_TORCH,
+        source_format=OFFICIAL_FORMAT,
+        destination_format=TORCH_FORMAT,
+        source_component=component,
+        destination_component=f"{type(optimizer).__name__} ({component})",
+    )
+
+    # torch-side official state names (iters + subclass state order)
+    names, tensors = zip(*optimizer._iter_official_weights())
+    state_map = dict(zip(names, tensors))  # official name -> tensor
+
+    # variable official name -> (param, index) for THIS optimizer
+    weights = list(getattr(optimizer, "_weights", []))
+    params_by_name = {}
+    for i, p in enumerate(weights):
+        params_by_name[_state_key_of(p, i)] = (p, i)
+
+    if saveable is not None:
+        saveable_names = {
+            ckpt.strip_zero_suffix(sub)
+            for sub, _ in saveable._iter_official_weights()
+            if sub != ""
+        }
+    else:
+        saveable_names = None
+
+    def _bound_varname(name, context):
+        """Bind an official state name to this optimizer's variables.
+
+        Returns (varname, error_text_or_None)."""
+        for prefix, varname in _state_varname_candidates(name):
+            if varname in params_by_name:
+                if saveable_names is not None:
+                    # the variable name is relative to the saveable's
+                    # PARENT scope; the saveable enumeration is
+                    # relative to the saveable scope itself
+                    sub = varname
+                    sname = getattr(saveable, "name", None)
+                    if sname and sub.startswith(sname + "/"):
+                        sub = sub[len(sname) + 1:]
+                    if ckpt.strip_zero_suffix(sub) not in saveable_names:
+                        return None, (
+                            f"{ERR_UNRECOGNIZED_STATE_KEY}: state "
+                            f"'{name}' references variable '{varname}' "
+                            f"which is not part of the given saveable"
+                        )
+                return varname, None
+        # no candidate bound: is the name at least well-formed?
+        well_formed = bool(_state_varname_candidates(name))
+        if not well_formed:
+            return None, (
+                f"{ERR_UNRECOGNIZED_STATE_KEY}: '{name}' does not follow "
+                f"the official optimizer state naming (iters / ms_ / vs_ / "
+                f"acc_ <varname> with the official ':' -> '_' marker)"
+            )
+        # well-formed but references a variable this optimizer has no
+        # state for (unbound parameter name)
+        cands = [v for _, v in _state_varname_candidates(name)]
+        return None, (
+            f"{ERR_MISSING_REQUIRED_STATE}: source state '{name}' "
+            f"references variable '{cands[0]}' which is not bound to any "
+            f"parameter this optimizer was initialized with (parameters "
+            f"need their official name binding, param.name / param._dfl_name)"
+        )
+
+    # --- iters ---
+    iters_param = state_map.get("iters:0")
+    iters_value, iters_key = ckpt._lookup_key(d, "iters:0")
+    if iters_param is not None and iters_value is None:
+        report.errors.append(
+            f"{ERR_MISSING_REQUIRED_STATE}: 'iters:0' (iteration state) "
+            f"is missing from the source (official DFL silently started "
+            f"from iteration 0; this project must not)"
+        )
+    elif iters_value is not None:
+        if not isinstance(iters_value, np.ndarray):
+            report.errors.append(
+                f"{ERR_CORRUPT_CHECKPOINT}: value for 'iters:0' is "
+                f"{type(iters_value).__name__}, expected numpy array"
+            )
+        else:
+            dt_err = _dtype_mismatch_text(iters_value.dtype, iters_param.dtype)
+            if dt_err is not None:
+                report.errors.append(f"{dt_err} (iters:0)")
+            elif iters_value.size != 1:
+                report.errors.append(
+                    f"{ERR_SHAPE_MISMATCH}: 'iters:0' has shape "
+                    f"{iters_value.shape}, expected scalar"
+                )
+            else:
+                widened = (np.dtype(iters_value.dtype) in _ITERS_INT_WIDENING
+                           and _ITERS_INT_WIDENING[np.dtype(iters_value.dtype)]
+                           == iters_param.dtype)
+                report.mapped.append(TensorMapping(
+                    source_name=iters_key,
+                    destination_name="iters:0",
+                    source_shape=() if iters_value.ndim == 0
+                    else tuple(iters_value.shape),
+                    destination_shape=tuple(iters_param.shape),
+                    source_dtype=np.dtype(iters_value.dtype).name,
+                    destination_dtype=str(iters_param.dtype),
+                    rule="iters_int_widening" if widened else "identity",
+                    status=("MAPPED_LAYOUT_CONVERTED" if widened
+                            else "MAPPED_IDENTITY"),
+                ))
+
+    # --- per-parameter states ---
+    for name, tensor in state_map.items():
+        if name == "iters:0":
+            continue
+        value, matched_key = ckpt._lookup_key(d, name)
+        if value is None:
+            report.errors.append(
+                f"{ERR_MISSING_REQUIRED_STATE}: optimizer state '{name}' "
+                f"is missing from the source (official DFL silently "
+                f"reset missing optimizer state; this project must not)"
+            )
+            continue
+        if not isinstance(value, np.ndarray):
+            report.errors.append(
+                f"{ERR_CORRUPT_CHECKPOINT}: value for '{name}' is "
+                f"{type(value).__name__}, expected numpy array"
+            )
+            continue
+
+        dt_err = _dtype_mismatch_text(value.dtype, tensor.dtype)
+        if dt_err is not None:
+            report.errors.append(f"{dt_err} (state '{name}')")
+            continue
+        if tuple(np.asarray(value).shape) != tuple(tensor.shape):
+            report.errors.append(
+                f"{ERR_SHAPE_MISMATCH}: optimizer state '{name}' has "
+                f"shape {tuple(np.asarray(value).shape)}, expected "
+                f"{tuple(tensor.shape)} (optimizer state is copied "
+                f"value-exact; no reshape)"
+            )
+            continue
+
+        # name-driven cross-check: the source key and the torch state
+        # slot must bind to the SAME variable
+        src_varname, err = _bound_varname(matched_key, "source")
+        if err:
+            report.errors.append(err)
+            continue
+        dst_varname, err = _bound_varname(name, "destination")
+        if err:
+            report.errors.append(err)
+            continue
+        if src_varname != dst_varname:
+            report.errors.append(
+                f"{ERR_UNRECOGNIZED_STATE_KEY}: source state "
+                f"'{matched_key}' binds to variable '{src_varname}' but "
+                f"this optimizer state slot '{name}' belongs to "
+                f"'{dst_varname}' (cross-wired optimizer state; refusing)"
+            )
+            continue
+
+        report.mapped.append(TensorMapping(
+            source_name=matched_key,
+            destination_name=name,
+            source_shape=tuple(np.asarray(value).shape),
+            destination_shape=tuple(tensor.shape),
+            source_dtype=np.dtype(value.dtype).name,
+            destination_dtype=str(tensor.dtype),
+            rule="identity",
+            status="MAPPED_IDENTITY",
+        ))
+
+    expected_state_names = {ckpt.strip_zero_suffix(n) for n in names}
+    for key in d:
+        if ckpt.strip_zero_suffix(key) not in expected_state_names:
+            report.errors.append(
+                f"{ERR_UNEXPECTED_EXTRA_STATE}: source key '{key}' is not "
+                f"a state of this optimizer (official DFL ignored extra "
+                f"keys silently; this project must not)"
+            )
+
+    # duplicate source keys across the ':0' variant forms: one logical
+    # state must not be provided by two different source keys (never
+    # silently pick one variant over the other — same rule as the
+    # weights path)
+    state_owner = {}
+    for key in d:
+        owner = None
+        for n in names:
+            if key in (n, ckpt.strip_zero_suffix(n)):
+                owner = n
+                break
+        if owner is None:
+            continue
+        if owner in state_owner:
+            report.errors.append(
+                f"{ERR_DUPLICATE_MAPPING}: source keys "
+                f"'{state_owner[owner]}' and '{key}' both provide state "
+                f"'{owner}' (duplicate ':0' variant forms; refusing to "
+                f"pick one)"
+            )
+        else:
+            state_owner[owner] = key
+
+    if report.errors:
+        raise ckpt.CheckpointLoadError(report.to_text())
+
+    # pass 2: apply (all-or-nothing)
+    for key, value in d.items():
+        _, matched_key = ckpt._lookup_key(state_map, key)
+        target = state_map[matched_key]
+        arr = _as_contig(value)
+        if target.dtype == torch.int64 and arr.dtype == np.int32:
+            arr = arr.astype(np.int64)  # declared iters widening
+        with torch.no_grad():
+            target.copy_(torch.from_numpy(arr).to(device=target.device,
+                                                  dtype=target.dtype))
+    return report
+
+
+def convert_optimizer_state_torch_to_official(optimizer, component=None):
+    """Convert the torch ``optimizer`` state to an official-format dict
+    (``iters:0`` + the official ``ms_*``/``vs_*``/``acc_*`` sub-names —
+    exact on the torch side via ``_iter_official_weights``). The
+    iteration counter is stored as int64 (torch.long); the official TF
+    implementation used int32 — the value is exact and the official
+    loader casts to its variable dtype on load."""
+    d = {}
+    for name, tensor in optimizer._iter_official_weights():
+        d[name] = tensor.detach().cpu().numpy().copy()
+    return d
