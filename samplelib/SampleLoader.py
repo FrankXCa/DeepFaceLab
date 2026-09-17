@@ -50,10 +50,16 @@ class SampleLoader:
 
         elif          sample_type == SampleType.FACE:
             if  samples[sample_type] is None:
+                # initialized before the try so a PackedFaceset load
+                # failure is logged (with the correct path — the
+                # upstream code referenced an undefined name here,
+                # which masked the real load error) and falls back to
+                # the DFLIMG face-sample path
+                result = None
                 try:
                     result = samplelib.PackedFaceset.load(samples_path)
                 except:
-                    io.log_err(f"Error occured while loading samplelib.PackedFaceset.load {str(samples_dat_path)}, {traceback.format_exc()}")
+                    io.log_err(f"Error occured while loading samplelib.PackedFaceset.load {str(samples_path)}, {traceback.format_exc()}")
 
                 if result is not None:
                     io.log_info (f"Loaded {len(result)} packed faces from {samples_path}")
