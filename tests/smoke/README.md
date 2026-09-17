@@ -217,19 +217,35 @@ Populated in Phase 4:
   concept sources: official DFL file-format contract (GPL-3.0),
   EXTERNAL_A strict two-pass load (GPL-3.0), EXTERNAL_B
   component/optimizer-state mapping concepts (unlicensed, NOT
-  copied)): official file-format validation against the REAL
-  official artifacts tracked in the baseline (`facelib/*.npy`
-  pickled dicts written by official TF-era DFL code: S3FD/2DFAN
-  float32 with 4-D singleton-padded bias/BN forms, 3DFAN float32
-  1-D forms, FaceEnhancer float16) + protocol-4 re-pickle
-  round-trip + corrupt-file rejection (truncated pickles, non-dict
-  pickles, real `np.save` array files, non-string keys, non-ndarray
-  values); name mapping (torch dotted <-> official slashed `:0`,
-  `:0`-variant tolerance); declared layout rules with UNIQUE-VALUE
-  tensors (Conv2D HWIO<->OIHW, Conv2DTranspose, DepthwiseConv2D,
-  Dense official-layout identity, the `broadcast_squeeze` rule for
-  1-D bias/BN parameters accepting the 2/3/4-D singleton-padded
-  official forms — no element-count reshape fallback anywhere);
+  copied)): official file-format validation — the EXACT outer
+  container is a RAW pickle protocol-4 stream of a
+  `dict[str, np.ndarray]` (the official `save_weights` writes
+  `pickle.dumps(d, 4)` + `write_bytes_safe`; the `.npy` extension is
+  a misnomer, the file is NOT a NumPy `.npy` container —
+  `np.save`/`np.load` play no role; "protocol 4" is the pickle
+  protocol of the whole file) — pinned independently of the
+  converter's reader (leading pickle bytes identical to the real
+  artifacts, `pickle.loads` — the official load primitive — parses
+  keys/shapes/dtypes/values exactly, structural comparison against a
+  real artifact, cross-checked in the NumPy 1.x environment) and
+  against the REAL official artifacts tracked in the baseline
+  (`facelib/*.npy` pickled dicts written by official TF-era DFL
+  code: S3FD/2DFAN float32 with the NHWC 4-D singleton-padded
+  `(1,1,1,C)` bias/BN forms, 3DFAN float32 1-D `(C,)` forms,
+  FaceEnhancer float16) + protocol-4 re-pickle round-trip +
+  corrupt-file rejection (truncated pickles, non-dict pickles, real
+  `np.save` array files, non-string keys, non-ndarray values); name
+  mapping (torch dotted <-> official slashed `:0`, `:0`-variant
+  tolerance); declared layout rules with UNIQUE-VALUE tensors
+  (Conv2D HWIO<->OIHW, Conv2DTranspose, DepthwiseConv2D, Dense
+  official-layout identity, and the `channel_broadcast` WHITELIST
+  for 1-D bias/BN/eps parameters — exactly the known official
+  singleton layouts `(C,)` (identity), `(1,1,1,C)` (NHWC padding)
+  and `(1,C,1,1)` (NCHW padding); every other shape, including
+  same-element-count placements a naive `np.squeeze()` would fix
+  (`(1,C)`, `(1,1,C)`, `(1,C,1)`, `(C,1)`, `(1,1,C,1)`,
+  `(C,1,1,1)`, `(2,1,1,C)`), is rejected explicitly — no
+  element-count reshape fallback anywhere);
   strict two-pass all-or-nothing conversion (missing required
   weights, unexpected extra keys, same-element-count wrong shapes,
   dtype mismatch, ambiguous mapping -> `CheckpointLoadError` with
@@ -249,8 +265,8 @@ Populated in Phase 4:
   rearrangement + value copy — torch.equal/np.array_equal; the GPU
   copy test is bit-exact, RTX 4090, skip-if-CPU-only).
 
-Current counts (2026-09, after Phase 4): CUDA environment 276
-passed; CPU environment 261 passed + 15 skipped.
+Current counts (2026-09, after Phase 4): CUDA environment 278
+passed; CPU environment 263 passed + 15 skipped.
 
 Environments (git-ignored, created with `uv`):
 

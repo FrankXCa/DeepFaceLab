@@ -8,8 +8,16 @@ implementation — the converter foundation that later model phases
 Authoritative source concepts (independent reimplementation — no code
 copied; see docs/PHASE4_PLAN.md, Part 1 items 16-19):
 - official DFL (GPL-3.0): the file format contract — checkpoint files
-  (``*.npy``) contain a pickled ``dict[str, np.ndarray]`` (pickle
-  protocol 4) with keys ``{sub_name}:0`` (scope prefix stripped);
+  carry a ``dict[str, np.ndarray]`` whose keys are ``{sub_name}:0``
+  (scope prefix stripped). EXACT outer container (verified against
+  the official source AND the real artifacts in this repo): the
+  official ``Saveable.save_weights`` writes ``pickle.dumps(d, 4)``
+  through ``pathex.write_bytes_safe`` — a RAW pickle protocol-4
+  stream; the ``.npy`` extension is a misnomer, the file is NOT a
+  NumPy ``.npy`` container and ``np.save``/``np.load`` are not
+  involved at any level; "protocol 4" is the pickle protocol of the
+  whole file (there is no separate outer container). The official
+  ``load_weights`` reads it back with ``pickle.loads(file_bytes)``.
 - EXTERNAL_A (GPL-3.0): the strict two-pass load concept (validate
   EVERYTHING before applying anything);
 - EXTERNAL_B (unlicensed): the component/optimizer spec and
@@ -48,14 +56,33 @@ reused, not duplicated):
    for a layer that DECLARES a layout conversion the hook is the
    authoritative rule — a value that already has the torch layout is
    an explicit failure, never a silent identity assumption;
-3. ``broadcast_squeeze``: a 1-D torch parameter (bias / BN
-   ``weight``/``bias``/``running_mean``/``running_var``) accepting the
-   2-D/3-D/4-D singleton-padded broadcast forms found in real
-   official files (e.g. S3FD/2DFAN store ``bias:0`` / ``bn*:0`` as
-   ``(1,1,1,C)`` while 3DFAN stores ``(C,)``; the official TF
-   variables themselves are 1-D, so the 4-D files predate the 1-D
-   leras variables and were only loadable there through the greedy
-   reshape this project refuses);
+3. ``channel_broadcast``: an explicit WHITELIST of the known
+    official singleton-padded layouts for a 1-D torch parameter of
+    size C (conv bias; BN ``weight``/``bias``/``running_mean``/
+    ``running_var``; FRNorm ``eps``) — never an unrestricted squeeze:
+
+    - ``(C,)``      identity — the official TF variable shape (all
+      1-D variables in the official leras are ``(dim,)``; the 3DFAN
+      artifact stores this form);
+    - ``(1,1,1,C)`` NHWC 4-D singleton padding — the official
+      forward reshape shape ``(1,1,1,dim)`` for ``data_format ==
+      'NHWC'`` (official BatchNorm2D/InstanceNorm2D/FRNorm2D); the
+      form present in the official S3FD / 2DFAN / FaceEnhancer
+      artifacts (conv biases and BN states);
+    - ``(1,C,1,1)`` NCHW 4-D singleton padding — the official
+      forward reshape shape ``(1,dim,1,1)`` for ``data_format ==
+      'NCHW'`` (same official source).
+
+    NO other shape is accepted, even when the element count matches
+    and a naive ``np.squeeze()`` would produce the right 1-D length
+    (e.g. ``(1,C)``, ``(1,1,C)``, ``(1,C,1)``, ``(C,1)``,
+    ``(1,1,C,1)``, ``(C,1,1,1)``, ``(2,1,1,C)`` all fail
+    explicitly). The official artifacts in this repo contain ONLY the
+    ``(C,)`` and ``(1,1,1,C)`` forms for these tensors (censused over
+    all four official facelib files); the official TF variables
+    themselves are 1-D, so the 4-D artifacts were only loadable
+    officially through the greedy ``np.reshape`` this project
+    refuses;
 4. model-specific explicit rules: RESERVED for the later model
    phases (this phase has no model-specific tables — the generic
    components need none).
@@ -64,8 +91,8 @@ Phase 4 coverage (parity labels, see docs/COMPATIBILITY.md):
 - EXACT (weight-level, both directions, file-level round-trip): the
   Phase 3B layers (Conv2D, Conv2DTranspose, DepthwiseConv2D with
   layout rules; Dense / DenseNorm / BatchNorm2D / InstanceNorm2D /
-  FRNorm2D with identity + the broadcast-squeeze rule for the 1-D
-  bias/BN forms found in real official files), the Phase 3F archis
+  FRNorm2D with identity + the channel-broadcast whitelist for the
+  1-D bias/BN forms found in real official files), the Phase 3F archis
   (DeepFakeArchi Encoder/Inter/Decoder, all official option combos)
   and discriminators (CodeDiscriminator, PatchDiscriminator,
   UNetPatchDiscriminator) as named Saveables, and the Phase 3E2
@@ -163,7 +190,7 @@ class TensorMapping:
     source_dtype: str           # numpy dtype name of the source value
     destination_dtype: str      # torch dtype name of the target
     rule: str                   # 'identity' | 'layer_layout:<Class>' |
-                                # 'broadcast_squeeze' | 'iters_int_widening'
+                                # 'channel_broadcast' | 'iters_int_widening'
     status: str                 # 'MAPPED_IDENTITY' | 'MAPPED_LAYOUT_CONVERTED'
 
 
@@ -333,19 +360,44 @@ def _declares_layout(owner_cls):
     return hook is not Saveable.convert_weight_layout
 
 
-def _squeeze_candidate(value, param):
-    """Rule 3 (generic, any owner): a 1-D torch parameter (bias / BN
-    ``weight``/``bias``/``running_mean``/``running_var``) accepting the
-    2-D/3-D/4-D singleton-padded broadcast forms found in real
-    official files (item 23 rule 1). Returns the squeezed array, or
-    None."""
-    if (
-        param.ndim == 1
-        and 2 <= value.ndim <= 4
-        and all(s == 1 for s in value.shape[:-1])
-        and value.shape[-1] == param.shape[0]
-    ):
-        return value.reshape(tuple(param.shape))
+def _channel_broadcast_candidate(value, param):
+    """Rule ``channel_broadcast``: the explicit WHITELIST of known
+    official singleton-padded layouts for a 1-D torch parameter of
+    size C (conv bias; BN ``weight``/``bias``/``running_mean``/
+    ``running_var``; FRNorm ``eps``). Returns the transformed
+    ``(C,)`` array, or None when the shape is not a known official
+    layout.
+
+    Accepted (C = param.size; the identity form ``(C,)`` is handled
+    by rule 1 before this rule is consulted):
+
+    - ``(1,1,1,C)``  NHWC 4-D singleton padding (the official
+      forward-reshape placement for ``data_format == 'NHWC'``; the
+      form stored by the official S3FD / 2DFAN / FaceEnhancer
+      artifacts): the channel axis is last and contiguous in C
+      order -> ``value.reshape(C)``;
+    - ``(1,C,1,1)``  NCHW 4-D singleton padding (the official
+      forward-reshape placement for ``data_format == 'NCHW'``): the
+      channel axis is second -> move it last deterministically,
+      ``value.transpose(1,0,2,3).reshape(C)``.
+
+    This is a whitelist of known official layouts, NOT an
+    unrestricted ``np.squeeze``: no other shape is accepted, even
+    when the element count matches and a naive squeeze would give
+    the right 1-D length (``(1,C)``, ``(1,1,C)``, ``(1,C,1)``,
+    ``(C,1)``, ``(1,1,C,1)``, ``(C,1,1,1)``, ``(2,1,1,C)`` all
+    fail explicitly).
+    """
+    if param.ndim != 1:
+        return None
+    c = param.shape[0]
+    shape = value.shape
+    if len(shape) == 4 and shape == (1, 1, 1, c):
+        # NHWC placement: trailing axis is contiguous in C order
+        return value.reshape(c)
+    if len(shape) == 4 and shape == (1, c, 1, 1):
+        # NCHW placement: move the channel axis to the end first
+        return value.transpose(1, 0, 2, 3).reshape(c)
     return None
 
 
@@ -373,9 +425,9 @@ def _resolve_layout(saveable, owner_cls, value, param):
         # the hook did not express this value: the generic rules still
         # apply (they concern other parameters of the same layer, e.g.
         # the 1-D bias of a conv that declares a kernel axis map)
-        squeezed = _squeeze_candidate(value, param)
+        squeezed = _channel_broadcast_candidate(value, param)
         if squeezed is not None:
-            return squeezed, "broadcast_squeeze"
+            return squeezed, "channel_broadcast"
         if value_shape == param_shape:
             raise _LayoutError(
                 f"{ERR_INVALID_LAYOUT}: value already has the torch "
@@ -394,11 +446,11 @@ def _resolve_layout(saveable, owner_cls, value, param):
     if value_shape == param_shape:
         return value, "identity"
 
-    # rule 3: broadcast_squeeze (official 4-D singleton-padded bias/BN
+    # rule 3: channel_broadcast (official singleton-padded bias/BN
     # forms, item 23 rule 1)
-    squeezed = _squeeze_candidate(value, param)
+    squeezed = _channel_broadcast_candidate(value, param)
     if squeezed is not None:
-        return squeezed, "broadcast_squeeze"
+        return squeezed, "channel_broadcast"
 
     raise _LayoutError(
         f"{ERR_SHAPE_MISMATCH}: source shape {value_shape} != parameter "
@@ -573,11 +625,12 @@ def convert_official_to_torch(saveable, d, component=None):
 
 def _weight_warnings(report):
     warnings = []
-    if any(m.rule == "broadcast_squeeze" for m in report.mapped):
+    if any(m.rule == "channel_broadcast" for m in report.mapped):
         warnings.append(
-            "broadcast_squeeze applied: the official file uses "
-            "singleton-padded (1[,1[,1]])C bias/BN shapes; the torch "
-            "parameters are 1-D (C,) — declared rule, value-exact"
+            "channel_broadcast applied: the official file stores the "
+            "1-D bias/BN state singleton-padded ((1,1,1,C) NHWC or "
+            "(1,C,1,1) NCHW); the torch parameters are 1-D (C,) — "
+            "declared whitelist rule, value-exact"
         )
     return warnings
 

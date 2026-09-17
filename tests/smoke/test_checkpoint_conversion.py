@@ -7,26 +7,42 @@ contract (GPL-3.0), EXTERNAL_A strict two-pass load concept (GPL-3.0),
 EXTERNAL_B component/optimizer-state mapping concepts (unlicensed —
 NOT copied)):
 
-- official file format (a pickled ``dict[str, np.ndarray]``, protocol
-  4, keys ``{sub}:0`` — parsed with pickle + NumPy, NO TensorFlow):
-  validation against the REAL official artifacts tracked in the
-  baseline (``facelib/*.npy`` — official TF-era pickled dicts written
-  by official DFL code: S3FD/2DFAN float32 with 4-D singleton-padded
-  bias/BN forms, 3DFAN float32 with 1-D forms, FaceEnhancer float16),
-  re-pickle protocol-4 round-trip, and rejection of corrupt files
-  (truncated pickles, non-dict pickles, real ``np.save``-format
-  array files, non-string keys, non-ndarray values);
+- official file format: the official ``Saveable.save_weights`` writes
+  a RAW pickle protocol-4 stream of a ``dict[str, np.ndarray]`` via
+  ``pickle.dumps(d, 4)`` + ``pathex.write_bytes_safe`` — the ``.npy``
+  extension is a misnomer, the file is NOT a NumPy ``.npy`` container
+  (``np.save``/``np.load`` are not involved at any level; "protocol
+  4" is the pickle protocol of the whole file, there is no separate
+  outer container); the official ``load_weights`` reads it back with
+  ``pickle.loads(file_bytes)``. The container contract is pinned
+  independently of the converter's own reader (leading pickle bytes
+  identical to the real artifacts — raw protocol-4 streams, not
+  NumPy ``.npy`` containers — and the pickle module, the official
+  load primitive, parses keys/shapes/dtypes/values exactly) and
+  against the REAL official artifacts tracked in the baseline
+  (``facelib/*.npy`` — S3FD/2DFAN float32 with the NHWC 4-D
+  singleton-padded ``(1,1,1,C)`` bias/BN forms, 3DFAN float32 with
+  1-D ``(C,)`` forms, FaceEnhancer float16), plus the re-pickle
+  protocol-4 round-trip and rejection of corrupt files (truncated
+  pickles, non-dict pickles, real ``np.save``-format array files,
+  non-string keys, non-ndarray values);
 - name mapping: the pure string transform (torch dotted <-> official
   slashed ``:0``) and the ``:0``-variant tolerance, both directions;
 - layout conversion with DECLARED rules only (no element-count
   reshape fallback): Conv2D (kH,kW,in,out)<->(out,in,kH,kW),
   Conv2DTranspose (kH,kW,out,in)<->(in,out,kH,kW), DepthwiseConv2D
   (kH,kW,in,dm)<->(in*dm,1,kH,kW), Dense official-layout identity
-  (in,out), and the ``broadcast_squeeze`` rule for 1-D parameters
-  (bias / BN weight/bias/running_mean/running_var) accepting the
-  2-D/3-D/4-D singleton-padded official forms; layout proofs use
-  UNIQUE-VALUE tensors so any wrong axis order is visible (element
-  counts are never an identity proof);
+  (in,out), and the ``channel_broadcast`` WHITELIST for 1-D
+  parameters (conv bias / BN weight/bias/running_mean/running_var /
+  FRNorm eps): exactly the known official singleton layouts
+  ``(C,)`` (identity), ``(1,1,1,C)`` (NHWC padding) and
+  ``(1,C,1,1)`` (NCHW padding) — every other shape, including
+  same-element-count placements a naive ``np.squeeze()`` would
+  "fix" (``(1,C)``, ``(1,1,C)``, ``(1,C,1)``, ``(C,1)``,
+  ``(1,1,C,1)``, ``(C,1,1,1)``, ``(2,1,1,C)``), is rejected
+  explicitly; layout proofs use UNIQUE-VALUE tensors so any wrong
+  axis order is visible (element counts are never an identity
+  proof);
 - strict two-pass (all-or-nothing) conversion: missing required
   weights, unexpected extra keys, shape mismatch (including
   same-element-count wrong shapes), dtype mismatch (float16 file into
@@ -191,6 +207,64 @@ def test_corrupt_files_rejected(plain_tmp):
 # Name mapping
 # ---------------------------------------------------------------------------
 
+def test_official_outer_container_contract_independent(plain_tmp):
+    """The OUTER file contract, verified without convert.py's reader:
+    direct byte inspection + the pickle module (the official load
+    primitive — official ``Saveable.load_weights`` is exactly
+    ``pickle.loads(Path.read_bytes())``).
+
+    The official writer is ``pickle.dumps(d, 4)`` through
+    ``pathex.write_bytes_safe``: a RAW pickle protocol-4 stream. The
+    ``.npy`` extension is a misnomer — the file is NOT a NumPy ``.npy``
+    container (``np.save``/``np.load`` play no role), so "protocol 4"
+    is the pickle protocol of the whole file, not an inner payload.
+    """
+    import pickle as _pickle
+
+    d = {
+        "weight:0": unique_value((3, 3, 2, 4)),   # official HWIO kernel
+        "bias:0": unique_value((4,)),
+        "running_mean:0": unique_value((1, 1, 1, 4)),  # NHWC padded form
+        "iters:0": np.zeros((), np.int64),
+    }
+    p = str(Path(plain_tmp) / "contract.npy")
+    cv.write_official_checkpoint(p, d)
+
+    raw = Path(p).read_bytes()
+    # outer container: raw pickle protocol-4 stream — NOT an npy file
+    assert raw[:2] == b"\x80\x04"
+    assert raw[:6] != b"\x93NUMPY"
+
+    # structural comparison with a REAL official artifact: identical
+    # container framing (PROTO 4 + FRAME opcodes)
+    with open(str(REPO_ROOT / "facelib" / "S3FD.npy"), "rb") as f:
+        real_head = f.read(3)
+    assert real_head == b"\x80\x04\x95"
+    assert raw[:3] == real_head  # same outer container as the real file
+
+    # the official load primitive (not the converter's reader) parses it
+    d2 = _pickle.loads(raw)
+    assert isinstance(d2, dict)
+    assert list(d2) == list(d)  # key names + order preserved exactly
+    for k, v in d.items():
+        assert isinstance(d2[k], np.ndarray), k
+        assert d2[k].shape == v.shape, k
+        assert np.dtype(d2[k].dtype) == np.dtype(v.dtype), k
+        assert np.array_equal(d2[k], v), k
+
+    # container pin: both our file and the real official artifact are
+    # raw pickle streams, not NumPy .npy containers (the NUMPY magic
+    # is absent). Whether numpy's legacy pickle path in np.load reads
+    # such files is a NumPy implementation detail across versions —
+    # the official reader is pickle.loads, and that is what this
+    # contract pins.
+    with open(str(REPO_ROOT / "facelib" / "S3FD.npy"), "rb") as f:
+        real_head = f.read(6)
+    assert raw[:6] != b"\x93NUMPY"
+    assert real_head != b"\x93NUMPY"
+    assert real_head[:2] == b"\x80\x04"
+
+
 def test_name_mapping_roundtrip():
     cases = [
         "weight", "bias", "running_mean", "running_var",
@@ -290,9 +364,13 @@ def test_dense_official_layout_identity():
     assert np.array_equal(rep_r.payload["weight:0"], src)
 
 
-def test_broadcast_squeeze_forms():
+def test_channel_broadcast_whitelist_forms():
+    # exactly the known official singleton layouts for a 1-D parameter
+    # of size C=5: (C,) identity, (1,1,1,C) NHWC, (1,C,1,1) NCHW
     init_cpu()
-    for form in ((5,), (1, 5), (1, 1, 5), (1, 1, 1, 5)):
+    for form, expected_rule in ((5,), "identity"), \
+                                ((1, 1, 1, 5), "channel_broadcast"), \
+                                ((1, 5, 1, 1), "channel_broadcast"):
         c = dfl_nn.Conv2D(3, 5, kernel_size=3, padding='SAME', name="c")
         c.build_weights()
         src = unique_value((3, 3, 3, 5))
@@ -301,9 +379,47 @@ def test_broadcast_squeeze_forms():
             c, {"weight:0": src, "bias:0": bias}, component="c")
         assert rep.result == "PASS", form
         rule = [m for m in rep.mapped if m.destination_name == "bias:0"][0].rule
-        expected = "identity" if form == (5,) else "broadcast_squeeze"
-        assert rule == expected, (form, rule)
-        assert torch.equal(c.bias, torch.from_numpy(unique_value((5,))))
+        assert rule == expected_rule, (form, rule)
+        # value-exact: the channel axis values land in order
+        assert torch.equal(c.bias, torch.from_numpy(unique_value((5,)))), form
+
+
+def test_channel_broadcast_rejects_malformed_same_count_shapes():
+    # malformed placements that np.squeeze() would "fix" to the right
+    # 1-D length but that are NOT known official layouts — the
+    # whitelist must reject them explicitly (never a disguised
+    # element-count reshape)
+    init_cpu()
+    rejected = [
+        (1, 5),        # 2-D: channel last but rank 2 (not official)
+        (5, 1),        # 2-D: channel first
+        (1, 1, 5),     # 3-D (not official — official forms are 1-D/4-D)
+        (1, 5, 1),     # 3-D middle placement
+        (5, 1, 1),     # 3-D channel first
+        (1, 1, 5, 1),  # 4-D trailing singleton (not an official layout)
+        (5, 1, 1, 1),  # 4-D channel first
+        (2, 1, 1, 5),  # leading dim not a singleton
+        (1, 5, 1, 5),  # channel duplicated (not a singleton pattern)
+    ]
+    for form in rejected:
+        c = dfl_nn.Conv2D(3, 5, kernel_size=3, padding='SAME', name="c")
+        c.build_weights()
+        before = {n: p.detach().clone() for n, p in
+                  list(c.named_parameters()) + list(c.named_buffers())}
+        src = unique_value((3, 3, 3, 5))
+        # distinct values (some malformed forms carry a different
+        # element count, e.g. (2,1,1,5) — the content is irrelevant:
+        # the conversion must fail on the shape alone)
+        bias = np.arange(int(np.prod(form)), dtype=np.float32).reshape(form)
+        with pytest.raises(dfl_ckpt.CheckpointLoadError) as ei:
+            cv.convert_official_to_torch(
+                c, {"weight:0": src, "bias:0": bias}, component="c")
+        text = ei.value.args[0]
+        assert ("SHAPE_MISMATCH" in text or "INVALID_LAYOUT" in text), form
+        # all-or-nothing: nothing was copied on failure
+        after = {n: p.detach().cpu() for n, p in
+                 list(c.named_parameters()) + list(c.named_buffers())}
+        assert all(torch.equal(before[k], after[k]) for k in before), form
 
 
 def test_bn_states_squeeze_and_identity():
