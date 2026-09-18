@@ -346,7 +346,12 @@ def get_transform_mat (image_landmarks, output_size, face_type, scale=1.0):
 
     # calc affine transform from 3 global space points to 3 local space points size of 'output_size'
     pts2 = np.float32(( (0,0),(output_size,0),(output_size,output_size) ))
-    mat = cv2.getAffineTransform(l_t,pts2)
+    # OpenCV 5.x enforces CV_32F in getAffineTransform while the
+    # remove_align branch builds l_t from Python float lists
+    # (g_c + [..] -> float64); the explicit downcast reproduces what
+    # the OpenCV 4.x python bindings applied automatically, so the
+    # official behavior is identical on both major versions.
+    mat = cv2.getAffineTransform(l_t.astype(np.float32),pts2)
     return mat
 
 def get_rect_from_landmarks(image_landmarks):
