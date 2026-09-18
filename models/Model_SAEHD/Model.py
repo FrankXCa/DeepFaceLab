@@ -1,5 +1,7 @@
 """SAEHD — official DeepFaceLab SAEHD model on the torch foundation
-(Phase 6A: structural skeleton, wiring, compatibility foundation).
+(Phase 6A: structural skeleton, wiring, compatibility foundation;
+Phase 6B: single-device training semantics — the official loss
+stack, train closures, update routing and preview rendering).
 
 The official TF source is preserved verbatim in ``Model_tf.py`` (dead
 reference, never imported — project convention, like
@@ -34,6 +36,23 @@ Official behavior preserved (structure/wiring layer):
   ``model_data_format``, NumPy out, exactly like the official
   ``tf_sess.run`` caller contract used by ``predictor_func`` / the
   merger);
+- Phase 6B training semantics (official behavior preserved):
+  ``onTrainOneIter`` (the official L767-782 driver: sample fetch,
+  the always-run src_dst step, the code-D step iff
+  true_face_power != 0 and not pretrain, the D_src step iff
+  gan_power != 0, the official two-scalar loss return = the per-
+  sample vector means), the train closures (``_src_dst_train`` /
+  ``_D_train`` / ``_D_src_dst_train`` = the official L574-605
+  closures) with the complete official loss stack (blur_out_mask
+  target rewrite, the softened loss masks incl. the official dead-
+  code style-mask override, the DSSIM/MSE/mask-head/eyes-mouth
+  terms, the face-style moments term, the background-style
+  dssim+MSE content term, the true-face generator term, the GAN
+  generator terms, the masked-training TV + bg-anti-MSE terms,
+  the code-D and D_src discriminator losses), the official
+  per-optimizer gradient ownership (src_dst_trainable_weights /
+  code_discriminator / D_src) and update order;
+  ``onGetPreview`` (the official L785-855 preview layout);
 - ``predictor_func`` / ``get_MergerConfig``: official, unchanged
   (the ``merger`` package is importable under the torch foundation);
 - ``get_model_filename_list`` / ``onSave`` / ``should_save_preview_
@@ -72,13 +91,21 @@ Documented torch adaptations (Phase 6A):
   ``gan_model_changed`` -> D_src) are preserved exactly;
 - ``export_dfm`` (DFM/ONNX via tf2onnx) is Phase 11 — the method
   exists and fails explicitly;
-- ``onTrainOneIter`` and the official train closures
-  (``src_dst_train`` / ``D_train`` / ``D_src_dst_train``) plus the
-  per-GPU loss stack (official L354-530) are Phase 6B (native torch
-  autograd with the official reduction semantics) — 6A provides
-  explicit deferral stubs that fail loudly instead of silently
-  mis-training; ``onGetPreview`` (preview rendering) is likewise
-  deferred (the base-class default is kept).
+- Phase 6B training translation: the official per-GPU TF graph
+  (the loss stack, nn.gradients, the src_dst_train / D_train /
+  D_src_dst_train session closures) becomes native eager torch —
+  the migrated ops (nn.dssim / nn.gaussian_blur / nn.style_loss /
+  nn.total_variation_mse / nn.sigmoid_cross_entropy) with the
+  official per-sample (N,) loss vectors; the multi-GPU
+  average_gv_list gradient averaging is the identity for the
+  single-device port; the official per-closure fresh gradients are
+  made explicit by zeroing each optimizer group's .grad before
+  every backward (no stale accumulation); the D closures detach
+  the generator-produced inputs (code / pred), exactly reproducing
+  the official nn.gradients(loss, D_weights)-only variable sets —
+  the D steps update no generator weight; the official update
+  order (src_dst step first, then the D steps on the post-update
+  weights) is preserved.
 
 No TensorFlow import appears on this path; no direct CUDA-backend
 calls or CUDA device-string literals (device handling through the
@@ -625,6 +652,336 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
             self.AE_merge = AE_merge
 
+        # --- training closures (official loss stack + update ops) -----
+        # torch (Phase 6B): the official per-GPU TF graph — the loss
+        # stack (Model_tf.py L388-547), the per-closure
+        # nn.gradients calls and the get_update_op update ops — is
+        # reproduced as native eager torch with identical semantics:
+        # the same tensor ops (the migrated nn.dssim /
+        # nn.gaussian_blur / nn.style_loss / nn.total_variation_mse /
+        # nn.sigmoid_cross_entropy), the same per-sample (N,) loss
+        # vectors, the same per-optimizer gradient sets (official
+        # nn.gradients(loss, vars) -> loss.backward() + the group's
+        # (grad, param) pairs), the same update order (src_dst first,
+        # then the D steps with the post-src_dst-step weights) and the
+        # single-tower translation of the multi-GPU graph (one
+        # device, average_gv_list over one tower is the identity —
+        # official ops_tf.py L76-77).
+
+        if self.is_training:
+            def AE_forward(warped_src, warped_dst):
+                # the official per-tower forward (L405-427), grad-
+                # capable: returns the code tensors (code-D inputs),
+                # the decoder-input codes and the five prediction
+                # tensors. Callers wrap it in torch.no_grad() where
+                # the official D closures re-feed the placeholders
+                # (post-update recompute).
+                warped_src = _to_tensor(warped_src)
+                warped_dst = _to_tensor(warped_dst)
+                if 'df' in archi_type:
+                    src_code = self.inter(self.encoder(warped_src))
+                    dst_code = self.inter(self.encoder(warped_dst))
+                    pred_src_src, pred_src_srcm = self.decoder_src(src_code)
+                    pred_dst_dst, pred_dst_dstm = self.decoder_dst(dst_code)
+                    pred_src_dst, pred_src_dstm = self.decoder_src(dst_code)
+                    # official L412: the code gradient is stopped, the
+                    # decoder itself still trains
+                    pred_src_dst_no_code_grad, _ = self.decoder_src(dst_code.detach())
+                elif 'liae' in archi_type:
+                    src_code = self.encoder(warped_src)
+                    src_inter_AB_code = self.inter_AB(src_code)
+                    src_code_dec = torch.concat([src_inter_AB_code, src_inter_AB_code], dim=nn.conv2d_ch_axis)
+                    dst_code = self.encoder(warped_dst)
+                    dst_inter_B_code = self.inter_B(dst_code)
+                    dst_inter_AB_code = self.inter_AB(dst_code)
+                    dst_code_dec = torch.concat([dst_inter_B_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+                    src_dst_code = torch.concat([dst_inter_AB_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+
+                    pred_src_src, pred_src_srcm = self.decoder(src_code_dec)
+                    pred_dst_dst, pred_dst_dstm = self.decoder(dst_code_dec)
+                    pred_src_dst, pred_src_dstm = self.decoder(src_dst_code)
+                    pred_src_dst_no_code_grad, _ = self.decoder(src_dst_code.detach())
+
+                return {
+                    'src_code': src_code,
+                    'dst_code': dst_code,
+                    'pred_src_src': pred_src_src,
+                    'pred_src_srcm': pred_src_srcm,
+                    'pred_dst_dst': pred_dst_dst,
+                    'pred_dst_dstm': pred_dst_dstm,
+                    'pred_src_dst': pred_src_dst,
+                    'pred_src_dstm': pred_src_dstm,
+                    'pred_src_dst_no_code_grad': pred_src_dst_no_code_grad,
+                }
+
+            def _zero_grads(param_groups):
+                # torch has no tf session boundary: the official
+                # fresh nn.gradients per session.run means no .grad
+                # may accumulate across update ops / iterations —
+                # make that explicit per group.
+                for group in param_groups:
+                    for p in group:
+                        p.grad = None
+
+            def _dssim_term(t, p):
+                # official L458-463 / L482-487: res<256 -> the 10x
+                # dssim term; res>=256 -> the 5x + 5x two-scale
+                # (filter_size int(res/11.6) and int(res/23.2),
+                # truncating int, max_val=1.0). nn.dssim returns the
+                # (N, C) per-sample channel vector in both data
+                # formats; the official axis=[1] = torch dim=1.
+                if resolution < 256:
+                    return torch.mean( 10*nn.dssim(t, p, max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                loss = torch.mean( 5*nn.dssim(t, p, max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                loss = loss + torch.mean( 5*nn.dssim(t, p, max_val=1.0, filter_size=int(resolution/23.2)), dim=1)
+                return loss
+
+            def _DLoss(labels, logits):
+                # official L499-500: the per-sample sigmoid BCE
+                # (mean over axes [1,2,3]) — the migrated
+                # nn.sigmoid_cross_entropy is the verbatim formula.
+                return nn.sigmoid_cross_entropy(labels, logits)
+
+            def _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                 warped_dst, target_dst, target_dstm, target_dstm_em):
+                # the official per-tower input preparation (L374-451):
+                # the blur_out_mask target rewrite (L391-402), the
+                # softened loss masks (L437-446, incl. the dead-code
+                # style-mask override) and the masked/anti-masked
+                # tensor set (L448-456).
+                warped_src = _to_tensor(warped_src)
+                target_src = _to_tensor(target_src)
+                target_srcm = _to_tensor(target_srcm)
+                target_srcm_em = _to_tensor(target_srcm_em)
+                warped_dst = _to_tensor(warped_dst)
+                target_dst = _to_tensor(target_dst)
+                target_dstm = _to_tensor(target_dstm)
+                target_dstm_em = _to_tensor(target_dstm_em)
+
+                target_srcm_anti = 1-target_srcm
+                target_dstm_anti = 1-target_dstm
+
+                if blur_out_mask:
+                    # official L391-402: the div-zero guard
+                    # tf.where(tf.equal(y, 0), ones, y) is ELEMENT-
+                    # WISE (y == 0, not torch.equal's whole-tensor
+                    # comparison)
+                    sigma = resolution / 128
+
+                    x = nn.gaussian_blur(target_src*target_srcm_anti, sigma)
+                    y = 1-nn.gaussian_blur(target_srcm, sigma)
+                    y = torch.where(y == 0, torch.ones_like(y), y)
+                    target_src = target_src*target_srcm + (x/y)*target_srcm_anti
+
+                    x = nn.gaussian_blur(target_dst*target_dstm_anti, sigma)
+                    y = 1-nn.gaussian_blur(target_dstm, sigma)
+                    y = torch.where(y == 0, torch.ones_like(y), y)
+                    target_dst = target_dst*target_dstm + (x/y)*target_dstm_anti
+
+                target_srcm_blur = nn.gaussian_blur(target_srcm,  max(1, resolution // 32) )
+                target_srcm_blur = torch.clip(target_srcm_blur, 0, 0.5) * 2
+                target_srcm_anti_blur = 1.0-target_srcm_blur
+
+                target_dstm_blur = nn.gaussian_blur(target_dstm,  max(1, resolution // 32) )
+                target_dstm_blur = torch.clip(target_dstm_blur, 0, 0.5) * 2
+
+                # official L444-446: the predicted-mask product blur
+                # (from pred_src_dstm*pred_dst_dstm after the
+                # forward) is DEAD CODE — L445 immediately
+                # overwrites it, so only the override is live: the
+                # bg anti-mask is the stop-grad complement of the
+                # SRC-side face mask, applied to DST-side tensors.
+                # The dead blur is omitted (its value is discarded —
+                # no observable difference).
+                style_mask_blur = torch.clip(target_srcm_blur, 0, 1.0).detach()
+                style_mask_anti_blur = 1.0 - style_mask_blur
+
+                target_dst_masked = target_dst*target_dstm_blur
+
+                target_src_anti_masked = target_src*target_srcm_anti_blur
+
+                target_src_masked_opt  = target_src*target_srcm_blur if masked_training else target_src
+                target_dst_masked_opt  = target_dst_masked if masked_training else target_dst
+                return {
+                    'warped_src': warped_src, 'target_src': target_src,
+                    'target_srcm': target_srcm, 'target_srcm_em': target_srcm_em,
+                    'warped_dst': warped_dst, 'target_dst': target_dst,
+                    'target_dstm': target_dstm, 'target_dstm_em': target_dstm_em,
+                    'target_srcm_blur': target_srcm_blur,
+                    'target_srcm_anti_blur': target_srcm_anti_blur,
+                    'target_dstm_blur': target_dstm_blur,
+                    'target_dst_masked': target_dst_masked,
+                    'target_src_anti_masked': target_src_anti_masked,
+                    'style_mask_anti_blur': style_mask_anti_blur,
+                    'target_src_masked_opt': target_src_masked_opt,
+                    'target_dst_masked_opt': target_dst_masked_opt,
+                }
+
+            def _src_dst_train(warped_src, target_src, target_srcm, target_srcm_em,
+                               warped_dst, target_dst, target_dstm, target_dstm_em):
+                # official src_dst_train (L574-586): the full
+                # generator loss stack (L458-545) -> backward ->
+                # ONE src_dst_opt step over src_dst_trainable_weights
+                # (official nn.gradients(gpu_G_loss,
+                # src_dst_trainable_weights) + get_update_op, L547/
+                # L564; the single tower makes average_gv_list the
+                # identity). Returns the per-sample (src, dst) loss
+                # vectors — the only closure returning values.
+                t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                     warped_dst, target_dst, target_dstm, target_dstm_em)
+
+                f = AE_forward(t['warped_src'], t['warped_dst'])
+                pred_src_src = f['pred_src_src']
+                pred_src_srcm = f['pred_src_srcm']
+                pred_dst_dst = f['pred_dst_dst']
+                pred_dst_dstm = f['pred_dst_dstm']
+                pred_src_dst = f['pred_src_dst']
+                pred_src_dstm = f['pred_src_dstm']
+                pred_src_dst_no_code_grad = f['pred_src_dst_no_code_grad']
+
+                pred_src_src_masked_opt = pred_src_src*t['target_srcm_blur'] if masked_training else pred_src_src
+                pred_dst_dst_masked_opt = pred_dst_dst*t['target_dstm_blur'] if masked_training else pred_dst_dst
+                pred_src_src_anti_masked = pred_src_src*t['target_srcm_anti_blur']
+
+                target_src = t['target_src']
+                target_dst = t['target_dst']
+                target_srcm = t['target_srcm']
+                target_srcm_em = t['target_srcm_em']
+                target_dstm = t['target_dstm']
+                target_dstm_em = t['target_dstm_em']
+
+                # --- src loss (official L458-480) ---
+                src_loss = _dssim_term(t['target_src_masked_opt'], pred_src_src_masked_opt)
+                src_loss = src_loss + torch.mean( 10*torch.square( t['target_src_masked_opt'] - pred_src_src_masked_opt ), dim=(1,2,3))
+
+                if eyes_mouth_prio:
+                    src_loss = src_loss + torch.mean( 300*torch.abs( target_src*target_srcm_em - pred_src_src*target_srcm_em ), dim=(1,2,3))
+
+                src_loss = src_loss + torch.mean( 10*torch.square( target_srcm - pred_src_srcm ), dim=(1,2,3) )
+
+                face_style_power = self.options['face_style_power'] / 100.0
+                if face_style_power != 0 and not self.pretrain:
+                    src_loss = src_loss + nn.style_loss(
+                        pred_src_dst_no_code_grad*pred_src_dstm.detach(),
+                        (pred_dst_dst*pred_dst_dstm).detach(),
+                        gaussian_blur_radius=resolution//8,
+                        loss_weight=10000*face_style_power)
+
+                bg_style_power = self.options['bg_style_power'] / 100.0
+                if bg_style_power != 0 and not self.pretrain:
+                    target_dst_style_anti_masked = target_dst*t['style_mask_anti_blur']
+                    psd_style_anti_masked = pred_src_dst*t['style_mask_anti_blur']
+
+                    src_loss = src_loss + torch.mean( (10*bg_style_power)*nn.dssim( psd_style_anti_masked, target_dst_style_anti_masked, max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                    src_loss = src_loss + torch.mean( (10*bg_style_power)*torch.square(psd_style_anti_masked - target_dst_style_anti_masked), dim=(1,2,3) )
+
+                # --- dst loss (official L482-492) ---
+                dst_loss = _dssim_term(t['target_dst_masked_opt'], pred_dst_dst_masked_opt)
+                dst_loss = dst_loss + torch.mean( 10*torch.square( t['target_dst_masked_opt']-pred_dst_dst_masked_opt ), dim=(1,2,3))
+
+                if eyes_mouth_prio:
+                    dst_loss = dst_loss + torch.mean( 300*torch.abs( target_dst*target_dstm_em - pred_dst_dst*target_dstm_em ), dim=(1,2,3))
+
+                dst_loss = dst_loss + torch.mean( 10*torch.square( target_dstm - pred_dst_dstm ), dim=(1,2,3) )
+
+                # --- the combined generator loss (official L497-545) ---
+                G_loss = src_loss + dst_loss
+
+                if self.options['true_face_power'] != 0:
+                    # official L502-509: the code-D prediction on the
+                    # SRC code with the ones label -> into G loss
+                    src_code_d = self.code_discriminator(f['src_code'])
+                    G_loss = G_loss + self.options['true_face_power']*_DLoss(torch.ones_like(src_code_d), src_code_d)
+
+                if gan_power != 0:
+                    # official L539-540: D_src on the pred (the
+                    # target-D_src forward belongs to the D closure's
+                    # own graph branch — not part of G loss)
+                    pred_src_src_d, pred_src_src_d2 = self.D_src(pred_src_src_masked_opt)
+                    G_loss = G_loss + gan_power*(_DLoss(torch.ones_like(pred_src_src_d), pred_src_src_d)  + \
+                                                 _DLoss(torch.ones_like(pred_src_src_d2), pred_src_src_d2))
+
+                    if masked_training:
+                        # official L542-545 (nested under the gan
+                        # block): minimal src-src-bg rec to suppress
+                        # random bright dots from the GAN
+                        G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_src_src)
+                        G_loss = G_loss + 0.02*torch.mean(torch.square(pred_src_src_anti_masked-t['target_src_anti_masked']), dim=(1,2,3) )
+
+                # the official update op consumes the grads of the
+                # TRAINABLE set (liae without random_warp excludes
+                # inter_AB — its weights never update and its state
+                # stays zero, official); the remaining generator
+                # grads (e.g. inter_AB via the dst path) are dropped,
+                # exactly as nn.gradients(loss, trainable) computes
+                # only the listed variables' gradients
+                _zero_grads([self.src_dst_saveable_weights])
+                G_loss.backward()
+                self.src_dst_opt.get_update_op(
+                    [ (p.grad, p) for p in self.src_dst_trainable_weights ])()
+
+                return src_loss, dst_loss
+
+            def _D_train(warped_src, warped_dst):
+                # official D_train (L590-592): the code-D loss
+                # 0.5*(DLoss(ones, D(dst_code)) + DLoss(zeros,
+                # D(src_code))) (L511-512) — the closure re-feeds
+                # the warped tensors and recomputes the codes with
+                # the post-src_dst-step weights (the official graph
+                # shares the same variable copies); the gradients
+                # are taken wrt the code-discriminator weights only
+                # (L514), so the recompute is gradient-free and the
+                # code-D step touches no generator weight.
+                with torch.no_grad():
+                    f = AE_forward(warped_src, warped_dst)
+
+                dst_code_d = self.code_discriminator(f['dst_code'])
+                src_code_d = self.code_discriminator(f['src_code'])
+
+                D_code_loss = (_DLoss(torch.ones_like(dst_code_d), dst_code_d) + \
+                               _DLoss(torch.zeros_like(src_code_d), src_code_d) ) * 0.5
+
+                _zero_grads([self.code_discriminator.get_weights()])
+                D_code_loss.backward()
+                self.D_code_opt.get_update_op(
+                    [ (p.grad, p) for p in self.code_discriminator.get_weights() ])()
+
+            def _D_src_dst_train(warped_src, target_src, target_srcm, target_srcm_em,
+                                 warped_dst, target_dst, target_dstm, target_dstm_em):
+                # official D_src_dst_train (L595-605): the D_src loss
+                # over full + patch outputs (L532-535) — real = the
+                # (prepared) TARGET, fake = the pred, both the
+                # masked_opt tensors; the closure re-feeds all eight
+                # inputs and recomputes with the post-src_dst-step
+                # weights; gradients wrt D_src weights only (L537)
+                # -> D_src_dst_opt (the official 'GAN_opt').
+                t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                     warped_dst, target_dst, target_dstm, target_dstm_em)
+
+                with torch.no_grad():
+                    f = AE_forward(t['warped_src'], t['warped_dst'])
+
+                pred_src_src = f['pred_src_src']
+                pred_src_src_masked_opt = pred_src_src*t['target_srcm_blur'] if masked_training else pred_src_src
+
+                pred_src_src_d, pred_src_src_d2 = self.D_src(pred_src_src_masked_opt)
+                target_src_d, target_src_d2 = self.D_src(t['target_src_masked_opt'])
+
+                D_src_dst_loss = (_DLoss(torch.ones_like(target_src_d), target_src_d) + \
+                                  _DLoss(torch.zeros_like(pred_src_src_d), pred_src_src_d) ) * 0.5 + \
+                                 (_DLoss(torch.ones_like(target_src_d2), target_src_d2) + \
+                                  _DLoss(torch.zeros_like(pred_src_src_d2), pred_src_src_d2) ) * 0.5
+
+                _zero_grads([self.D_src.get_weights()])
+                D_src_dst_loss.backward()
+                self.D_src_dst_opt.get_update_op(
+                    [ (p.grad, p) for p in self.D_src.get_weights() ])()
+
+            self._src_dst_train = _src_dst_train
+            self._D_train = _D_train
+            self._D_src_dst_train = _D_src_dst_train
+            self._prepare_targets = _prepare_targets
+
         # Loading/initializing all models/optimizers weights (the
         # official 637-657 loop; Phase 4/5 strict policy: a missing
         # required component file on resume fails explicitly instead of
@@ -711,15 +1068,127 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
     #override
     def onTrainOneIter(self):
-        # Phase 6A boundary: the official training step (the loss stack,
-        # nn.gradients, the src_dst_train/D_train/D_src_dst_train
-        # update closures — official L354-606) is Phase 6B (native torch
-        # autograd with the official reduction semantics). Failing
-        # explicitly instead of silently skipping/mis-training.
-        raise NotImplementedError(
-            "SAEHD training step (loss composition, GAN/true-face "
-            "discriminator training, gradient orchestration) is Phase "
-            "6B — Phase 6A implements the structural foundation only")
+        # torch (Phase 6B): the official onTrainOneIter (Model_tf.py
+        # L767-782) — the sample fetch, the src_dst_train step
+        # (generator + src_dst_opt update), the code-D step and the
+        # D_src step (the official order: the D steps run AFTER the
+        # generator step, on the post-update weights), and the
+        # official two-value loss return (the per-sample vector
+        # means). The train closures are built in on_initialize
+        # (above), mirroring the official graph-construction
+        # location.
+        if self.get_iter() == 0 and not self.pretrain and not self.pretrain_just_disabled:
+            io.log_info('You are training the model from scratch. It is strongly recommended to use a pretrained model to speed up the training and improve the quality.\n')
+
+        ( (warped_src, target_src, target_srcm, target_srcm_em), \
+          (warped_dst, target_dst, target_dstm, target_dstm_em) ) = self.generate_next_samples()
+
+        # gradient hygiene: the official fresh nn.gradients per
+        # session.run means no .grad may survive into this
+        # iteration — zero every optimizer group before the first
+        # backward (the D closures additionally zero their own
+        # groups before their backdrops, discarding the stale
+        # code-D / D_src grads accumulated by the G-loss backward)
+        grad_groups = [self.src_dst_saveable_weights]
+        if self.options['true_face_power'] != 0:
+            grad_groups.append(self.code_discriminator.get_weights())
+        if self.gan_power != 0:
+            grad_groups.append(self.D_src.get_weights())
+        for group in grad_groups:
+            for p in group:
+                p.grad = None
+
+        src_loss, dst_loss = self._src_dst_train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
+
+        if self.options['true_face_power'] != 0 and not self.pretrain:
+            self._D_train (warped_src, warped_dst)
+
+        if self.gan_power != 0:
+            self._D_src_dst_train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
+
+        # the official returns the per-sample means as plain floats
+        # (np.mean of numpy vectors); .detach() first — same values,
+        # no torch grad-conversion warning
+        return ( ('src_loss', float(src_loss.mean().detach()) ),
+                 ('dst_loss', float(dst_loss.mean().detach()) ), )
+
+    #override
+    def onGetPreview(self, samples, for_history=False):
+        # torch (Phase 6B): the official onGetPreview (Model_tf.py
+        # L785-855) — AE_view fed with the UNWARPED targets, the
+        # NHWC preview strips, and the official layouts:
+        # resolution <= 256 -> two previews ('SAEHD': S, SS, D, DD,
+        # SD and 'SAEHD masked' with SD_mask = DDM*SDM for face_type
+        # < HEAD else SDM); resolution > 256 -> the six previews
+        # (src-src, dst-dst, pred + the masked variants).
+        ( (warped_src, target_src, target_srcm, target_srcm_em),
+          (warped_dst, target_dst, target_dstm, target_dstm_em) ) = samples
+
+        S, D, SS, DD, DDM, SD, SDM = [ np.clip( nn.to_data_format(x,"NHWC", self.model_data_format), 0.0, 1.0) for x in ([target_src,target_dst] + self.AE_view (target_src, target_dst) ) ]
+        DDM, SDM = [ np.repeat (x, (3,), -1) for x in [DDM, SDM] ]
+
+        target_srcm, target_dstm = [ nn.to_data_format(x,"NHWC", self.model_data_format) for x in ([target_srcm, target_dstm] ) ]
+
+        n_samples = min(4, self.get_batch_size(), 800 // self.resolution )
+
+        if self.resolution <= 256:
+            result = []
+
+            st = []
+            for i in range(n_samples):
+                ar = S[i], SS[i], D[i], DD[i], SD[i]
+                st.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD', np.concatenate (st, axis=0)), ]
+
+            st_m = []
+            for i in range(n_samples):
+                SD_mask = DDM[i]*SDM[i] if self.face_type < FaceType.HEAD else SDM[i]
+
+                ar = S[i]*target_srcm[i], SS[i], D[i]*target_dstm[i], DD[i]*DDM[i], SD[i]*SD_mask
+                st_m.append ( np.concatenate ( ar, axis=1) )
+
+            result += [ ('SAEHD masked', np.concatenate (st_m, axis=0)), ]
+        else:
+            result = []
+
+            st = []
+            for i in range(n_samples):
+                ar = S[i], SS[i]
+                st.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD src-src', np.concatenate (st, axis=0)), ]
+
+            st = []
+            for i in range(n_samples):
+                ar = D[i], DD[i]
+                st.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD dst-dst', np.concatenate (st, axis=0)), ]
+
+            st = []
+            for i in range(n_samples):
+                ar = D[i], SD[i]
+                st.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD pred', np.concatenate (st, axis=0)), ]
+
+            st_m = []
+            for i in range(n_samples):
+                ar = S[i]*target_srcm[i], SS[i]
+                st_m.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD masked src-src', np.concatenate (st_m, axis=0)), ]
+
+            st_m = []
+            for i in range(n_samples):
+                ar = D[i]*target_dstm[i], DD[i]*DDM[i]
+                st_m.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD masked dst-dst', np.concatenate (st_m, axis=0)), ]
+
+            st_m = []
+            for i in range(n_samples):
+                SD_mask = DDM[i]*SDM[i] if self.face_type < FaceType.HEAD else SDM[i]
+                ar = D[i]*target_dstm[i], SD[i]*SD_mask
+                st_m.append ( np.concatenate ( ar, axis=1) )
+            result += [ ('SAEHD masked pred', np.concatenate (st_m, axis=0)), ]
+
+        return result
 
     # Phase 11 (DFM/ONNX): the official tf2onnx export is out of the
     # torch-6A scope; the official I/O contract (in_face:0 ->
