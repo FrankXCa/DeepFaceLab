@@ -479,6 +479,41 @@ def total_variation_mse(images):
 
 
 # ---------------------------------------------------------------------------
+# Phase 6B: sigmoid_cross_entropy (the official SAEHD/AMP/XSeg DLoss)
+# ---------------------------------------------------------------------------
+
+def sigmoid_cross_entropy(labels, logits):
+    """Official DFL DLoss (Model_SAEHD/Model_tf.py L499-500) VERBATIM:
+
+        tf.reduce_mean(
+            tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=labels, logits=logits),
+            axis=[1,2,3])
+
+    -> a PER-SAMPLE (N,) vector: the elementwise sigmoid cross
+    entropy ``-[y*log(sigmoid(x)) + (1-y)*log(1-sigmoid(x))]``
+    reduced by MEAN over axes [1,2,3] (all axes except the batch).
+    Elementwise-identical to torch
+    ``F.binary_cross_entropy_with_logits``; the manual per-sample
+    mean over (1,2,3) is required because torch's ``'mean'``
+    reduction would additionally divide by the batch size (the
+    official loss keeps a per-sample vector; SAEHD averages it
+    with np.mean when reporting, and nn.gradients uses the
+    unaveraged vector inside the per-GPU loss). Data-format
+    agnostic (axes 1..3 are C,H,W under NCHW and H,W,C under
+    NHWC - the official formula is layout-agnostic). Rejected
+    deviations: none (no alternative implementation exists in the
+    audited references; USER_LEGACY/EXTERNAL_A carry no torch
+    equivalent). reduction='none' is REQUIRED: torch's default
+    reduction='mean' would collapse the tensor to a scalar before
+    the official per-sample (1,2,3) mean, which is not the
+    official elementwise DLoss.
+    """
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, labels, reduction='none').mean(dim=(1, 2, 3))
+
+
+# ---------------------------------------------------------------------------
 # Phase 3E2: random_binomial (lr_dropout mask source for the optimizers)
 # ---------------------------------------------------------------------------
 
@@ -514,3 +549,4 @@ nn.reshape_4D = reshape_4D
 nn.average_tensor_list = average_tensor_list
 nn.total_variation_mse = total_variation_mse
 nn.random_binomial = random_binomial
+nn.sigmoid_cross_entropy = sigmoid_cross_entropy
