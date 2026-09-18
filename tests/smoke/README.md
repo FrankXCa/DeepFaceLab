@@ -442,12 +442,71 @@ Populated in Phase 6A (SAEHD structural skeleton):
   fixtures (2DFAN 68-point landmark layout, official
   `faceset.pak` VERSION-1 layout) and `make_model`.
 
-Current counts (2026-09, after the Phase 6A publish audit): CUDA
-environment 415 passed + 2 skipped; CPU environment 396 passed + 21
-skipped (the optional real-artifact validations —
-`DFL_TEST_SAEHD_CHECKPOINT` / `DFL_TEST_FACESET_PAK` — skip without
-the environment variables and are validated separately against the
-local official artifacts).
+Populated in Phase 6B (SAEHD single-device training semantics):
+
+- `test_model_saehd_training.py` — the CPU tier of the 6B testing
+  pyramid (formula-level units + tiny 64px integration, kept fast;
+  one step per test except the stale-grad proof / optimizer
+  continuity / save-resume which need two). Formula units (no
+  model construction): the style-moments formula (the migrated
+  `style_loss` == the official per-channel moments, not a gram
+  matrix), the bg-style-is-a-dssim+MSE-content-loss guard, the
+  official `sigmoid_cross_entropy` DLoss per-sample semantics
+  (elementwise BCE, `reduction='none'`, per-sample mean over
+  (1,2,3) -> (N,) vectors, ones/zeros label distinction). Tiny
+  integration (64px, batch 1, smallest dims): one official
+  iteration on liae and df (two-value loss return, iter
+  increment, exactly the `src_loss`/`dst_loss` history columns,
+  `src_dst_opt` advance), two-iteration optimizer-state
+  continuity, src/dst loss separation (weight state restored
+  between evaluations), the masked-loss-multiplicity + mask
+  softening + stop-grad style-mask pins through the exposed
+  `_prepare_targets`, the `blur_out_mask` outside-target rewrite
+  pin, the MANDATED gradient-hygiene proof (state-restored double
+  step -> bit-identical losses and weight deltas -> no stale
+  `.grad`), gradient ownership (trainable set == saveable set),
+  the official liae `random_warp=False` inter_AB trainable-set
+  exclusion, the eyes/mouth twin-difference pins (zero-mask
+  identity + the 300x MAE contribution), the true-face/GAN
+  absence rules (tfp==0 / liae / gan==0), the three-optimizer
+  discriminator routing + update order (tiny df + tfp + GAN),
+  clipgrad and lr_dropout/lr_cos step wiring, save -> strict
+  resume -> continue, and the official `onGetPreview`
+  res<=256 two-preview layout (the n_samples==1 leading-axis
+  quirk is faithful official behavior).
+- `test_model_saehd_training_cuda.py` — the CUDA (RTX 4090) tier
+  (all tests skip without CUDA): the all-terms df-udt 128 model
+  (true-face + face style + bg style + eyes/mouth + blur +
+  masked + GAN) — the eyes/mouth, face-style and bg-style
+  twin-difference pins, the GAN generator-terms GRADIENT pin
+  (the GAN/TV/bg-anti terms enter `gpu_G_loss` only, never the
+  returned src/dst loss vectors), the D_src loss gradient pin,
+  the real/fake label routing on a fresh untrained discriminator,
+  the true-face generator + code-D routing (the code-D step
+  touches only code-D weights; D_src untouched by it), the
+  three-optimizer update order, clipgrad/lr options, the
+  official `onTrainOneIter` driver, save -> strict resume ->
+  continue, the representative archi u/d/t/c training, the
+  real-checkpoint-configuration shape (256 df-udt, tfp=0, GAN
+  on), the `onGetPreview` res>256 six-preview layout, and the
+  OPTIONAL real-artifact one-step training lifecycle
+  (env-gated `DFL_TEST_SAEHD_CHECKPOINT` + `DFL_TEST_FACESET_PAK`;
+  copies only; the 13-step plan §9 sequence: strict resume,
+  real faceset, one iter, finite losses, expected GAN/true-face
+  updates per the checkpoint's own options, optimizer advances,
+  weight changes, save, strict reload, optimizer-state
+  continuity, post-reload iter; labels include
+  `Training numerical parity vs official TF: NOT_VERIFIED`).
+
+Current counts (2026-09, after the Phase 6B test suite): CUDA
+environment 458 passed + 3 skipped; CPU environment 418 passed +
+43 skipped (461 collected in each environment; the 6B tiers add
+22 CPU tests and 22 CUDA tests over the 6A baselines of 396/21
+and 415/2; the optional real-artifact validation —
+`DFL_TEST_SAEHD_CHECKPOINT` / `DFL_TEST_FACESET_PAK` — is the
+env-gated CUDA test, skips without the environment variables,
+and is validated separately against the local official
+artifacts).
 
 Environments (git-ignored, created with `uv`):
 
