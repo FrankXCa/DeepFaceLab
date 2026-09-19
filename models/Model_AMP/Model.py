@@ -678,7 +678,15 @@ class AMPModel(ModelBase):
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
-                f = AE_forward(t['warped_src'], t['warped_dst'])
+                # Phase 8: the AE forward runs under this plan's
+                # autocast (in 'off' mode: nullcontext -> the exact
+                # Phase 7 fp32 path); the boundary cast starts the
+                # FP32 loss island — the loss stack, the GAN
+                # forwards and the backward all see fp32 (in 'off'
+                # mode .to is a no-op)
+                with self._mp_autocast():
+                    f = AE_forward(t['warped_src'], t['warped_dst'])
+                f = { k: v.to(nn.floatx) for k, v in f.items() }
                 pred_src_src = f['pred_src_src']
                 pred_src_srcm = f['pred_src_srcm']
                 pred_dst_dst = f['pred_dst_dst']
@@ -746,9 +754,19 @@ class AMPModel(ModelBase):
                 # nn.gradients(gpu_G_loss, G_weights) on the
                 # per-sample (N,) loss vector seeds the backward
                 # with ones — the batch SUM over samples
-                torch.autograd.backward(G_loss, torch.ones_like(G_loss))
-                self.src_dst_opt.get_update_op(
-                    [ (p.grad, p) for p in self.G_weights ])()
+                # Phase 8: the scaled/FP32 explicit-grad backward
+                # (official nn.gradients = the batch SUM over the
+                # per-sample (N,) loss vector), then the native
+                # fp16 unscale + the overflow-aware update of the
+                # official update op (in 'off' mode: the exact
+                # Phase 7 code path — plain backward + direct
+                # update op)
+                self._mp_backward(G_loss)
+                self._mp_unscale_opt(self.src_dst_opt)
+                self._mp_opt_step(
+                    self.src_dst_opt,
+                    [ (p.grad, p) for p in self.G_weights ])
+                self._mp_scaler_update()
 
                 return ( src_loss_snap, dst_loss_snap )
 
@@ -774,6 +792,11 @@ class AMPModel(ModelBase):
                     t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                          warped_dst, target_dst, target_dstm, target_dstm_em)
 
+                    # Phase 8: the GAN step is ENTIRELY fp32 in
+                    # every precision mode (the official GAN never
+                    # receives an fp16 treatment) — no autocast
+                    # region here; its backward/update also never
+                    # touch the shared fp16 scaler
                     with torch.no_grad():
                         f = AE_forward(t['warped_src'], t['warped_dst'])
 
