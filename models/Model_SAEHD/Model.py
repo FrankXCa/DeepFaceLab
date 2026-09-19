@@ -916,7 +916,12 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # exactly as nn.gradients(loss, trainable) computes
                 # only the listed variables' gradients
                 _zero_grads([self.src_dst_saveable_weights])
-                G_loss.backward()
+                # official nn.gradients(G_loss, vars) = the batch SUM
+                # over the per-sample (N,) loss vector — reproduced as
+                # backward with ones_like (a bare .backward() is only
+                # legal for numel()==1 and crashes for batch > 1,
+                # which the official model suggests: batch 4-8).
+                torch.autograd.backward(G_loss, torch.ones_like(G_loss))
                 self.src_dst_opt.get_update_op(
                     [ (p.grad, p) for p in self.src_dst_trainable_weights ])()
 
@@ -942,7 +947,10 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                                _DLoss(torch.zeros_like(src_code_d), src_code_d) ) * 0.5
 
                 _zero_grads([self.code_discriminator.get_weights()])
-                D_code_loss.backward()
+                # official nn.gradients(D_code_loss, code-D vars) =
+                # batch SUM over the per-sample (N,) vector — see the
+                # G-step note (a bare .backward() crashes for N > 1).
+                torch.autograd.backward(D_code_loss, torch.ones_like(D_code_loss))
                 self.D_code_opt.get_update_op(
                     [ (p.grad, p) for p in self.code_discriminator.get_weights() ])()
 
@@ -973,7 +981,10 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                                   _DLoss(torch.zeros_like(pred_src_src_d2), pred_src_src_d2) ) * 0.5
 
                 _zero_grads([self.D_src.get_weights()])
-                D_src_dst_loss.backward()
+                # official nn.gradients(D_src_dst_loss, D_src vars) =
+                # batch SUM over the per-sample (N,) vector — see the
+                # G-step note (a bare .backward() crashes for N > 1).
+                torch.autograd.backward(D_src_dst_loss, torch.ones_like(D_src_dst_loss))
                 self.D_src_dst_opt.get_update_op(
                     [ (p.grad, p) for p in self.D_src.get_weights() ])()
 

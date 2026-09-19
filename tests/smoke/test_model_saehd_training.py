@@ -784,3 +784,138 @@ def test_preview_res_le_256_layout_cpu(tiny_liae_model):
     assert np.allclose(first0[:, 2 * res:3 * res], D[0], atol=1e-6)
     assert np.allclose(first0[:, 3 * res:4 * res], DD[0], atol=1e-6)
     assert np.allclose(first0[:, 4 * res:5 * res], SD[0], atol=1e-6)
+
+
+# --- official nn.gradients batch-SUM pin (Phase 8 fix) -------------------------
+
+def test_train_ones_seed_batch_sum_cpu(tmp_path_factory):
+    """Official nn.gradients(loss_vec, vars) = the per-sample
+    batch SUM (the model suggests batch 4-8) — the migrated
+    torch.autograd.backward(loss_vec, torch.ones_like(loss_vec))
+    must reproduce it: on a doubled batch [x1, x1] the gradient
+    accumulated for EVERY trainable src_dst parameter is exactly
+    2x the N=1 gradient at identical weights. The CPU kernels are
+    deterministic for these shapes, so the strict Phase 7 AMP
+    Q11-CPU-pin tolerance applies (rtol=1e-5, atol=1e-6). This
+    test pins the SAEHD G-loss site (previously a bare
+    .backward(), which torch only accepts for numel()==1 and
+    which crashes for the official batch sizes) and the
+    per-sample loss-vector layout itself."""
+    model = construct(tmp_path_factory.mktemp("q11_g"), is_training=True,
+                      seed=seed(**TINY), cpu_only=True)
+    res = model.resolution
+
+    s1t = tensors8(synth_samples(res, batch=1, seed_no=0))
+    s2t = tensors8(synth_samples(res, batch=2, seed_no=0))
+
+    snaps = param_snapshots(model)
+    g1_src, g1_dst = model._src_dst_train(*s1t)   # N=1: grads + step
+    grads_n1 = {id(p): p.grad.detach().clone()
+                for p in model.src_dst_trainable_weights}
+    assert torch.isfinite(g1_src).all()
+    assert torch.isfinite(g1_dst).all()
+    for p, w in snaps.items():
+        p.data.copy_(w)                            # identical weights for N=2
+
+    g2_src, g2_dst = model._src_dst_train(*s2t)    # N=2: grads + step
+    assert torch.isfinite(g2_src).all()
+    assert torch.isfinite(g2_dst).all()
+    # the per-sample loss rows of the doubled batch equal the
+    # duplicated N=1 rows (identical inputs, identical weights)
+    assert torch.allclose(g2_src, torch.cat([g1_src, g1_src]),
+                          rtol=1e-5, atol=1e-6)
+    assert torch.allclose(g2_dst, torch.cat([g1_dst, g1_dst]),
+                          rtol=1e-5, atol=1e-6)
+    n_checked = 0
+    for p in model.src_dst_trainable_weights:
+        assert p.grad is not None, "src_dst weight without grad"
+        g1 = grads_n1[id(p)]
+        assert torch.allclose(p.grad, 2 * g1, rtol=1e-5, atol=1e-6), \
+            f"batch-SUM doubling violated for a {tuple(p.shape)} weight"
+        n_checked += 1
+    assert n_checked > 0
+
+
+def _all_component_weights(model):
+    """Every component parameter (generator + discriminators) —
+    the no_grad AE re-forwards inside the D closures make the D
+    gradients depend on the generator weights, so the doubling
+    comparison must restore all of them."""
+    out = []
+    for attr in ('encoder', 'inter', 'inter_AB', 'inter_B',
+                 'decoder_src', 'decoder_dst', 'decoder',
+                 'code_discriminator', 'D_src'):
+        comp = getattr(model, attr, None)
+        if comp is not None:
+            out.extend(comp.parameters())
+    return out
+
+
+def test_disc_train_ones_seed_batch_sum_cpu(tmp_path_factory):
+    """The same batch-SUM identity for the two discriminator
+    nn.gradients sites (official L514 code-D, L537 D_src): on a
+    doubled batch [x1, x1], every code-D weight gradient is 2x
+    the N=1 value and every D_src weight gradient is 2x the N=1
+    value, at identical weights (generator weights restored too,
+    since the closures re-forward AE under no_grad).
+
+    Tolerance (measured noise floor, Phase 7 style — never
+    loosened to pass): the N=1 vs N=2 forward kernels differ by
+    last-bit rounding (the tiny df-udt AE stack shows ~4e-6
+    absolute in encoder rows; every archi layer is pure
+    conv/linear — no batch-dependent layer exists), and the
+    D_src gradients are small cancellation sums (the in_conv
+    bias gradient ~1e-2..1e-4 sums O(1e4) mixed-sign terms), so
+    the amplified deviation floor measured on the CPU tier is
+    ~1.2e-6 absolute worst case (in_conv bias; other disc
+    weights < 4e-7). The pin asserts atol=1e-5 (~8x the
+    measured floor) + rtol=1e-4; any genuine semantic defect
+    (crash at N>1, mean-reduction, missing 0.5, wrong label
+    routing) would deviate by O(1e-2..1) — three or more
+    orders of magnitude beyond the floor."""
+    model = construct(tmp_path_factory.mktemp("q11_d"), is_training=True,
+                      seed=full_seed(**TINY), cpu_only=True)
+    res = model.resolution
+
+    s1t = tensors8(synth_samples(res, batch=1, seed_no=0))
+    s2t = tensors8(synth_samples(res, batch=2, seed_no=0))
+    ws1 = s1t[0]
+    wd1 = s1t[4]
+    ws2 = s2t[0]
+    wd2 = s2t[4]
+
+    snaps = {p: p.detach().clone() for p in _all_component_weights(model)}
+    opt_snaps_code = opt_snapshots(model.D_code_opt)
+    opt_snaps_src = opt_snapshots(model.D_src_dst_opt)
+
+    # N=1: both D closures (each steps its own optimizer)
+    model._D_train(ws1, wd1)
+    code_grads_n1 = {id(p): p.grad.detach().clone()
+                     for p in model.code_discriminator.get_weights()
+                     if p.grad is not None}
+    model._D_src_dst_train(*s1t)
+    dsrc_grads_n1 = {id(p): p.grad.detach().clone()
+                     for p in model.D_src.get_weights()
+                     if p.grad is not None}
+    assert code_grads_n1 and dsrc_grads_n1
+
+    # restore the pre-step state (weights + optimizer states) so the
+    # N=2 evaluations run at identical weights
+    for p, w in snaps.items():
+        p.data.copy_(w)
+    restore_opt(model.D_code_opt, opt_snaps_code)
+    restore_opt(model.D_src_dst_opt, opt_snaps_src)
+
+    # N=2: both D closures
+    model._D_train(ws2, wd2)
+    for p in model.code_discriminator.get_weights():
+        assert p.grad is not None, "code-D weight without grad"
+        g1 = code_grads_n1[id(p)]
+        assert torch.allclose(p.grad, 2 * g1, rtol=1e-4, atol=1e-5), \
+            f"code-D batch-SUM doubling violated for a {tuple(p.shape)} weight"
+    model._D_src_dst_train(*s2t)
+    for p in model.D_src.get_weights():
+        assert p.grad is not None, "D_src weight without grad"
+        g1 = dsrc_grads_n1[id(p)]
+        assert torch.allclose(p.grad, 2 * g1, rtol=1e-4, atol=1e-5), \
+            f"D_src batch-SUM doubling violated for a {tuple(p.shape)} weight"
