@@ -830,7 +830,15 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
-                f = AE_forward(t['warped_src'], t['warped_dst'])
+                # Phase 8: the AE forward runs under this plan's
+                # autocast (in 'off' mode: nullcontext -> the exact
+                # Phase 7 fp32 path); the boundary cast starts the
+                # FP32 loss island — the loss stack, the GAN
+                # forwards and the backward all see fp32 (in 'off'
+                # mode .to is a no-op)
+                with self._mp_autocast():
+                    f = AE_forward(t['warped_src'], t['warped_dst'])
+                f = { k: v.to(nn.floatx) for k, v in f.items() }
                 pred_src_src = f['pred_src_src']
                 pred_src_srcm = f['pred_src_srcm']
                 pred_dst_dst = f['pred_dst_dst']
@@ -921,9 +929,18 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # backward with ones_like (a bare .backward() is only
                 # legal for numel()==1 and crashes for batch > 1,
                 # which the official model suggests: batch 4-8).
-                torch.autograd.backward(G_loss, torch.ones_like(G_loss))
-                self.src_dst_opt.get_update_op(
-                    [ (p.grad, p) for p in self.src_dst_trainable_weights ])()
+                # Phase 8: via the ModelBase helpers this is the
+                # scaled/FP32 explicit-grad backward + the native
+                # fp16 unscale + overflow-aware update of the
+                # official update op (in 'off' mode: the exact
+                # Phase 7 code path — plain backward + direct
+                # update op)
+                self._mp_backward(G_loss)
+                self._mp_unscale_opt(self.src_dst_opt)
+                self._mp_opt_step(
+                    self.src_dst_opt,
+                    [ (p.grad, p) for p in self.src_dst_trainable_weights ])
+                self._mp_scaler_update()
 
                 return src_loss, dst_loss
 
@@ -937,6 +954,11 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # are taken wrt the code-discriminator weights only
                 # (L514), so the recompute is gradient-free and the
                 # code-D step touches no generator weight.
+                # Phase 8: the D step is ENTIRELY fp32 in every
+                # precision mode (the official D steps never receive
+                # an fp16 treatment) — no autocast region here and
+                # its backward/update never touch the shared fp16
+                # scaler.
                 with torch.no_grad():
                     f = AE_forward(warped_src, warped_dst)
 
@@ -963,6 +985,11 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # inputs and recomputes with the post-src_dst-step
                 # weights; gradients wrt D_src weights only (L537)
                 # -> D_src_dst_opt (the official 'GAN_opt').
+                # Phase 8: the D step is ENTIRELY fp32 in every
+                # precision mode (the official D steps never receive
+                # an fp16 treatment) — no autocast region here and
+                # its backward/update never touch the shared fp16
+                # scaler.
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
