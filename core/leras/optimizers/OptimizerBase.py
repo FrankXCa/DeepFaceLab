@@ -250,6 +250,17 @@ class OptimizerBase(torch.nn.Module, Saveable):
             return value
         return layer.convert_weight_to_official(value, tracked)
 
+    # --- Phase 8: torch-optimizer view for mixed precision ---------------
+
+    @property
+    def param_groups(self):
+        """The torch-optimizer-shaped view of the official
+        ``_weights`` list: exactly what ``torch.amp.GradScaler``
+        (``unscale_`` / ``step``) iterates for its fp16 overflow
+        bookkeeping. No other torch optimizer API is involved — the
+        DFL update path stays ``get_update_op`` (the native
+        ``optimizer.step()`` is never called on these optimizers)."""
+        return [{'params': list(self._weights)}]
     # --- official get_update_op contract ---------------------------------
 
     def get_update_op(self, grads_vars):

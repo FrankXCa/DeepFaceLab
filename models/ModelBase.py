@@ -54,6 +54,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import torch
+
 from core import imagelib, pathex
 from core.cv2ex import *
 from core.interact import interact as io
@@ -73,6 +75,7 @@ class ModelBase(object):
                        force_model_name=None,
                        force_gpu_idxs=None,
                        cpu_only=False,
+                       precision='off',
                        debug=False,
                        force_model_class_name=None,
                        silent_start=False,
@@ -86,6 +89,16 @@ class ModelBase(object):
         self.pretrained_model_path = pretrained_model_path
         self.no_preview = no_preview
         self.debug = debug
+        # Phase 8: the requested training precision mode ('off' |
+        # 'fp16' | 'bf16'). A runtime-only constructor channel,
+        # exactly like cpu_only/force_gpu_idxs above: it is NOT a
+        # model option (no data.dat key, no io prompt, no state
+        # file — Phase 7 D-6), so old checkpoints resume in any
+        # mode and the mode can change on restart. Resolved (and
+        # capability-checked) lazily on the first training step.
+        self.precision = precision
+        self._mp_plan = None    # mixed_precision.PrecisionPlan, resolved once
+        self._mp_scaler = None  # fp16-only torch.amp.GradScaler; never persisted
 
         self.model_class_name = model_class_name = Path(inspect.getmodule(self).__file__).parent.name.rsplit("_", 1)[1]
 
@@ -517,7 +530,70 @@ class ModelBase(object):
     def should_save_preview_history(self):
         return (not io.is_colab() and self.iter % 10 == 0) or (io.is_colab() and self.iter % 100 == 0)
 
+    #### Phase 8: mixed-precision training plumbing (runtime-only).
+    ####
+    #### The precision MODE ('off' | 'fp16' | 'bf16') is a constructor
+    #### channel like cpu_only; it is resolved against the chosen device
+    #### exactly once, on the first training step. An unsupported
+    #### mode/device pair fails EXPLICITLY there (no silent fallback,
+    #### plan v2 Milestone E). In 'off' mode every helper degenerates
+    #### to the exact Phase 6B/7 code path (nullcontext + no scaler),
+    #### and fp16 is CUDA-only while bf16 needs Ampere+ on GPU (see
+    #### core/leras/mixed_precision.py for the full policy).
+    def _mp_ensure_resolved(self):
+        if self._mp_plan is not None:
+            return
+        from core.leras import mixed_precision as mp
+        self._mp_plan = mp.resolve_precision(self.precision, nn.device)
+        self._mp_scaler = self._mp_plan.make_scaler()
+        if self.is_training:
+            io.log_info (f"Training precision: {self._mp_plan.describe()}")
+
+    def _mp_autocast(self):
+        # context manager wrapping the safe-forward region in this
+        # plan's dtype (nullcontext in 'off' mode); resolution is
+        # forced so a directly-called train closure can never run in
+        # a silently wrong mode
+        self._mp_ensure_resolved()
+        return self._mp_plan.autocast_context()
+
+    def _mp_backward(self, loss_vec):
+        # official nn.gradients(loss, vars) == the batch SUM over the
+        # per-sample loss vector == explicit-grad backward; under fp16
+        # the vector is first scaled by the shared GradScaler (the
+        # true unscaled gradients are exposed by _mp_unscale_opt
+        # before the update op, so the clip inside it is unscaled)
+        if self._mp_scaler is not None:
+            loss_vec = self._mp_scaler.scale(loss_vec)
+        torch.autograd.backward(loss_vec, torch.ones_like(loss_vec))
+
+    def _mp_unscale_opt(self, opt):
+        # the native torch-recipe step: expose the true (unscaled)
+        # fp32 gradients BEFORE the update op, so the clip inside
+        # it sees unscaled values (no-op for off/bf16)
+        if self._mp_scaler is not None:
+            self._mp_scaler.unscale_(opt)
+
+    def _mp_opt_step(self, opt, grads_vars):
+        # the native overflow-aware parameter update for the DFL
+        # custom update op: under fp16, GradScaler.step SKIPS the
+        # update (opt.step(grads_vars) — the official update op)
+        # when its overflow check fired, so an overflow can never
+        # corrupt the weights; in off/bf16 the update op runs
+        # directly (the exact Phase 6B/7 code path)
+        if self._mp_scaler is not None:
+            self._mp_scaler.step(opt, grads_vars)
+        else:
+            opt.get_update_op(grads_vars)()
+
+    def _mp_scaler_update(self):
+        # per optimizer-group step: overflow check + scale bookkeeping
+        # (no-op for off/bf16, which carry no scaler)
+        if self._mp_scaler is not None:
+            self._mp_scaler.update()
+
     def train_one_iter(self):
+        self._mp_ensure_resolved()
 
         iter_time = time.time()
         losses = self.onTrainOneIter()
