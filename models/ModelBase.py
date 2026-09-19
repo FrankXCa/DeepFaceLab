@@ -21,7 +21,9 @@ the file is the official code verbatim):
   starts True so first-run models still snapshot ``default_options.dat``
   exactly like official DFL; USER_LEGACY flipped the default, which would
   have silently changed official model behavior, so only the escape hatch
-  was adopted — AMP's torch model calls ``disable_default_options_autosave()``);
+  was adopted — none of the torch model ports call it: SAEHD and AMP keep
+  the official unconditional first-run snapshot (Phase 7 Q4); the hook is
+  exercised by the Model_Dummy smoke tests);
 - ``save()`` writes the summary text with ``encoding='utf-8',
   errors='ignore'`` (official write crashed on non-ASCII option values
   under non-UTF-8 console code pages; ASCII output is byte-identical);
