@@ -1,16 +1,188 @@
+"""AMP — official DeepFaceLab AMP model on the torch foundation
+(Phase 7: single-device training semantics — the official loss
+stack, train closures, update routing, preview rendering and
+inference paths).
+
+The official TF source is preserved verbatim in ``Model_tf.py`` (dead
+reference, never imported — project convention, like
+``ModelBase_tf.py`` / ``discriminators_tf.py``).
+
+Official behavior preserved:
+- ``on_initialize_options``: the complete official option set
+  (resolution/face_type/models_opt_on_gpu, ae/inter/e/d/d_mask dims
+  with the official first-run clipping — resolution a multiple of 32
+  in 64-640, ae 32-1024, inter 32-2048, e/d/d_mask 16-256 with the
+  even rounding, the d_mask_dims default derived from d_dims (d//3
+  rounded even), morph_factor 0.1-0.5 — and the official
+  first-run/override prompt order: the batch-size/flip/backup
+  prompts, then resolution/face_type/dims, then uniform_yaw /
+  blur_out_mask / lr_dropout, then gan_power (with the conditional
+  gan_patch_size / gan_dims prompts), models_opt_on_gpu,
+  random_warp, ct_mode, clipgrad, and the official
+  ``gan_model_changed`` detection (stored vs prompted
+  gan_patch_size / gan_dims);
+- ``on_initialize``: the official structural portion — the
+  official hard-wired ``model_data_format = "NCHW"`` (Model_tf.py
+  L107), the official archi construction through the Phase 7
+  ``nn.AMPArchi`` factory (core/leras/archis/AMP.py — the official
+  no-argument Encoder / Inter / Decoder constructors and names:
+  the flat pixel-normalized encoder codes with ``dense1`` inside
+  the encoder, the single-dense inter reshaped to
+  ``(N, inter_ch, inter_res, inter_res)``, the decoder image head
+  (``out_conv`` / ``out_conv1..3`` concat -> depth_to_space RRC ->
+  sigmoid) and mask head (``upscalem0..4`` -> ``out_convm`` ->
+  sigmoid); the official ``use_fp16`` export-only conv-dtype knob),
+  the official two-optimizer construction (Phase 3E2
+  ``nn.AdaBelief`` x2, ``lr=5e-5``, the official
+  ``lr_dropout in ['y','cpu']`` -> ``lr_cos=500`` /
+  ``lr_dropout=0.3`` coupling, ``clipgrad`` -> clipnorm=1.0; the
+  official ``src_dst_opt`` over ``G_weights = encoder + decoder``
+  (L301) and, iff ``gan_power != 0``, the official
+  ``nn.UNetPatchDiscriminator`` (Phase 3F) + ``GAN_opt``), the
+  official ``model_filename_list`` (official ``.npy`` filenames,
+  ``[model, file]`` pairs for components and ``(opt, file)`` tuples
+  for optimizers), and the official sample-generator wiring
+  (migrated samplelib; the official output-sample spec incl. the
+  warped/unwarped FACE_IMAGE pair and the FULL_FACE / EYES_MOUTH
+  FACE_MASK pair on both sides);
+- the official training semantics (Phase 7, single-device — the
+  Phase 2 device model): ``onTrainOneIter`` (the official
+  L646-657 driver: sample fetch, the always-run generator step,
+  the GAN step iff ``gan_power != 0``, the official two-value loss
+  return = the per-sample vector means), the train closures
+  (``train`` / ``GAN_train`` = the official L484-510 closures)
+  with the complete official loss stack: the target preparation
+  (L382-414: the ``blur_out_mask`` target rewrite with
+  ``sigma = resolution/128`` and the element-wise div-zero guard,
+  the softened loss masks ``clip(gblur, 0, 0.5) * 2`` and their
+  anti-complements, the masked / anti-masked tensor set), the
+  official five-term src/dst stacks (5x dssim @ int(R/11.6) +
+  5x dssim @ int(R/23.2) on the blurred masks, 10x MSE masked,
+  300x |target*em - pred*em| on the RAW targets, 10x (raw mask -
+  pred mask)^2), the official background terms (0.1x MSE
+  anti-masked + 1e-6 total_variation_mse on the anti-masked dst
+  pred) and the official GAN terms iff ``gan_power != 0``: the
+  discriminator forwards on the MASKED tensors, the 4-term
+  ``DLossOnes`` generator loss x ``gan_power`` UNNORMALIZED,
+  1e-6 total_variation_mse on the RAW full src pred and 0.02x MSE
+  anti-masked src, and the official 8-term D loss x (1/8) — the
+  1/8 factor is the OFFICIAL upstream normalization (L448-452) and
+  is preserved, as is the official batch-SUM gradient over the
+  per-sample loss vectors;
+- the official morph semantics (Model_tf.py L360-367): the
+  training morph mask is the per-sample EXACT-k uniform k-subset
+  (k = int(inter_dims * morph_factor)) shuffle of the k-ones /
+  (D-k)-zeros base pattern, stop-gradient (the Phase 7
+  ``core.leras.archis.AMP.exact_k_morph_mask`` op — the
+  torch.randperm implementation; NOT an i.i.d. Bernoulli mask),
+  applied as ``src*m + dst*(1-m)`` on the inter codes; the
+  inference morph (AE_view / AE_merge / the merger prompt) is the
+  official DETERMINISTIC floor-channel-slice
+  (first k = int(inter_dims * morph_value) channels from the
+  inter_src head, the remainder from the inter_dst head);
+- ``AE_view`` / ``AE_merge``: the official inference functions
+  (the official TF session-run graph is replaced by an eager
+  ``torch.no_grad`` forward pass over the same component chain —
+  the official inference boundary; NumPy in ``model_data_format``,
+  NumPy out, exactly like the official ``tf_sess.run`` caller
+  contract used by ``predictor_func`` / the merger);
+- ``onGetPreview`` (the official L660-705 preview layout — the
+  three named strips 'AMP morph 1.0' / 'AMP morph list' /
+  'AMP morph list masked', the official 2 rows x 3 tiles incl.
+  the 3-channel repeats of the DDM masks, the official
+  one-sample rendering — ``n_samples = min(4, batch_size,
+  800 // resolution)`` bounds only the RANDOM index, and
+  ``for_history`` fixes it to 0),
+- ``predictor_func(face, morph_value)`` / ``get_MergerConfig``:
+  official — the merger prompts the morph factor
+  (``io.input_number("Morph factor", 1.0)`` clipped 0-1) and the
+  ``predictor_morph`` closure feeds it to the official
+  ``AE_merge``; the official ``merger.MergerConfigMasked``
+  (face_type, default_mode='overlay');
+- ``get_model_filename_list`` / ``onSave`` /
+  ``should_save_preview_history``: official, unchanged (component
+  saves go through the Phase 4 Saveable engine — official raw
+  pickle protocol-4 ``.npy`` streams);
+- the official top-level lifecycle (Phase 5 ``models/ModelBase.py``)
+  is used unchanged: data.dat-gated resume, the two distinct
+  iteration counters, the 2-stage save and the official first-run
+  ``default_options.dat`` snapshot STAYS ENABLED (AMP never calls
+  ``disable_default_options_autosave()`` — the official behavior;
+  the stale ModelBase docstring claim is corrected comment-only in
+  Phase 7).
+
+Torch deviations (documented, numerics unchanged):
+- the official multi-GPU graph (the per-GPU batch slices and the
+  ``average_gv_list`` averaging, Model_tf.py L314-331 /
+  L466-477) collapses to the single-device torch foundation
+  (Phase 2): one forward, one loss stack, one optimizer step per
+  closure; on one device the official
+  ``gpu_count * bs_per_gpu`` batch-size reconstruction is the
+  identity (omitted, like the Phase 6A/6B ports);
+- the official ``tf.device`` placement (the CPU placeholders, the
+  /CPU:0 mask-shuffle draw, the ``models_opt_on_gpu`` /
+  ``'/CPU:0'`` optimizer-vars branch) is expressed through the
+  Phase 2 device config: everything executes on ``nn.device``
+  (single GPU or CPU); ``initialize_variables(vars_on_cpu=...)``
+  keeps the official signature — torch co-locates optimizer state
+  with its parameters (documented placement deviation, numerics
+  unchanged); the official mask draw on ``/CPU:0`` becomes a draw
+  on ``nn.device`` — the exact-k uniform k-subset distribution is
+  device-independent;
+- the official per-sample loss vectors are per-sample (N,)
+  tensors; the official TF ``nn.gradients(loss_vec, vars)``
+  (gradient seeds of ones) is the batch SUM over samples —
+  reproduced as ``torch.autograd.backward(loss_vec,
+  torch.ones_like(loss_vec))`` for BOTH the generator loss and
+  the D loss (probe-verified: a bare ``.backward()`` raises for
+  N > 1; the externals' batch-MEAN substitution is NOT
+  inherited);
+- the official slice-code decoder call (L371-376) is pruned from
+  the train / GAN_train subgraphs by TF's lazy execution (the
+  fetched tensors never depend on it — the dst stack uses
+  ``pred_dst_dst``, not ``pred_src_dst``); the torch closures
+  simply never invoke it; only ``AE_view`` / ``AE_merge`` feed it;
+- the official ``gan_model_changed`` re-init set names only the
+  GAN component (L539-541); the GAN_opt file then fails the
+  official ``do_init = not load_weights(...)`` fallback and the
+  official silently re-initializes it — under the Phase 4/5
+  strict load policy (no silent fallback) the same official
+  outcome (a changed discriminator gets a FRESH optimizer state)
+  is preserved by re-initializing GAN and GAN_opt explicitly
+  (the Phase 6B SAEHD precedent);
+- a missing required component file on resume fails explicitly
+  (``FileNotFoundError``) instead of the official silent
+  re-initialization; a corrupt file fails the strict Phase 4
+  load (``CheckpointLoadError``);
+- the ``export_dfm`` (ONNX/DFM) export is out of scope for
+  Phase 7 (the ONNX/DFM exclusion) — a ``NotImplementedError``
+  stub, like the Phase 6B SAEHD port;
+- the frozen inter heads are torch parameters with
+  requires_grad=False: autograd constants the encoder
+  gradients flow THROUGH (the TF back-prop-through-untrained-
+  variables behavior — the official gradient requests at
+  L454/L464 cover only the GAN weights and the G_weights set,
+  so the inter variables never receive any gradient), keeping
+  their .grad None (finding F4);
+- the ``ask_batch_size`` prompt passes the official AMP
+  constant 8 (the official SAEHD's VRAM-based suggestion is
+  SAEHD-specific and NOT inherited — the plan option table
+  records 'suggest 8').
+"""
+
 import multiprocessing
-import operator
-from functools import partial
 
 import numpy as np
+import torch
 
 from core import mathlib
 from core.interact import interact as io
 from core.leras import nn
+from core.leras.archis.AMP import exact_k_morph_mask
 from facelib import FaceType
 from models import ModelBase
 from samplelib import *
-from core.cv2ex import *
+
 
 class AMPModel(ModelBase):
 
@@ -44,32 +216,39 @@ class AMPModel(ModelBase):
             self.ask_batch_size(8)
 
         if self.is_first_run():
-            resolution = io.input_int("Resolution", default_resolution, add_info="64-640", help_message="More resolution requires more VRAM and time to train. Value will be adjusted to multiple of 32 .")
-            resolution = np.clip ( (resolution // 32) * 32, 64, 640)
+            resolution = io.input_int ("Resolution", default_resolution, add_info="64-640",
+                                       help_message="Training and processing data resolution in pixels. Too low values result in blurry faces, too high values require more VRAM, time and iterations to train. Typical fine value is 128.")
+            resolution = np.clip( (resolution // 32) * 32, 64, 640 )
             self.options['resolution'] = resolution
-            self.options['face_type'] = io.input_str ("Face type", default_face_type, ['f','wf','head'], help_message="whole face / head").lower()
 
+            self.options['face_type'] = io.input_str ("Face type", default_face_type, ['f','wf','head'], help_message="Whole face has better quality but covers less area of face. Head covers full head, but requires xseg for src and dst facesets.").lower()
 
-        default_d_dims             = self.options['d_dims']             = self.load_or_def_option('d_dims', 64)
-
-        default_d_mask_dims        = default_d_dims // 3
-        default_d_mask_dims        += default_d_mask_dims % 2
-        default_d_mask_dims        = self.options['d_mask_dims']        = self.load_or_def_option('d_mask_dims', default_d_mask_dims)
+        default_d_dims = self.options['d_dims'] = self.load_or_def_option('d_dims', 64)
+        default_d_mask_dims = default_d_dims // 3
+        default_d_mask_dims += default_d_mask_dims % 2
+        default_d_mask_dims = self.options['d_mask_dims'] = self.load_or_def_option('d_mask_dims', default_d_mask_dims)
 
         if self.is_first_run():
-            self.options['ae_dims']    = np.clip ( io.input_int("AutoEncoder dimensions", default_ae_dims, add_info="32-1024", help_message="All face information will packed to AE dims. If amount of AE dims are not enough, then for example closed eyes will not be recognized. More dims are better, but require more VRAM. You can fine-tune model size to fit your GPU." ), 32, 1024 )
-            self.options['inter_dims'] = np.clip ( io.input_int("Inter dimensions", default_inter_dims, add_info="32-2048", help_message="Should be equal or more than AutoEncoder dimensions. More dims are better, but require more VRAM. You can fine-tune model size to fit your GPU." ), 32, 2048 )
+            self.options['ae_dims'] = np.clip (io.input_int ("AutoEncoder dimensions", default_ae_dims, add_info="32-1024",
+                                   help_message="The higher the value, the higher the quality of the model, but the more iterations and VRAM are required. If there are enough iterations, 256 is fine for most use cases."), 32, 1024)
 
-            e_dims = np.clip ( io.input_int("Encoder dimensions", default_e_dims, add_info="16-256", help_message="More dims help to recognize more facial features and achieve sharper result, but require more VRAM. You can fine-tune model size to fit your GPU." ), 16, 256 )
+            self.options['inter_dims'] = np.clip (io.input_int ("Inter dimensions", default_inter_dims, add_info="32-2048",
+                                   help_message="The higher the value, the higher the quality of the model, but the more iterations and VRAM are required. If there are enough iterations, 1024 is fine for most use cases."), 32, 2048)
+
+            e_dims = np.clip (io.input_int ("Encoder dimensions", default_e_dims, add_info="16-256",
+                                   help_message="The higher the value, the higher the quality of the model, but the more iterations and VRAM are required. If there are enough iterations, 64 is fine for most use cases."), 16, 256)
             self.options['e_dims'] = e_dims + e_dims % 2
 
-            d_dims = np.clip ( io.input_int("Decoder dimensions", default_d_dims, add_info="16-256", help_message="More dims help to recognize more facial features and achieve sharper result, but require more VRAM. You can fine-tune model size to fit your GPU." ), 16, 256 )
+            d_dims = np.clip (io.input_int ("Decoder dimensions", default_d_dims, add_info="16-256",
+                                   help_message="The higher the value, the higher the quality of the model, but the more iterations and VRAM are required. If there are enough iterations, 64 is fine for most use cases."), 16, 256)
             self.options['d_dims'] = d_dims + d_dims % 2
 
-            d_mask_dims = np.clip ( io.input_int("Decoder mask dimensions", default_d_mask_dims, add_info="16-256", help_message="Typical mask dimensions = decoder dimensions / 3. If you manually cut out obstacles from the dst mask, you can increase this parameter to achieve better quality." ), 16, 256 )
+            d_mask_dims = np.clip (io.input_int ("Decoder mask dimensions", default_d_mask_dims, add_info="16-256",
+                                   help_message="The higher the value, the higher the quality of the model, but the more iterations and VRAM are required. If there are enough iterations, 64 is fine for most use cases."), 16, 256)
             self.options['d_mask_dims'] = d_mask_dims + d_mask_dims % 2
 
-            morph_factor = np.clip ( io.input_number ("Morph factor.", default_morph_factor, add_info="0.1 .. 0.5", help_message="Typical fine value is 0.5"), 0.1, 0.5 )
+            morph_factor = np.clip (io.input_number ("Morph factor.", default_morph_factor, add_info="0.1-0.5",
+                                   help_message="How strongly the src and dst inter codes are mixed. The lower the value, the less the face is morphed towards the src face."), 0.1, 0.5)
             self.options['morph_factor'] = morph_factor
 
         if self.is_first_run() or ask_override:
@@ -106,7 +285,13 @@ class AMPModel(ModelBase):
         devices = device_config.devices
         self.model_data_format = "NCHW"
         nn.initialize(data_format=self.model_data_format)
-        tf = nn.tf
+        # torch (Phase 7): the official `tf = nn.tf` import, the TF
+        # placeholders and the `tf.device` placement contexts are
+        # removed — the torch foundation executes eagerly on
+        # nn.device (Phase 2 device model; the official
+        # models_opt_on_gpu / CPU optimizer-vars placement branches
+        # are documented co-location semantics, kept below as
+        # initialize_variables kwargs).
 
         input_ch=3
         resolution  = self.resolution = self.options['resolution']
@@ -133,424 +318,533 @@ class AMPModel(ModelBase):
         if self.is_exporting:
             use_fp16 = io.input_bool ("Export quantized?", False, help_message='Makes the exported model faster. If you have problems, disable this option.')
 
-        conv_dtype = tf.float16 if use_fp16 else tf.float32
-
-        class Downscale(nn.ModelBase):
-            def on_build(self, in_ch, out_ch, kernel_size=5 ):
-                self.conv1 = nn.Conv2D( in_ch, out_ch, kernel_size=kernel_size, strides=2, padding='SAME', dtype=conv_dtype)
-
-            def forward(self, x):
-                return tf.nn.leaky_relu(self.conv1(x), 0.1)
-
-        class Upscale(nn.ModelBase):
-            def on_build(self, in_ch, out_ch, kernel_size=3 ):
-                self.conv1 = nn.Conv2D(in_ch, out_ch*4, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-
-            def forward(self, x):
-                x = nn.depth_to_space(tf.nn.leaky_relu(self.conv1(x), 0.1), 2)
-                return x
-
-        class ResidualBlock(nn.ModelBase):
-            def on_build(self, ch, kernel_size=3 ):
-                self.conv1 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-                self.conv2 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
-
-            def forward(self, inp):
-                x = self.conv1(inp)
-                x = tf.nn.leaky_relu(x, 0.2)
-                x = self.conv2(x)
-                x = tf.nn.leaky_relu(inp+x, 0.2)
-                return x
-
-        class Encoder(nn.ModelBase):
-            def on_build(self):
-                self.down1 = Downscale(input_ch, e_dims, kernel_size=5)
-                self.res1 = ResidualBlock(e_dims)
-                self.down2 = Downscale(e_dims, e_dims*2, kernel_size=5)
-                self.down3 = Downscale(e_dims*2, e_dims*4, kernel_size=5)
-                self.down4 = Downscale(e_dims*4, e_dims*8, kernel_size=5)
-                self.down5 = Downscale(e_dims*8, e_dims*8, kernel_size=5)
-                self.res5 = ResidualBlock(e_dims*8)
-                self.dense1 = nn.Dense( (( resolution//(2**5) )**2) * e_dims*8, ae_dims )
-
-            def forward(self, x):
-                if use_fp16:
-                    x = tf.cast(x, tf.float16)
-                x = self.down1(x)
-                x = self.res1(x)
-                x = self.down2(x)
-                x = self.down3(x)
-                x = self.down4(x)
-                x = self.down5(x)
-                x = self.res5(x)
-                if use_fp16:
-                    x = tf.cast(x, tf.float32)
-                x = nn.pixel_norm(nn.flatten(x), axes=-1)
-                x = self.dense1(x)
-                return x
-
-
-        class Inter(nn.ModelBase):
-            def on_build(self):
-                self.dense2 = nn.Dense(ae_dims, inter_res * inter_res * inter_dims)
-
-            def forward(self, inp):
-                x = inp
-                x = self.dense2(x)
-                x = nn.reshape_4D (x, inter_res, inter_res, inter_dims)
-                return x
-
-
-        class Decoder(nn.ModelBase):
-            def on_build(self ):
-                self.upscale0 = Upscale(inter_dims, d_dims*8, kernel_size=3)
-                self.upscale1 = Upscale(d_dims*8, d_dims*8, kernel_size=3)
-                self.upscale2 = Upscale(d_dims*8, d_dims*4, kernel_size=3)
-                self.upscale3 = Upscale(d_dims*4, d_dims*2, kernel_size=3)
-
-                self.res0 = ResidualBlock(d_dims*8, kernel_size=3)
-                self.res1 = ResidualBlock(d_dims*8, kernel_size=3)
-                self.res2 = ResidualBlock(d_dims*4, kernel_size=3)
-                self.res3 = ResidualBlock(d_dims*2, kernel_size=3)
-
-                self.upscalem0 = Upscale(inter_dims, d_mask_dims*8, kernel_size=3)
-                self.upscalem1 = Upscale(d_mask_dims*8, d_mask_dims*8, kernel_size=3)
-                self.upscalem2 = Upscale(d_mask_dims*8, d_mask_dims*4, kernel_size=3)
-                self.upscalem3 = Upscale(d_mask_dims*4, d_mask_dims*2, kernel_size=3)
-                self.upscalem4 = Upscale(d_mask_dims*2, d_mask_dims*1, kernel_size=3)
-                self.out_convm = nn.Conv2D( d_mask_dims*1, 1, kernel_size=1, padding='SAME', dtype=conv_dtype)
-
-                self.out_conv  = nn.Conv2D( d_dims*2, 3, kernel_size=1, padding='SAME', dtype=conv_dtype)
-                self.out_conv1 = nn.Conv2D( d_dims*2, 3, kernel_size=3, padding='SAME', dtype=conv_dtype)
-                self.out_conv2 = nn.Conv2D( d_dims*2, 3, kernel_size=3, padding='SAME', dtype=conv_dtype)
-                self.out_conv3 = nn.Conv2D( d_dims*2, 3, kernel_size=3, padding='SAME', dtype=conv_dtype)
-
-            def forward(self, z):
-                if use_fp16:
-                    z = tf.cast(z, tf.float16)
-
-                x = self.upscale0(z)
-                x = self.res0(x)
-                x = self.upscale1(x)
-                x = self.res1(x)
-                x = self.upscale2(x)
-                x = self.res2(x)
-                x = self.upscale3(x)
-                x = self.res3(x)
-
-                x = tf.nn.sigmoid( nn.depth_to_space(tf.concat( (self.out_conv(x),
-                                                                 self.out_conv1(x),
-                                                                 self.out_conv2(x),
-                                                                 self.out_conv3(x)), nn.conv2d_ch_axis), 2) )
-                m = self.upscalem0(z)
-                m = self.upscalem1(m)
-                m = self.upscalem2(m)
-                m = self.upscalem3(m)
-                m = self.upscalem4(m)
-                m = tf.nn.sigmoid(self.out_convm(m))
-
-                if use_fp16:
-                    x = tf.cast(x, tf.float32)
-                    m = tf.cast(m, tf.float32)
-                return x, m
-
+        # torch (Phase 7, backend-neutral device model): the official
+        # selection (Model_tf.py L258-259: models_opt_device =
+        # tf_default_device_name if models_opt_on_gpu and is_training
+        # else '/CPU:0') is expressed through the Phase 2 device
+        # config — optimizer vars live on the selected (GPU) device
+        # only when a device is selected, models_opt_on_gpu is set
+        # and this is a training run; otherwise on CPU. The boolean
+        # is kept as the Phase 3E2 initialize_variables
+        # signature-parity kwarg (torch co-locates optimizer state
+        # with its parameters on nn.device — documented placement
+        # deviation, numerics unchanged).
         models_opt_on_gpu = False if len(devices) == 0 else self.options['models_opt_on_gpu']
-        models_opt_device = nn.tf_default_device_name if models_opt_on_gpu and self.is_training else '/CPU:0'
-        optimizer_vars_on_cpu = models_opt_device=='/CPU:0'
+        optimizer_vars_on_cpu = not (len(devices) != 0 and models_opt_on_gpu and self.is_training)
 
         bgr_shape = self.bgr_shape = nn.get4Dshape(resolution,resolution,input_ch)
         mask_shape = nn.get4Dshape(resolution,resolution,1)
+
+        # torch (Phase 7): the official nine CPU placeholders
+        # (warped_src/dst, target_src/dst, target_srcm/dstm, _em,
+        # morph_value_t — Model_tf.py L265-278) are removed — the
+        # torch foundation passes tensors directly to the eager
+        # forward paths (training: the closures below; inference:
+        # the no-grad AE_view/AE_merge); the official
+        # gpu_count * bs_per_gpu batch-size reconstruction
+        # (L314-318) is the identity on the single-device
+        # foundation (omitted, like the Phase 6A/6B ports).
+
         self.model_filename_list = []
 
-        with tf.device ('/CPU:0'):
-            #Place holders on CPU
-            self.warped_src = tf.placeholder (nn.floatx, bgr_shape, name='warped_src')
-            self.warped_dst = tf.placeholder (nn.floatx, bgr_shape, name='warped_dst')
+        # Initializing model classes (Phase 7 torch archi factory —
+        # the official AMP archi contract: same no-argument
+        # constructors, names, the flat pixel-normalized encoder
+        # codes, the single-dense inter, the RRC decoder heads)
+        model_archi = nn.AMPArchi(resolution, use_fp16=use_fp16, e_ch=e_dims, ae_ch=ae_dims,
+                                  inter_ch=inter_dims, inter_res=inter_res,
+                                  d_ch=d_dims, d_mask_ch=d_mask_dims)
 
-            self.target_src = tf.placeholder (nn.floatx, bgr_shape, name='target_src')
-            self.target_dst = tf.placeholder (nn.floatx, bgr_shape, name='target_dst')
+        self.encoder = model_archi.Encoder(name='encoder')
+        self.inter_src = model_archi.Inter(name='inter_src')
+        self.inter_dst = model_archi.Inter(name='inter_dst')
+        self.decoder = model_archi.Decoder(name='decoder')
 
-            self.target_srcm    = tf.placeholder (nn.floatx, mask_shape, name='target_srcm')
-            self.target_srcm_em = tf.placeholder (nn.floatx, mask_shape, name='target_srcm_em')
-            self.target_dstm    = tf.placeholder (nn.floatx, mask_shape, name='target_dstm')
-            self.target_dstm_em = tf.placeholder (nn.floatx, mask_shape, name='target_dstm_em')
+        self.model_filename_list += [   [self.encoder,  'encoder.npy'],
+                                        [self.inter_src, 'inter_src.npy'],
+                                        [self.inter_dst , 'inter_dst.npy'],
+                                        [self.decoder , 'decoder.npy'] ]
 
-            self.morph_value_t = tf.placeholder (nn.floatx, (1,), name='morph_value_t')
+        # torch (Phase 7, official optimizer-state naming): the
+        # official DFL optimizer names its per-parameter state after
+        # the trained variables ('ms_<full_varname>_0:0' /
+        # 'vs_<full_varname>_0:0', where <full_varname> =
+        # '<component>/<sub_name>:0', e.g.
+        # 'ms_encoder/down1/conv1/weight_0:0'). The Phase 3E2
+        # OptimizerBase emits exactly that naming from a per-
+        # parameter binding (param._dfl_name; Tensor.name is
+        # reserved/read-only in torch), so BEFORE
+        # initialize_variables — which registers the state keys —
+        # every component is bound to its full official DFL
+        # variable name: the component's checkpoint scope
+        # (component.name) + the official sub-name from its weight
+        # enumeration, e.g. 'encoder/down1/conv1/weight:0'. The inter
+        # components are bound (official sub-names) but NEVER
+        # optimized — the official src_dst_opt trains encoder+decoder
+        # only (Model_tf.py L301), and the official src_dst_opt.npy
+        # state file accordingly contains no inter keys.
+        def _bind_official_names(component):
+            # the owning leaf layer per parameter (the module whose
+            # DIRECT registrations include it) — the optimizer-state
+            # layout hooks delegate a state tensor to this layer's
+            # official layout rule (a state tensor has the layout of
+            # the variable it tracks; OptimizerBase module
+            # docstring, 'State LAYOUT')
+            owners = {}
+            for module in component.modules():
+                for p in module.parameters(recurse=False):
+                    owners[id(p)] = module
+            for sub_name, param in component._iter_official_weights():
+                param._dfl_name = f"{component.name}/{sub_name}"
+                owner = owners.get(id(param))
+                if owner is not None:
+                    param._dfl_owner_layer = owner
 
-        # Initializing model classes
-        with tf.device (models_opt_device):
-            self.encoder = Encoder(name='encoder')
-            self.inter_src = Inter(name='inter_src')
-            self.inter_dst = Inter(name='inter_dst')
-            self.decoder = Decoder(name='decoder')
+        for _component in (self.encoder, self.inter_src, self.inter_dst, self.decoder):
+            _bind_official_names(_component)
 
-            self.model_filename_list += [   [self.encoder,  'encoder.npy'],
-                                            [self.inter_src, 'inter_src.npy'],
-                                            [self.inter_dst , 'inter_dst.npy'],
-                                            [self.decoder , 'decoder.npy'] ]
-
-            if self.is_training:
-                # Initialize optimizers
-                clipnorm = 1.0 if self.options['clipgrad'] else 0.0
-                if self.options['lr_dropout'] in ['y','cpu']:
-                    lr_cos = 500
-                    lr_dropout = 0.3
-                else:
-                    lr_cos = 0
-                    lr_dropout = 1.0
-                self.G_weights = self.encoder.get_weights() + self.decoder.get_weights()
-
-                self.src_dst_opt = nn.AdaBelief(lr=5e-5, lr_dropout=lr_dropout, lr_cos=lr_cos, clipnorm=clipnorm, name='src_dst_opt')
-                self.src_dst_opt.initialize_variables (self.G_weights, vars_on_cpu=optimizer_vars_on_cpu)
-                self.model_filename_list += [ (self.src_dst_opt, 'src_dst_opt.npy') ]
-
-                if gan_power != 0:
-                    self.GAN = nn.UNetPatchDiscriminator(patch_size=self.options['gan_patch_size'], in_ch=input_ch, base_ch=self.options['gan_dims'], name="GAN")
-                    self.GAN_opt = nn.AdaBelief(lr=5e-5, lr_dropout=lr_dropout, lr_cos=lr_cos, clipnorm=clipnorm, name='GAN_opt')
-                    self.GAN_opt.initialize_variables ( self.GAN.get_weights(), vars_on_cpu=optimizer_vars_on_cpu)
-                    self.model_filename_list += [ [self.GAN, 'GAN.npy'],
-                                                  [self.GAN_opt, 'GAN_opt.npy'] ]
+        # Official: the inter_src / inter_dst heads are FROZEN fixed
+        # random projections — the official gradient requests cover
+        # only the GAN weights (L454) and the G_weights set (L464:
+        # encoder + decoder), so the inter variables never receive
+        # any gradient. torch: requires_grad=False makes the inter
+        # weights autograd constants — the encoder still receives
+        # gradients THROUGH them (the TF back-prop-through-untrained-
+        # variables behavior: the backprop path from the inter codes
+        # to the encoder passes through the inter weight values as
+        # constants) and their .grad stays None (finding F4). The
+        # freeze does not affect save/load (data-only checkpoints).
+        for _p in self.inter_src.get_weights() + self.inter_dst.get_weights():
+            _p.requires_grad_(False)
 
         if self.is_training:
-            # Adjust batch size for multiple GPU
-            gpu_count = max(1, len(devices) )
-            bs_per_gpu = max(1, self.get_batch_size() // gpu_count)
-            self.set_batch_size( gpu_count*bs_per_gpu)
+            # Initialize optimizers
+            # (the official lr_dropout 'y' / 'cpu' values are
+            # equivalent on the single-device torch foundation —
+            # the official AMP model never passes the SAEHD
+            # lr_dropout_on_cpu knob: its optimizer state is
+            # co-located with its parameters on nn.device; Q3)
+            clipnorm = 1.0 if self.options['clipgrad'] else 0.0
+            if self.options['lr_dropout'] in ['y','cpu']:
+                lr_cos = 500
+                lr_dropout = 0.3
+            else:
+                lr_cos = 0
+                lr_dropout = 1.0
+            self.G_weights = self.encoder.get_weights() + self.decoder.get_weights()
 
-            # Compute losses per GPU
-            gpu_pred_src_src_list = []
-            gpu_pred_dst_dst_list = []
-            gpu_pred_src_dst_list = []
-            gpu_pred_src_srcm_list = []
-            gpu_pred_dst_dstm_list = []
-            gpu_pred_src_dstm_list = []
-
-            gpu_src_losses = []
-            gpu_dst_losses = []
-            gpu_G_loss_gradients = []
-            gpu_GAN_loss_gradients = []
-
-            def DLossOnes(logits):
-                return tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(logits), logits=logits), axis=[1,2,3])
-
-            def DLossZeros(logits):
-                return tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.zeros_like(logits), logits=logits), axis=[1,2,3])
-
-            for gpu_id in range(gpu_count):
-                with tf.device( f'/{devices[gpu_id].tf_dev_type}:{gpu_id}' if len(devices) != 0 else f'/CPU:0' ):
-                    with tf.device(f'/CPU:0'):
-                        # slice on CPU, otherwise all batch data will be transfered to GPU first
-                        batch_slice = slice( gpu_id*bs_per_gpu, (gpu_id+1)*bs_per_gpu )
-                        gpu_warped_src      = self.warped_src [batch_slice,:,:,:]
-                        gpu_warped_dst      = self.warped_dst [batch_slice,:,:,:]
-                        gpu_target_src      = self.target_src [batch_slice,:,:,:]
-                        gpu_target_dst      = self.target_dst [batch_slice,:,:,:]
-                        gpu_target_srcm     = self.target_srcm[batch_slice,:,:,:]
-                        gpu_target_srcm_em  = self.target_srcm_em[batch_slice,:,:,:]
-                        gpu_target_dstm     = self.target_dstm[batch_slice,:,:,:]
-                        gpu_target_dstm_em  = self.target_dstm_em[batch_slice,:,:,:]
-
-                    # process model tensors
-                    gpu_src_code = self.encoder (gpu_warped_src)
-                    gpu_dst_code = self.encoder (gpu_warped_dst)
-
-                    gpu_src_inter_src_code, gpu_src_inter_dst_code = self.inter_src (gpu_src_code), self.inter_dst (gpu_src_code)
-                    gpu_dst_inter_src_code, gpu_dst_inter_dst_code = self.inter_src (gpu_dst_code), self.inter_dst (gpu_dst_code)
-
-                    inter_dims_bin = int(inter_dims*morph_factor)
-                    with tf.device(f'/CPU:0'):
-                        inter_rnd_binomial = tf.stack([tf.random.shuffle(tf.concat([tf.tile(tf.constant([1], tf.float32), ( inter_dims_bin, )),
-                                                                                    tf.tile(tf.constant([0], tf.float32), ( inter_dims-inter_dims_bin, ))], 0 )) for _ in range(bs_per_gpu)], 0)
-
-                        inter_rnd_binomial = tf.stop_gradient(inter_rnd_binomial[...,None,None])
-
-                    gpu_src_code = gpu_src_inter_src_code * inter_rnd_binomial + gpu_src_inter_dst_code * (1-inter_rnd_binomial)
-                    gpu_dst_code = gpu_dst_inter_dst_code
-
-                    inter_dims_slice = tf.cast(inter_dims*self.morph_value_t[0], tf.int32)
-                    gpu_src_dst_code = tf.concat( (tf.slice(gpu_dst_inter_src_code, [0,0,0,0],   [-1, inter_dims_slice , inter_res, inter_res]),
-                                                   tf.slice(gpu_dst_inter_dst_code, [0,inter_dims_slice,0,0], [-1,inter_dims-inter_dims_slice, inter_res,inter_res]) ), 1 )
-
-                    gpu_pred_src_src, gpu_pred_src_srcm = self.decoder(gpu_src_code)
-                    gpu_pred_dst_dst, gpu_pred_dst_dstm = self.decoder(gpu_dst_code)
-                    gpu_pred_src_dst, gpu_pred_src_dstm = self.decoder(gpu_src_dst_code)
-
-                    gpu_pred_src_src_list.append(gpu_pred_src_src), gpu_pred_src_srcm_list.append(gpu_pred_src_srcm)
-                    gpu_pred_dst_dst_list.append(gpu_pred_dst_dst), gpu_pred_dst_dstm_list.append(gpu_pred_dst_dstm)
-                    gpu_pred_src_dst_list.append(gpu_pred_src_dst), gpu_pred_src_dstm_list.append(gpu_pred_src_dstm)
-
-                    gpu_target_srcm_anti = 1-gpu_target_srcm
-                    gpu_target_dstm_anti = 1-gpu_target_dstm
-
-                    gpu_target_srcm_gblur = nn.gaussian_blur(gpu_target_srcm, resolution // 32)
-                    gpu_target_dstm_gblur = nn.gaussian_blur(gpu_target_dstm, resolution // 32)
-
-                    gpu_target_srcm_blur = tf.clip_by_value(gpu_target_srcm_gblur, 0, 0.5) * 2
-                    gpu_target_dstm_blur = tf.clip_by_value(gpu_target_dstm_gblur, 0, 0.5) * 2
-                    gpu_target_srcm_anti_blur = 1.0-gpu_target_srcm_blur
-                    gpu_target_dstm_anti_blur = 1.0-gpu_target_dstm_blur
-
-                    if blur_out_mask:
-                        sigma = resolution / 128
-
-                        x = nn.gaussian_blur(gpu_target_src*gpu_target_srcm_anti, sigma)
-                        y = 1-nn.gaussian_blur(gpu_target_srcm, sigma)
-                        y = tf.where(tf.equal(y, 0), tf.ones_like(y), y)
-                        gpu_target_src = gpu_target_src*gpu_target_srcm + (x/y)*gpu_target_srcm_anti
-
-                        x = nn.gaussian_blur(gpu_target_dst*gpu_target_dstm_anti, sigma)
-                        y = 1-nn.gaussian_blur(gpu_target_dstm, sigma)
-                        y = tf.where(tf.equal(y, 0), tf.ones_like(y), y)
-                        gpu_target_dst = gpu_target_dst*gpu_target_dstm + (x/y)*gpu_target_dstm_anti
-
-                    gpu_target_src_masked = gpu_target_src*gpu_target_srcm_blur
-                    gpu_target_dst_masked = gpu_target_dst*gpu_target_dstm_blur
-                    gpu_target_src_anti_masked = gpu_target_src*gpu_target_srcm_anti_blur
-                    gpu_target_dst_anti_masked = gpu_target_dst*gpu_target_dstm_anti_blur
-
-                    gpu_pred_src_src_masked = gpu_pred_src_src*gpu_target_srcm_blur
-                    gpu_pred_dst_dst_masked = gpu_pred_dst_dst*gpu_target_dstm_blur
-                    gpu_pred_src_src_anti_masked = gpu_pred_src_src*gpu_target_srcm_anti_blur
-                    gpu_pred_dst_dst_anti_masked = gpu_pred_dst_dst*gpu_target_dstm_anti_blur
-
-                    # Structural loss
-                    gpu_src_loss =  tf.reduce_mean (5*nn.dssim(gpu_target_src_masked, gpu_pred_src_src_masked, max_val=1.0, filter_size=int(resolution/11.6)), axis=[1])
-                    gpu_src_loss += tf.reduce_mean (5*nn.dssim(gpu_target_src_masked, gpu_pred_src_src_masked, max_val=1.0, filter_size=int(resolution/23.2)), axis=[1])
-                    gpu_dst_loss =  tf.reduce_mean (5*nn.dssim(gpu_target_dst_masked, gpu_pred_dst_dst_masked, max_val=1.0, filter_size=int(resolution/11.6) ), axis=[1])
-                    gpu_dst_loss += tf.reduce_mean (5*nn.dssim(gpu_target_dst_masked, gpu_pred_dst_dst_masked, max_val=1.0, filter_size=int(resolution/23.2) ), axis=[1])
-
-                    # Pixel loss
-                    gpu_src_loss += tf.reduce_mean (10*tf.square(gpu_target_src_masked-gpu_pred_src_src_masked), axis=[1,2,3])
-                    gpu_dst_loss += tf.reduce_mean (10*tf.square(gpu_target_dst_masked-gpu_pred_dst_dst_masked), axis=[1,2,3])
-
-                    # Eyes+mouth prio loss
-                    gpu_src_loss += tf.reduce_mean (300*tf.abs (gpu_target_src*gpu_target_srcm_em-gpu_pred_src_src*gpu_target_srcm_em), axis=[1,2,3])
-                    gpu_dst_loss += tf.reduce_mean (300*tf.abs (gpu_target_dst*gpu_target_dstm_em-gpu_pred_dst_dst*gpu_target_dstm_em), axis=[1,2,3])
-
-                    # Mask loss
-                    gpu_src_loss += tf.reduce_mean ( 10*tf.square( gpu_target_srcm - gpu_pred_src_srcm ),axis=[1,2,3] )
-                    gpu_dst_loss += tf.reduce_mean ( 10*tf.square( gpu_target_dstm - gpu_pred_dst_dstm ),axis=[1,2,3] )
-
-                    gpu_src_losses += [gpu_src_loss]
-                    gpu_dst_losses += [gpu_dst_loss]
-                    gpu_G_loss = gpu_src_loss + gpu_dst_loss
-                    # dst-dst background weak loss
-                    gpu_G_loss += tf.reduce_mean(0.1*tf.square(gpu_pred_dst_dst_anti_masked-gpu_target_dst_anti_masked),axis=[1,2,3] )
-                    gpu_G_loss += 0.000001*nn.total_variation_mse(gpu_pred_dst_dst_anti_masked)
-
-
-                    if gan_power != 0:
-                        gpu_pred_src_src_d, gpu_pred_src_src_d2 = self.GAN(gpu_pred_src_src_masked)
-                        gpu_pred_dst_dst_d, gpu_pred_dst_dst_d2 = self.GAN(gpu_pred_dst_dst_masked)
-                        gpu_target_src_d, gpu_target_src_d2 = self.GAN(gpu_target_src_masked)
-                        gpu_target_dst_d, gpu_target_dst_d2 = self.GAN(gpu_target_dst_masked)
-
-                        gpu_GAN_loss = (DLossOnes (gpu_target_src_d)   + DLossOnes (gpu_target_src_d2) + \
-                                        DLossZeros(gpu_pred_src_src_d) + DLossZeros(gpu_pred_src_src_d2) + \
-                                        DLossOnes (gpu_target_dst_d)   + DLossOnes (gpu_target_dst_d2) + \
-                                        DLossZeros(gpu_pred_dst_dst_d) + DLossZeros(gpu_pred_dst_dst_d2)
-                                        ) * (1.0 / 8)
-
-                        gpu_GAN_loss_gradients += [ nn.gradients (gpu_GAN_loss, self.GAN.get_weights() ) ]
-
-                        gpu_G_loss += (DLossOnes(gpu_pred_src_src_d) + DLossOnes(gpu_pred_src_src_d2) + \
-                                       DLossOnes(gpu_pred_dst_dst_d) + DLossOnes(gpu_pred_dst_dst_d2)
-                                      ) * gan_power
-
-                        # Minimal src-src-bg rec with total_variation_mse to suppress random bright dots from gan
-                        gpu_G_loss += 0.000001*nn.total_variation_mse(gpu_pred_src_src)
-                        gpu_G_loss += 0.02*tf.reduce_mean(tf.square(gpu_pred_src_src_anti_masked-gpu_target_src_anti_masked),axis=[1,2,3] )
-
-                    gpu_G_loss_gradients += [ nn.gradients ( gpu_G_loss, self.G_weights ) ]
-
-            # Average losses and gradients, and create optimizer update ops
-            with tf.device(f'/CPU:0'):
-                pred_src_src  = nn.concat(gpu_pred_src_src_list, 0)
-                pred_dst_dst  = nn.concat(gpu_pred_dst_dst_list, 0)
-                pred_src_dst  = nn.concat(gpu_pred_src_dst_list, 0)
-                pred_src_srcm = nn.concat(gpu_pred_src_srcm_list, 0)
-                pred_dst_dstm = nn.concat(gpu_pred_dst_dstm_list, 0)
-                pred_src_dstm = nn.concat(gpu_pred_src_dstm_list, 0)
-
-            with tf.device (models_opt_device):
-                src_loss = tf.concat(gpu_src_losses, 0)
-                dst_loss = tf.concat(gpu_dst_losses, 0)
-                train_op = self.src_dst_opt.get_update_op (nn.average_gv_list (gpu_G_loss_gradients))
-
-                if gan_power != 0:
-                    GAN_train_op = self.GAN_opt.get_update_op (nn.average_gv_list(gpu_GAN_loss_gradients) )
-
-            # Initializing training and view functions
-            def train(warped_src, target_src, target_srcm, target_srcm_em,  \
-                              warped_dst, target_dst, target_dstm, target_dstm_em, ):
-                s, d, _ = nn.tf_sess.run ([src_loss, dst_loss, train_op],
-                                            feed_dict={self.warped_src :warped_src,
-                                                       self.target_src :target_src,
-                                                       self.target_srcm:target_srcm,
-                                                       self.target_srcm_em:target_srcm_em,
-                                                       self.warped_dst :warped_dst,
-                                                       self.target_dst :target_dst,
-                                                       self.target_dstm:target_dstm,
-                                                       self.target_dstm_em:target_dstm_em,
-                                                       })
-                return s, d
-            self.train = train
+            self.src_dst_opt = nn.AdaBelief(lr=5e-5, lr_dropout=lr_dropout, lr_cos=lr_cos, clipnorm=clipnorm, name='src_dst_opt')
+            self.src_dst_opt.initialize_variables (self.G_weights, vars_on_cpu=optimizer_vars_on_cpu)
+            self.model_filename_list += [ (self.src_dst_opt, 'src_dst_opt.npy') ]
 
             if gan_power != 0:
-                def GAN_train(warped_src, target_src, target_srcm, target_srcm_em,  \
-                              warped_dst, target_dst, target_dstm, target_dstm_em, ):
-                    nn.tf_sess.run ([GAN_train_op], feed_dict={self.warped_src :warped_src,
-                                                               self.target_src :target_src,
-                                                               self.target_srcm:target_srcm,
-                                                               self.target_srcm_em:target_srcm_em,
-                                                               self.warped_dst :warped_dst,
-                                                               self.target_dst :target_dst,
-                                                               self.target_dstm:target_dstm,
-                                                               self.target_dstm_em:target_dstm_em})
-                self.GAN_train = GAN_train
+                self.GAN = nn.UNetPatchDiscriminator(patch_size=self.options['gan_patch_size'], in_ch=input_ch, base_ch=self.options['gan_dims'], name="GAN")
+                _bind_official_names(self.GAN)
+                self.GAN_opt = nn.AdaBelief(lr=5e-5, lr_dropout=lr_dropout, lr_cos=lr_cos, clipnorm=clipnorm, name='GAN_opt')
+                self.GAN_opt.initialize_variables ( self.GAN.get_weights(), vars_on_cpu=optimizer_vars_on_cpu)
+                self.model_filename_list += [ [self.GAN, 'GAN.npy'],
+                                              [self.GAN_opt, 'GAN_opt.npy'] ]
+
+        def _to_tensor(x):
+            # official feed_dict placement semantics: to the current
+            # nn.device in the declared floatx (NumPy or tensor in)
+            if not isinstance(x, torch.Tensor):
+                x = torch.from_numpy(np.ascontiguousarray(x))
+            x = x.to(device=nn.device, dtype=nn.floatx)
+            if x.dim() == 3:
+                x = x[None, ...]
+            return x
+
+        def _to_numpy(x):
+            # official caller contract: TF session outputs were NumPy
+            # (in the graph's data format — model_data_format here)
+            return x.detach().cpu().numpy()
+
+        if self.is_training:
+            def DLossOnes(logits):
+                # official L333-334: the per-sample sigmoid BCE on
+                # the ones labels (mean over the (1,2,3) axes -> the
+                # per-sample (N,) vector) — the migrated
+                # nn.sigmoid_cross_entropy is the verbatim formula
+                return nn.sigmoid_cross_entropy(torch.ones_like(logits), logits)
+
+            def DLossZeros(logits):
+                # official L336-337: the per-sample sigmoid BCE on
+                # the zeros labels
+                return nn.sigmoid_cross_entropy(torch.zeros_like(logits), logits)
+
+            def AE_forward(warped_src, warped_dst):
+                # the official forward graph (Model_tf.py L354-376),
+                # grad-capable: both inter heads on the src code
+                # (L357), the dst code = inter_dst of the dst code
+                # (L358/L368), the EXACT-k random morph mask
+                # (L360-367: the per-sample uniform k-subset shuffle
+                # of the k-ones/(D-k)-zeros base pattern,
+                # stop_gradient — the Phase 7
+                # core.leras.archis.AMP.exact_k_morph_mask op,
+                # re-drawn on every call = the official fresh
+                # tf.random.shuffle per session.run) and the two
+                # training decoder calls (L374-375). The official
+                # slice-code decoder call (L371-376) is pruned from
+                # every training fetch by TF's lazy execution (the
+                # fetched tensors never depend on it — the dst stack
+                # consumes pred_dst_dst, not pred_src_dst); it lives
+                # in AE_view / AE_merge below.
+                warped_src = _to_tensor(warped_src)
+                warped_dst = _to_tensor(warped_dst)
+                src_code = self.encoder(warped_src)
+                dst_code = self.encoder(warped_dst)
+
+                src_inter_src_code = self.inter_src(src_code)
+                src_inter_dst_code = self.inter_dst(src_code)
+                dst_inter_dst_code = self.inter_dst(dst_code)
+
+                inter_rnd_binomial = exact_k_morph_mask(src_code.shape[0], inter_dims,
+                                                        morph_factor, device=nn.device, dtype=nn.floatx)
+                morph_src_code = src_inter_src_code * inter_rnd_binomial + src_inter_dst_code * (1-inter_rnd_binomial)
+
+                pred_src_src, pred_src_srcm = self.decoder(morph_src_code)
+                pred_dst_dst, pred_dst_dstm = self.decoder(dst_inter_dst_code)
+
+                return {
+                    'dst_code': dst_code,
+                    'pred_src_src': pred_src_src,
+                    'pred_src_srcm': pred_src_srcm,
+                    'pred_dst_dst': pred_dst_dst,
+                    'pred_dst_dstm': pred_dst_dstm,
+                }
 
             def AE_view(warped_src, warped_dst, morph_value):
-                return nn.tf_sess.run ( [pred_src_src, pred_dst_dst, pred_dst_dstm, pred_src_dst, pred_src_dstm],
-                                            feed_dict={self.warped_src:warped_src, self.warped_dst:warped_dst, self.morph_value_t:[morph_value] })
+                # official L512-514: the inference boundary — a
+                # fresh session.run per call (the stochastic exact-k
+                # mask is re-drawn per call), plus the official
+                # DETERMINISTIC morph-value floor-slice
+                # (L370-372: k = int(inter_dims * morph_value)
+                # leading inter channels from the inter_src head,
+                # the remainder from the inter_dst head) for the
+                # SD/SDM tiles
+                with torch.no_grad():
+                    f = AE_forward(warped_src, warped_dst)
+
+                    inter_dims_slice = int(inter_dims*morph_value)
+                    dst_inter_src_code = self.inter_src(f['dst_code'])
+                    dst_inter_dst_code = self.inter_dst(f['dst_code'])
+                    src_dst_code = torch.cat( ( dst_inter_src_code[:, :inter_dims_slice],
+                                                dst_inter_dst_code[:, inter_dims_slice:] ), dim=nn.conv2d_ch_axis )
+
+                    pred_src_dst, pred_src_dstm = self.decoder(src_dst_code)
+
+                    return [ _to_numpy(x) for x in
+                             (f['pred_src_src'], f['pred_dst_dst'], f['pred_dst_dstm'], pred_src_dst, pred_src_dstm) ]
+                # torch: the official nn.tf_sess.run([...], feed_
+                # dict=...) inference boundary — no gradient
+                # bookkeeping
 
             self.AE_view = AE_view
         else:
-            #Initializing merge function
-            with tf.device( nn.tf_default_device_name if len(devices) != 0 else f'/CPU:0'):
-                gpu_dst_code = self.encoder (self.warped_dst)
-                gpu_dst_inter_src_code = self.inter_src (gpu_dst_code)
-                gpu_dst_inter_dst_code = self.inter_dst (gpu_dst_code)
-
-                inter_dims_slice = tf.cast(inter_dims*self.morph_value_t[0], tf.int32)
-                gpu_src_dst_code =  tf.concat( ( tf.slice(gpu_dst_inter_src_code, [0,0,0,0],   [-1, inter_dims_slice , inter_res, inter_res]),
-                                                 tf.slice(gpu_dst_inter_dst_code, [0,inter_dims_slice,0,0], [-1,inter_dims-inter_dims_slice, inter_res,inter_res]) ), 1 )
-
-                gpu_pred_src_dst, gpu_pred_src_dstm = self.decoder(gpu_src_dst_code)
-                _, gpu_pred_dst_dstm = self.decoder(gpu_dst_inter_dst_code)
+            #Initializing merge function (the official non-training
+            # branch, L519-534 — the dst code chain + the official
+            # DETERMINISTIC morph-value floor slice; the morph value
+            # comes from the merger prompt below)
 
             def AE_merge(warped_dst, morph_value):
-                return nn.tf_sess.run ( [gpu_pred_src_dst, gpu_pred_dst_dstm, gpu_pred_src_dstm], feed_dict={self.warped_dst:warped_dst, self.morph_value_t:[morph_value] })
+                warped_dst = _to_tensor(warped_dst)
+                with torch.no_grad():
+                    dst_code = self.encoder(warped_dst)
+                    dst_inter_src_code = self.inter_src(dst_code)
+                    dst_inter_dst_code = self.inter_dst(dst_code)
+
+                    inter_dims_slice = int(inter_dims*morph_value)
+                    src_dst_code = torch.cat( ( dst_inter_src_code[:, :inter_dims_slice],
+                                                dst_inter_dst_code[:, inter_dims_slice:] ), dim=nn.conv2d_ch_axis )
+
+                    pred_src_dst, pred_src_dstm = self.decoder(src_dst_code)
+                    _, pred_dst_dstm = self.decoder(dst_inter_dst_code)
+
+                    return [ _to_numpy(x) for x in
+                             (pred_src_dst, pred_dst_dstm, pred_src_dstm) ]
+                # torch: the official nn.tf_sess.run([...], feed_
+                # dict=...) inference boundary — no gradient
+                # bookkeeping
 
             self.AE_merge = AE_merge
 
-        # Loading/initializing all models/optimizers weights
+        if self.is_training:
+            # --- training closures (official loss stack + update
+            # ops) ---
+            # torch (Phase 7): the official per-GPU TF graph — the
+            # loss stack (Model_tf.py L382-464), the per-closure
+            # nn.gradients calls and the get_update_op update ops —
+            # is reproduced as native eager torch with identical
+            # semantics: the same tensor ops (the migrated
+            # nn.dssim / nn.gaussian_blur / nn.total_variation_mse /
+            # nn.sigmoid_cross_entropy), the same per-sample (N,)
+            # loss vectors, the same per-optimizer gradient sets
+            # (official nn.gradients(loss, vars) -> the backward
+            # with the ones seed + the group's (grad, param) pairs;
+            # the official TF nn.gradients on a vector loss seeds
+            # the backward with ones = the batch SUM over samples,
+            # probe-verified — a bare .backward() raises for N > 1;
+            # the externals' batch-mean substitution is NOT
+            # inherited), the same update order (the G step first,
+            # then the D step with the post-update weights and a
+            # fresh mask draw) and the single-device collapse of
+            # the multi-GPU graph (one device; average_gv_list over
+            # one tower is the identity).
+
+            def _zero_grads(param_groups):
+                # torch has no tf session boundary: the official
+                # fresh nn.gradients per session.run means no .grad
+                # may accumulate across update ops / iterations —
+                # make that explicit per group.
+                for group in param_groups:
+                    for p in group:
+                        p.grad = None
+
+            def _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                 warped_dst, target_dst, target_dstm, target_dstm_em):
+                # the official per-tower input preparation (L382-
+                # 414): the anti masks, the blur_out_mask target
+                # rewrite (sigma = resolution/128, the element-wise
+                # div-zero guard) and the softened loss-mask
+                # products (L385-391, L406-409)
+                warped_src = _to_tensor(warped_src)
+                target_src = _to_tensor(target_src)
+                target_srcm = _to_tensor(target_srcm)
+                target_srcm_em = _to_tensor(target_srcm_em)
+                warped_dst = _to_tensor(warped_dst)
+                target_dst = _to_tensor(target_dst)
+                target_dstm = _to_tensor(target_dstm)
+                target_dstm_em = _to_tensor(target_dstm_em)
+
+                target_srcm_anti = 1-target_srcm
+                target_dstm_anti = 1-target_dstm
+
+                if blur_out_mask:
+                    # official L393-404: the div-zero guard
+                    # tf.where(tf.equal(y, 0), ones, y) is ELEMENT-
+                    # WISE (y == 0, not torch.equal's whole-tensor
+                    # comparison)
+                    sigma = resolution / 128
+
+                    x = nn.gaussian_blur(target_src*target_srcm_anti, sigma)
+                    y = 1-nn.gaussian_blur(target_srcm, sigma)
+                    y = torch.where(y == 0, torch.ones_like(y), y)
+                    target_src = target_src*target_srcm + (x/y)*target_srcm_anti
+
+                    x = nn.gaussian_blur(target_dst*target_dstm_anti, sigma)
+                    y = 1-nn.gaussian_blur(target_dstm, sigma)
+                    y = torch.where(y == 0, torch.ones_like(y), y)
+                    target_dst = target_dst*target_dstm + (x/y)*target_dstm_anti
+
+                target_srcm_blur = torch.clip(nn.gaussian_blur(target_srcm,  max(1, resolution // 32) ), 0, 0.5) * 2
+                target_dstm_blur = torch.clip(nn.gaussian_blur(target_dstm,  max(1, resolution // 32) ), 0, 0.5) * 2
+                target_srcm_anti_blur = 1.0-target_srcm_blur
+                target_dstm_anti_blur = 1.0-target_dstm_blur
+
+                target_src_masked = target_src*target_srcm_blur
+                target_dst_masked = target_dst*target_dstm_blur
+                target_src_anti_masked = target_src*target_srcm_anti_blur
+                target_dst_anti_masked = target_dst*target_dstm_anti_blur
+
+                return {
+                    'warped_src': warped_src, 'target_src': target_src,
+                    'target_srcm': target_srcm, 'target_srcm_em': target_srcm_em,
+                    'warped_dst': warped_dst, 'target_dst': target_dst,
+                    'target_dstm': target_dstm, 'target_dstm_em': target_dstm_em,
+                    'target_srcm_blur': target_srcm_blur,
+                    'target_srcm_anti_blur': target_srcm_anti_blur,
+                    'target_dstm_blur': target_dstm_blur,
+                    'target_dstm_anti_blur': target_dstm_anti_blur,
+                    'target_src_masked': target_src_masked,
+                    'target_dst_masked': target_dst_masked,
+                    'target_src_anti_masked': target_src_anti_masked,
+                    'target_dst_anti_masked': target_dst_anti_masked,
+                }
+
+            def train(warped_src, target_src, target_srcm, target_srcm_em,
+                      warped_dst, target_dst, target_dstm, target_dstm_em):
+                # official train (L484-496): the full generator loss
+                # stack (L417-462) -> ONE src_dst_opt step over the
+                # official G_weights set (L301: encoder+decoder —
+                # the inter-head and GAN grads computed by the
+                # backward are dropped, exactly as
+                # nn.gradients(gpu_G_loss, G_weights) requests only
+                # the listed variables). Returns the official src /
+                # dst loss vectors — the 5-term stacks snapshotted
+                # BEFORE the background / GAN terms are added to
+                # G_loss (L434-435), as the official
+                # gpu_src_losses / gpu_dst_losses lists hold.
+                t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                     warped_dst, target_dst, target_dstm, target_dstm_em)
+
+                f = AE_forward(t['warped_src'], t['warped_dst'])
+                pred_src_src = f['pred_src_src']
+                pred_src_srcm = f['pred_src_srcm']
+                pred_dst_dst = f['pred_dst_dst']
+                pred_dst_dstm = f['pred_dst_dstm']
+
+                pred_src_src_masked = pred_src_src*t['target_srcm_blur']
+                pred_dst_dst_masked = pred_dst_dst*t['target_dstm_blur']
+                pred_src_src_anti_masked = pred_src_src*t['target_srcm_anti_blur']
+                pred_dst_dst_anti_masked = pred_dst_dst*t['target_dstm_anti_blur']
+
+                target_src = t['target_src']
+                target_dst = t['target_dst']
+                target_srcm = t['target_srcm']
+                target_srcm_em = t['target_srcm_em']
+                target_dstm = t['target_dstm']
+                target_dstm_em = t['target_dstm_em']
+
+                # --- src loss (official L417-431) ---
+                src_loss = torch.mean( 5*nn.dssim(t['target_src_masked'], pred_src_src_masked, max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                src_loss = src_loss + torch.mean( 5*nn.dssim(t['target_src_masked'], pred_src_src_masked, max_val=1.0, filter_size=int(resolution/23.2)), dim=1)
+                src_loss = src_loss + torch.mean( 10*torch.square( t['target_src_masked'] - pred_src_src_masked ), dim=(1,2,3))
+                src_loss = src_loss + torch.mean( 300*torch.abs( target_src*target_srcm_em - pred_src_src*target_srcm_em ), dim=(1,2,3))
+                src_loss = src_loss + torch.mean( 10*torch.square( target_srcm - pred_src_srcm ), dim=(1,2,3) )
+
+                # --- dst loss (official L418-432) ---
+                dst_loss = torch.mean( 5*nn.dssim(t['target_dst_masked'], pred_dst_dst_masked, max_val=1.0, filter_size=int(resolution/11.6) ), dim=1)
+                dst_loss = dst_loss + torch.mean( 5*nn.dssim(t['target_dst_masked'], pred_dst_dst_masked, max_val=1.0, filter_size=int(resolution/23.2) ), dim=1)
+                dst_loss = dst_loss + torch.mean( 10*torch.square( t['target_dst_masked'] - pred_dst_dst_masked ), dim=(1,2,3))
+                dst_loss = dst_loss + torch.mean( 300*torch.abs( target_dst*target_dstm_em - pred_dst_dst*target_dstm_em ), dim=(1,2,3))
+                dst_loss = dst_loss + torch.mean( 10*torch.square( target_dstm - pred_dst_dstm ), dim=(1,2,3) )
+
+                # the official gpu_src_losses / gpu_dst_losses
+                # snapshot (L434-435) — train() returns these
+                # vectors (the 5-term stacks, pre-GAN terms)
+                src_loss_snap = src_loss.detach()
+                dst_loss_snap = dst_loss.detach()
+
+                G_loss = src_loss + dst_loss
+
+                # dst-dst background weak loss (official L438-439)
+                G_loss = G_loss + torch.mean(0.1*torch.square(pred_dst_dst_anti_masked-t['target_dst_anti_masked']), dim=(1,2,3))
+                G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_dst_dst_anti_masked)
+
+                if gan_power != 0:
+                    # official L443-446: the GAN forwards on the
+                    # MASKED tensors; the 4-term GAN generator loss
+                    # x gan_power UNNORMALIZED (official L456-458);
+                    # the target-D forwards belong to the D
+                    # closure's own graph branch — not part of G
+                    # loss
+                    pred_src_src_d, pred_src_src_d2 = self.GAN(pred_src_src_masked)
+                    pred_dst_dst_d, pred_dst_dst_d2 = self.GAN(pred_dst_dst_masked)
+
+                    G_loss = G_loss + (DLossOnes(pred_src_src_d) + DLossOnes(pred_src_src_d2) + \
+                                       DLossOnes(pred_dst_dst_d) + DLossOnes(pred_dst_dst_d2)) * gan_power
+
+                    # Minimal src-src-bg rec with total_variation_
+                    # mse to suppress random bright dots from gan
+                    # (official L460-462)
+                    G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_src_src)
+                    G_loss = G_loss + 0.02*torch.mean(torch.square(pred_src_src_anti_masked-t['target_src_anti_masked']), dim=(1,2,3))
+
+                _zero_grads([self.G_weights])
+                # Q11 (probe-verified): the official TF
+                # nn.gradients(gpu_G_loss, G_weights) on the
+                # per-sample (N,) loss vector seeds the backward
+                # with ones — the batch SUM over samples
+                torch.autograd.backward(G_loss, torch.ones_like(G_loss))
+                self.src_dst_opt.get_update_op(
+                    [ (p.grad, p) for p in self.G_weights ])()
+
+                return ( src_loss_snap, dst_loss_snap )
+
+            self.train = train
+
+            if gan_power != 0:
+                def GAN_train(warped_src, target_src, target_srcm, target_srcm_em,
+                              warped_dst, target_dst, target_dstm, target_dstm_em):
+                    # official GAN_train (L499-510): the D step on
+                    # the POST-src_dst-step weights — a fresh graph
+                    # evaluation (a fresh exact-k mask draw) whose
+                    # generator recompute is gradient-free (the
+                    # official TF gradients are requested only wrt
+                    # the GAN weights, L454), the 8-term D loss x
+                    # (1/8) (official L448-452 — the 1/8 factor is
+                    # the OFFICIAL upstream normalization,
+                    # preserved; the gradient over the batch is the
+                    # SUM via the ones seed, Q11) -> ONE GAN_opt
+                    # step over the GAN weights (the official
+                    # GAN_opt state is the FULL per-parameter state
+                    # — iters / ms_ / vs_ — never filtered by a
+                    # parameter-name prefix)
+                    t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
+                                         warped_dst, target_dst, target_dstm, target_dstm_em)
+
+                    with torch.no_grad():
+                        f = AE_forward(t['warped_src'], t['warped_dst'])
+
+                    pred_src_src_masked = f['pred_src_src']*t['target_srcm_blur']
+                    pred_dst_dst_masked = f['pred_dst_dst']*t['target_dstm_blur']
+
+                    # the GAN forwards on the MASKED tensors
+                    # (official L443-446), now gradient-capable wrt
+                    # the GAN weights only (the preds / targets are
+                    # constants from the no_grad recompute)
+                    pred_src_src_d, pred_src_src_d2 = self.GAN(pred_src_src_masked)
+                    pred_dst_dst_d, pred_dst_dst_d2 = self.GAN(pred_dst_dst_masked)
+                    target_src_d, target_src_d2 = self.GAN(t['target_src_masked'])
+                    target_dst_d, target_dst_d2 = self.GAN(t['target_dst_masked'])
+
+                    GAN_loss = (DLossOnes (target_src_d)   + DLossOnes (target_src_d2) + \
+                                DLossZeros(pred_src_src_d) + DLossZeros(pred_src_src_d2) + \
+                                DLossOnes (target_dst_d)   + DLossOnes (target_dst_d2) + \
+                                DLossZeros(pred_dst_dst_d) + DLossZeros(pred_dst_dst_d2)
+                                ) * (1.0 / 8)
+
+                    # the G step's backward left grads on the GAN
+                    # weights (they feed the G loss via the
+                    # generator GAN terms) — the official fresh
+                    # nn.gradients per session.run means they must
+                    # not leak into the D step
+                    _zero_grads([self.GAN.get_weights()])
+                    torch.autograd.backward(GAN_loss, torch.ones_like(GAN_loss))
+                    self.GAN_opt.get_update_op(
+                        [ (p.grad, p) for p in self.GAN.get_weights() ])()
+
+                self.GAN_train = GAN_train
+
+        # Loading/initializing all models/optimizers weights (the
+        # official 536-546 loop; Phase 4/5 strict policy: a missing
+        # required component file on resume fails explicitly instead
+        # of the official silent re-initialization — the OFFICIAL
+        # intentional re-init rule below is preserved. GAN_opt joins
+        # the GAN in the official gan_model_changed re-init set: the
+        # official loop only names the GAN, but the stale GAN_opt
+        # file then fails the official `do_init = not load_weights(
+        # ...)` fallback and the official silently re-initializes
+        # it — under the strict load policy (no fallback) the same
+        # official outcome (a changed discriminator gets a FRESH
+        # optimizer state) is preserved by re-initializing GAN_opt
+        # explicitly (the Phase 6B SAEHD precedent))
         for model, filename in io.progress_bar_generator(self.model_filename_list, "Initializing models"):
             do_init = self.is_first_run()
-            if self.is_training and gan_power != 0 and model == self.GAN:
+            if self.is_training and gan_power != 0 and model in (self.GAN, self.GAN_opt):
                 if self.gan_model_changed:
                     do_init = True
             if not do_init:
+                if not self.is_first_run():
+                    file_path = self.get_strpath_storage_for_file(filename)
+                    import os
+                    if not os.path.exists(file_path):
+                        raise FileNotFoundError(
+                            f"required component file missing on resume: {file_path}")
                 do_init = not model.load_weights( self.get_strpath_storage_for_file(filename) )
+
             if do_init:
                 model.init_weights()
+
         ###############
 
         # initializing sample generators
         if self.is_training:
-            training_data_src_path = self.training_data_src_path #if not self.pretrain else self.get_pretraining_data_path()
-            training_data_dst_path = self.training_data_dst_path #if not self.pretrain else self.get_pretraining_data_path()
+            training_data_src_path = self.training_data_src_path
+            training_data_dst_path = self.training_data_dst_path
 
-            random_ct_samples_path=training_data_dst_path if ct_mode is not None else None #and not self.pretrain
+            random_ct_samples_path=training_data_dst_path if ct_mode is not None else None
 
             cpu_count = multiprocessing.cpu_count()
             src_generators_count = cpu_count // 2
@@ -558,17 +852,15 @@ class AMPModel(ModelBase):
             if ct_mode is not None:
                 src_generators_count = int(src_generators_count * 1.5)
 
-
-
             self.set_training_data_generators ([
                     SampleGeneratorFace(training_data_src_path, random_ct_samples_path=random_ct_samples_path, debug=self.is_debug(), batch_size=self.get_batch_size(),
                         sample_process_options=SampleProcessor.Options(scale_range=[-0.15, 0.15], random_flip=self.random_src_flip),
-                        output_sample_types = [ {'sample_type': SampleProcessor.SampleType.FACE_IMAGE,'warp':random_warp, 'transform':True, 'channel_type' : SampleProcessor.ChannelType.BGR, 'ct_mode': ct_mode,                                         'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
-                                                {'sample_type': SampleProcessor.SampleType.FACE_IMAGE,'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.BGR, 'ct_mode': ct_mode,                                         'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
+                        output_sample_types = [ {'sample_type': SampleProcessor.SampleType.FACE_IMAGE,'warp':random_warp, 'transform':True, 'channel_type' : SampleProcessor.ChannelType.BGR, 'ct_mode': ct_mode,   'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
+                                                {'sample_type': SampleProcessor.SampleType.FACE_IMAGE,'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.BGR, 'ct_mode': ct_mode,                           'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
                                                 {'sample_type': SampleProcessor.SampleType.FACE_MASK, 'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.G,   'face_mask_type' : SampleProcessor.FaceMaskType.FULL_FACE,  'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
                                                 {'sample_type': SampleProcessor.SampleType.FACE_MASK, 'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.G,   'face_mask_type' : SampleProcessor.FaceMaskType.EYES_MOUTH, 'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
                                               ],
-                        uniform_yaw_distribution=self.options['uniform_yaw'],# or self.pretrain,
+                        uniform_yaw_distribution=self.options['uniform_yaw'],
                         generators_count=src_generators_count ),
 
                     SampleGeneratorFace(training_data_dst_path, debug=self.is_debug(), batch_size=self.get_batch_size(),
@@ -578,55 +870,16 @@ class AMPModel(ModelBase):
                                                 {'sample_type': SampleProcessor.SampleType.FACE_MASK, 'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.G,   'face_mask_type' : SampleProcessor.FaceMaskType.FULL_FACE,  'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
                                                 {'sample_type': SampleProcessor.SampleType.FACE_MASK, 'warp':False      , 'transform':True, 'channel_type' : SampleProcessor.ChannelType.G,   'face_mask_type' : SampleProcessor.FaceMaskType.EYES_MOUTH, 'face_type':face_type, 'data_format':nn.data_format, 'resolution': resolution},
                                               ],
-                        uniform_yaw_distribution=self.options['uniform_yaw'],# or self.pretrain,
+                        uniform_yaw_distribution=self.options['uniform_yaw'],
                         generators_count=dst_generators_count )
-                             ])
+                         ])
 
     def export_dfm (self):
-        output_path=self.get_strpath_storage_for_file('model.dfm')
-
-        io.log_info(f'Dumping .dfm to {output_path}')
-
-        tf = nn.tf
-        with tf.device (nn.tf_default_device_name):
-            warped_dst = tf.placeholder (nn.floatx, (None, self.resolution, self.resolution, 3), name='in_face')
-            warped_dst = tf.transpose(warped_dst, (0,3,1,2))
-            morph_value = tf.placeholder (nn.floatx, (1,), name='morph_value')
-
-            gpu_dst_code = self.encoder (warped_dst)
-            gpu_dst_inter_src_code = self.inter_src ( gpu_dst_code)
-            gpu_dst_inter_dst_code = self.inter_dst ( gpu_dst_code)
-
-            inter_dims_slice = tf.cast(self.inter_dims*morph_value[0], tf.int32)
-            gpu_src_dst_code =  tf.concat( (tf.slice(gpu_dst_inter_src_code, [0,0,0,0],   [-1, inter_dims_slice , self.inter_res, self.inter_res]),
-                                            tf.slice(gpu_dst_inter_dst_code, [0,inter_dims_slice,0,0], [-1,self.inter_dims-inter_dims_slice, self.inter_res,self.inter_res]) ), 1 )
-
-            gpu_pred_src_dst, gpu_pred_src_dstm = self.decoder(gpu_src_dst_code)
-            _, gpu_pred_dst_dstm = self.decoder(gpu_dst_inter_dst_code)
-
-            gpu_pred_src_dst = tf.transpose(gpu_pred_src_dst, (0,2,3,1))
-            gpu_pred_dst_dstm = tf.transpose(gpu_pred_dst_dstm, (0,2,3,1))
-            gpu_pred_src_dstm = tf.transpose(gpu_pred_src_dstm, (0,2,3,1))
-
-        tf.identity(gpu_pred_dst_dstm, name='out_face_mask')
-        tf.identity(gpu_pred_src_dst, name='out_celeb_face')
-        tf.identity(gpu_pred_src_dstm, name='out_celeb_face_mask')
-
-        output_graph_def = tf.graph_util.convert_variables_to_constants(
-            nn.tf_sess,
-            tf.get_default_graph().as_graph_def(),
-            ['out_face_mask','out_celeb_face','out_celeb_face_mask']
-        )
-
-        import tf2onnx
-        with tf.device("/CPU:0"):
-            model_proto, _ = tf2onnx.convert._convert_common(
-                output_graph_def,
-                name='AMP',
-                input_names=['in_face:0','morph_value:0'],
-                output_names=['out_face_mask:0','out_celeb_face:0','out_celeb_face_mask:0'],
-                opset=12,
-                output_path=output_path)
+        raise NotImplementedError(
+            "AMP DFM/ONNX export is out of scope for Phase 7 (the "
+            "official export_dfm is a TF/tf2onnx graph export — the "
+            "ONNX/DFM exclusion); the torch AE_merge path serves the "
+            "merger and the predictor")
 
     #override
     def get_model_filename_list(self):
@@ -644,20 +897,55 @@ class AMPModel(ModelBase):
 
     #override
     def onTrainOneIter(self):
+        # torch (Phase 7): the official onTrainOneIter (Model_tf.py
+        # L646-657) — the sample fetch, the always-run generator
+        # step (the official train closure) and the GAN step (the
+        # official two-phase post-step D on the post-update weights),
+        # and the official two-value loss return (the per-sample
+        # vector means). The train closures are built in
+        # on_initialize (above), mirroring the official
+        # graph-construction location.
         bs = self.get_batch_size()
+        # official L647 (dead in the official code too: the batch
+        # size drives the generators, not the closures) — kept for
+        # fidelity (F9)
 
         ( (warped_src, target_src, target_srcm, target_srcm_em), \
           (warped_dst, target_dst, target_dstm, target_dstm_em) ) = self.generate_next_samples()
+
+        # gradient hygiene: the official fresh nn.gradients per
+        # session.run means no .grad may survive into this
+        # iteration — zero every graph group before the first
+        # backward (the GAN closure additionally re-zeros its own
+        # group before its backward, discarding the stale GAN grads
+        # accumulated by the G-loss backward)
+        grad_groups = [self.G_weights, self.inter_src.get_weights(), self.inter_dst.get_weights()]
+        if self.gan_power != 0:
+            grad_groups.append(self.GAN.get_weights())
+        for group in grad_groups:
+            for p in group:
+                p.grad = None
 
         src_loss, dst_loss = self.train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
 
         if self.gan_power != 0:
             self.GAN_train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
 
-        return ( ('src_loss', np.mean(src_loss) ), ('dst_loss', np.mean(dst_loss) ), )
+        # the official returns the per-sample means as plain floats
+        # (np.mean of the fetched numpy vectors) — same values;
+        # .detach() first, no torch grad-conversion warning
+        return ( ('src_loss', float(src_loss.mean().detach()) ),
+                 ('dst_loss', float(dst_loss.mean().detach()) ), )
 
     #override
     def onGetPreview(self, samples, for_history=False):
+        # torch (Phase 7): the official onGetPreview (Model_tf.py
+        # L660-705) — AE_view fed with the UNWARPED targets, the
+        # official NHWC preview strips, the official 3 named strips
+        # x 2 rows x 3 tiles (the DDM masks 3-channel repeated), the
+        # official one-sample rendering (n_samples bounds only the
+        # RANDOM index; for_history fixes it to 0) and the
+        # resolution-invariant layout (no SAEHD-style branch)
         ( (warped_src, target_src, target_srcm, target_srcm_em),
           (warped_dst, target_dst, target_dstm, target_dstm_em) ) = samples
 
@@ -682,6 +970,8 @@ class AMPModel(ModelBase):
                                                                  DDM_100, SDM_100) ]
 
         target_srcm, target_dstm = [ nn.to_data_format(x,"NHWC", self.model_data_format) for x in ([target_srcm, target_dstm] )]
+        # official L684 (dead in the official code too — the masks
+        # are never used in the strips) — kept for fidelity
 
         n_samples = min(4, self.get_batch_size(), 800 // self.resolution )
 
@@ -717,7 +1007,6 @@ class AMPModel(ModelBase):
 
         def predictor_morph(face):
             return self.predictor_func(face, morph_factor)
-
 
         import merger
         return predictor_morph, (self.options['resolution'], self.options['resolution'], 3), merger.MergerConfigMasked(face_type=self.face_type, default_mode = 'overlay')
