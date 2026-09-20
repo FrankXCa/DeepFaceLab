@@ -63,6 +63,10 @@ from core.leras import nn
 from samplelib import SampleGeneratorBase
 
 
+class SkippedGeneratorStep(RuntimeError):
+    """GradScaler rejected one generator update; retry with its new scale."""
+
+
 class ModelBase(object):
     def __init__(self, is_training=False,
                        is_exporting=False,
@@ -567,12 +571,18 @@ class ModelBase(object):
             loss_vec = self._mp_scaler.scale(loss_vec)
         torch.autograd.backward(loss_vec, torch.ones_like(loss_vec))
 
-    def _mp_unscale_opt(self, opt):
+    def _mp_unscale_opt(self, opt, active_weights=None):
         # the native torch-recipe step: expose the true (unscaled)
         # fp32 gradients BEFORE the update op, so the clip inside
         # it sees unscaled values (no-op for off/bf16)
         if self._mp_scaler is not None:
-            self._mp_scaler.unscale_(opt)
+            if active_weights is not None:
+                opt._grad_scaler_active_weights = tuple(active_weights)
+            try:
+                self._mp_scaler.unscale_(opt)
+            except Exception:
+                opt._grad_scaler_active_weights = None
+                raise
 
     def _mp_opt_step(self, opt, grads_vars):
         # the native overflow-aware parameter update for the DFL
@@ -582,15 +592,37 @@ class ModelBase(object):
         # corrupt the weights; in off/bf16 the update op runs
         # directly (the exact Phase 6B/7 code path)
         if self._mp_scaler is not None:
-            self._mp_scaler.step(opt, grads_vars)
+            before = int(opt.iterations.item()) if hasattr(opt, 'iterations') else None
+            try:
+                self._mp_scaler.step(opt, grads_vars)
+            finally:
+                if hasattr(opt, '_grad_scaler_active_weights'):
+                    opt._grad_scaler_active_weights = None
+            return before is None or int(opt.iterations.item()) == before + 1
         else:
             opt.get_update_op(grads_vars)()
+            return True
 
     def _mp_scaler_update(self):
         # per optimizer-group step: overflow check + scale bookkeeping
         # (no-op for off/bf16, which carry no scaler)
         if self._mp_scaler is not None:
             self._mp_scaler.update()
+
+    def _mp_run_generator(self, closure, *args):
+        """Complete one G update, retrying finite-gradient scale overflows.
+
+        Reuses the already fetched sample. A nonfinite forward raises a
+        separate error from the closure and is never retried or recorded.
+        """
+        attempts = 16 if self._mp_scaler is not None else 1
+        for attempt in range(attempts):
+            try:
+                return closure(*args)
+            except SkippedGeneratorStep:
+                if attempt + 1 == attempts:
+                    raise FloatingPointError(
+                        f"FP16 generator update skipped {attempts} times")
 
     def train_one_iter(self):
         self._mp_ensure_resolved()

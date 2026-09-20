@@ -148,6 +148,7 @@ class OptimizerBase(torch.nn.Module, Saveable):
 
         # state bookkeeping (filled by initialize_variables)
         self._weights = []       # initialized parameters, order kept
+        self._grad_scaler_active_weights = None  # transient, never saved
         self._weight_keys = {}   # id(weight) -> stable state key
         # official sub-name for every state tensor, aligned with
         # get_weights() (after the leading 'iters:0')
@@ -254,13 +255,13 @@ class OptimizerBase(torch.nn.Module, Saveable):
 
     @property
     def param_groups(self):
-        """The torch-optimizer-shaped view of the official
-        ``_weights`` list: exactly what ``torch.amp.GradScaler``
-        (``unscale_`` / ``step``) iterates for its fp16 overflow
-        bookkeeping. No other torch optimizer API is involved — the
-        DFL update path stays ``get_update_op`` (the native
-        ``optimizer.step()`` is never called on these optimizers)."""
-        return [{'params': list(self._weights)}]
+        """Transient current-update view for GradScaler's gradient scan.
+
+        The full ``_weights`` inventory still owns the official saved
+        optimizer state, including conditionally excluded parameters.
+        """
+        weights = self._grad_scaler_active_weights
+        return [{'params': list(self._weights if weights is None else weights)}]
     # --- official get_update_op contract ---------------------------------
 
     def get_update_op(self, grads_vars):
