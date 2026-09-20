@@ -181,6 +181,7 @@ from core.leras import nn
 from core.leras.archis.AMP import exact_k_morph_mask
 from facelib import FaceType
 from models import ModelBase
+from models.ModelBase import SkippedGeneratorStep
 from samplelib import *
 
 
@@ -356,6 +357,8 @@ class AMPModel(ModelBase):
                                   d_ch=d_dims, d_mask_ch=d_mask_dims)
 
         self.encoder = model_archi.Encoder(name='encoder')
+        if self.precision == 'fp16':
+            self.encoder.res5.fp16_fp32_island = True
         self.inter_src = model_archi.Inter(name='inter_src')
         self.inter_dst = model_archi.Inter(name='inter_dst')
         self.decoder = model_archi.Decoder(name='decoder')
@@ -687,6 +690,9 @@ class AMPModel(ModelBase):
                 with self._mp_autocast():
                     f = AE_forward(t['warped_src'], t['warped_dst'])
                 f = { k: v.to(nn.floatx) for k, v in f.items() }
+                if self._mp_scaler is not None and any(
+                        not bool(torch.isfinite(v).all()) for v in f.values()):
+                    raise FloatingPointError('nonfinite AMP FP16 generator forward')
                 pred_src_src = f['pred_src_src']
                 pred_src_srcm = f['pred_src_srcm']
                 pred_dst_dst = f['pred_dst_dst']
@@ -749,6 +755,8 @@ class AMPModel(ModelBase):
                     G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_src_src)
                     G_loss = G_loss + 0.02*torch.mean(torch.square(pred_src_src_anti_masked-t['target_src_anti_masked']), dim=(1,2,3))
 
+                if self._mp_scaler is not None and not bool(torch.isfinite(G_loss).all()):
+                    raise FloatingPointError('nonfinite AMP FP16 generator loss')
                 _zero_grads([self.G_weights])
                 # Q11 (probe-verified): the official TF
                 # nn.gradients(gpu_G_loss, G_weights) on the
@@ -762,11 +770,13 @@ class AMPModel(ModelBase):
                 # Phase 7 code path — plain backward + direct
                 # update op)
                 self._mp_backward(G_loss)
-                self._mp_unscale_opt(self.src_dst_opt)
-                self._mp_opt_step(
+                self._mp_unscale_opt(self.src_dst_opt, self.G_weights)
+                stepped = self._mp_opt_step(
                     self.src_dst_opt,
                     [ (p.grad, p) for p in self.G_weights ])
                 self._mp_scaler_update()
+                if not stepped:
+                    raise SkippedGeneratorStep('AMP FP16 G gradients overflowed')
 
                 return ( src_loss_snap, dst_loss_snap )
 
@@ -949,7 +959,9 @@ class AMPModel(ModelBase):
             for p in group:
                 p.grad = None
 
-        src_loss, dst_loss = self.train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
+        src_loss, dst_loss = self._mp_run_generator(
+            self.train, warped_src, target_src, target_srcm, target_srcm_em,
+            warped_dst, target_dst, target_dstm, target_dstm_em)
 
         if self.gan_power != 0:
             self.GAN_train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)

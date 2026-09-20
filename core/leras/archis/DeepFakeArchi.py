@@ -144,11 +144,21 @@ class DeepFakeArchi(nn.ArchiBase):
             class ResidualBlock(LayerBase):
                 def __init__(self, ch, kernel_size=3, name=None):
                     super().__init__(name=name)
+                    # Runtime FP16 training may opt the late encoder block
+                    # into FP32 without changing its fp32 master weights or
+                    # checkpoint names. Other blocks keep the official path.
+                    self.fp16_fp32_island = False
                     self.conv1 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
                     self.conv2 = nn.Conv2D( ch, ch, kernel_size=kernel_size, padding='SAME', dtype=conv_dtype)
                     build_leaf_weights(self)
 
                 def forward(self, inp):
+                    if self.fp16_fp32_island and torch.is_autocast_enabled('cuda'):
+                        with torch.autocast('cuda', enabled=False):
+                            return self._forward_block(inp.float())
+                    return self._forward_block(inp)
+
+                def _forward_block(self, inp):
                     x = self.conv1(inp)
                     x = act(x, 0.2)
                     x = self.conv2(x)

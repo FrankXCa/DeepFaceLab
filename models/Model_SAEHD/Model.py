@@ -123,6 +123,7 @@ from core.interact import interact as io
 from core.leras import nn
 from facelib import FaceType
 from models import ModelBase
+from models.ModelBase import SkippedGeneratorStep
 from samplelib import *
 
 
@@ -444,6 +445,8 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
         if 'df' in archi_type:
             self.encoder = model_archi.Encoder(in_ch=input_ch, e_ch=e_dims, name='encoder')
+            if self.precision == 'fp16' and hasattr(self.encoder, 'res5'):
+                self.encoder.res5.fp16_fp32_island = True
             encoder_out_ch = self.encoder.get_out_ch()*self.encoder.get_out_res(resolution)**2
 
             self.inter = model_archi.Inter (in_ch=encoder_out_ch, ae_ch=ae_dims, ae_out_ch=ae_dims, name='inter')
@@ -464,6 +467,8 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
         elif 'liae' in archi_type:
             self.encoder = model_archi.Encoder(in_ch=input_ch, e_ch=e_dims, name='encoder')
+            if self.precision == 'fp16' and hasattr(self.encoder, 'res5'):
+                self.encoder.res5.fp16_fp32_island = True
             encoder_out_ch = self.encoder.get_out_ch()*self.encoder.get_out_res(resolution)**2
 
             self.inter_AB = model_archi.Inter(in_ch=encoder_out_ch, ae_ch=ae_dims, ae_out_ch=ae_dims*2, name='inter_AB')
@@ -839,6 +844,9 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 with self._mp_autocast():
                     f = AE_forward(t['warped_src'], t['warped_dst'])
                 f = { k: v.to(nn.floatx) for k, v in f.items() }
+                if self._mp_scaler is not None and any(
+                        not bool(torch.isfinite(v).all()) for v in f.values()):
+                    raise FloatingPointError('nonfinite SAEHD FP16 generator forward')
                 pred_src_src = f['pred_src_src']
                 pred_src_srcm = f['pred_src_srcm']
                 pred_dst_dst = f['pred_dst_dst']
@@ -923,6 +931,8 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # grads (e.g. inter_AB via the dst path) are dropped,
                 # exactly as nn.gradients(loss, trainable) computes
                 # only the listed variables' gradients
+                if self._mp_scaler is not None and not bool(torch.isfinite(G_loss).all()):
+                    raise FloatingPointError('nonfinite SAEHD FP16 generator loss')
                 _zero_grads([self.src_dst_saveable_weights])
                 # official nn.gradients(G_loss, vars) = the batch SUM
                 # over the per-sample (N,) loss vector — reproduced as
@@ -936,11 +946,13 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # Phase 7 code path — plain backward + direct
                 # update op)
                 self._mp_backward(G_loss)
-                self._mp_unscale_opt(self.src_dst_opt)
-                self._mp_opt_step(
+                self._mp_unscale_opt(self.src_dst_opt, self.src_dst_trainable_weights)
+                stepped = self._mp_opt_step(
                     self.src_dst_opt,
                     [ (p.grad, p) for p in self.src_dst_trainable_weights ])
                 self._mp_scaler_update()
+                if not stepped:
+                    raise SkippedGeneratorStep('SAEHD FP16 G gradients overflowed')
 
                 return src_loss, dst_loss
 
@@ -1136,7 +1148,9 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
             for p in group:
                 p.grad = None
 
-        src_loss, dst_loss = self._src_dst_train (warped_src, target_src, target_srcm, target_srcm_em, warped_dst, target_dst, target_dstm, target_dstm_em)
+        src_loss, dst_loss = self._mp_run_generator(
+            self._src_dst_train, warped_src, target_src, target_srcm, target_srcm_em,
+            warped_dst, target_dst, target_dstm, target_dstm_em)
 
         if self.options['true_face_power'] != 0 and not self.pretrain:
             self._D_train (warped_src, warped_dst)
