@@ -183,13 +183,33 @@ class Saveable():
         problems = []
         planned = []
         for sub_name, param in items:
-            value, matched_key = ckpt._lookup_key(d, sub_name)
-            if value is None:
+            aliases = ckpt.matching_alias_keys(d, sub_name)
+            if len(aliases) > 1:
+                problems.append(
+                    f"DUPLICATE_MAPPING: source keys {aliases} both provide "
+                    f"weight '{sub_name}' in {filename}")
+                continue
+            if not aliases:
                 problems.append(
                     f"missing weight '{sub_name}' in {filename} "
                     f"(official DFL re-initialized it silently; this project "
                     f"must not)"
                 )
+                continue
+
+            matched_key = aliases[0]
+            value = d[matched_key]
+            if sub_name == 'iters:0' and isinstance(value, (int, np.integer)):
+                value = np.asarray(value)
+            if not isinstance(value, np.ndarray):
+                problems.append(
+                    f"corrupt weight '{sub_name}' in {filename}: expected "
+                    f"numpy array, got {type(value).__name__}")
+                continue
+            dtype_error = ckpt.dtype_mismatch_text(
+                value.dtype, param.dtype, allow_int_widening=sub_name == 'iters:0')
+            if dtype_error is not None:
+                problems.append(f"{dtype_error} (weight '{sub_name}')")
                 continue
 
             value = self.convert_weight_layout(value, param)

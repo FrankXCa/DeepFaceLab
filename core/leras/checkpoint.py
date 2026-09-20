@@ -32,6 +32,9 @@ Original DFL → Modernized DFL → train/save → official-compatible export
 → Original/reference DFL).
 """
 
+import numpy as np
+import torch
+
 
 class CheckpointLoadError(Exception):
     """Raised when a checkpoint cannot be loaded STRICTLY.
@@ -86,3 +89,33 @@ def _lookup_key(d, key):
     if alt in d:
         return d[alt], alt
     return None, None
+
+
+def matching_alias_keys(d, key):
+    """All present spellings of one declared `:0` checkpoint name."""
+    alt = key[:-2] if key.endswith(':0') else key + ':0'
+    return [candidate for candidate in (key, alt) if candidate in d]
+
+
+_NP_TO_TORCH_DTYPE = {
+    np.dtype(np.float32): torch.float32,
+    np.dtype(np.float16): torch.float16,
+    np.dtype(np.float64): torch.float64,
+    np.dtype(np.int32): torch.int32,
+    np.dtype(np.int64): torch.int64,
+    np.dtype(np.uint8): torch.uint8,
+    np.dtype(np.bool_): torch.bool,
+}
+
+
+def dtype_mismatch_text(value_dtype, param_dtype, allow_int_widening=False):
+    """Exact dtype, except declared int32 -> int64 optimizer `iters`."""
+    dt = np.dtype(value_dtype)
+    if _NP_TO_TORCH_DTYPE.get(dt) == param_dtype:
+        return None
+    if allow_int_widening and dt == np.dtype(np.int32) and param_dtype == torch.int64:
+        return None
+    return (
+        f"DTYPE_MISMATCH: source dtype {dt.name} is not representable "
+        f"in the target dtype {param_dtype} (no silent coercion)"
+    )

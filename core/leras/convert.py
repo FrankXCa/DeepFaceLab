@@ -150,17 +150,7 @@ ERR_INVALID_LAYOUT = "INVALID_LAYOUT"
 
 _WEIGHT_STATE_PREFIXES = ("ms_", "vs_", "acc_")
 
-# np dtype -> torch dtype for the strict dtype policy
-_NP_TO_TORCH_DTYPE = {
-    np.dtype(np.float32): torch.float32,
-    np.dtype(np.float16): torch.float16,
-    np.dtype(np.float64): torch.float64,
-    np.dtype(np.int32): torch.int32,
-    np.dtype(np.int64): torch.int64,
-    np.dtype(np.uint8): torch.uint8,
-    np.dtype(np.bool_): torch.bool,
-}
-# declared exact integer widening for the iteration counter: official
+# Declared exact integer widening for the iteration counter: official
 # TF stored ``iters`` as int32, the torch implementation keeps it as
 # int64 (torch.long) — value-exact, reported, not a silent cast
 _ITERS_INT_WIDENING = {np.dtype(np.int32): torch.int64}
@@ -484,19 +474,10 @@ def _as_contig(arr):
     return np.ascontiguousarray(arr)
 
 
-def _dtype_mismatch_text(value_dtype, param_dtype):
+def _dtype_mismatch_text(value_dtype, param_dtype, allow_int_widening=False):
     """Strict dtype policy: exact match, or the declared iters
     int32->int64 widening. Returns None on match, else the error text."""
-    dt = np.dtype(value_dtype)
-    if param_dtype == _NP_TO_TORCH_DTYPE.get(dt):
-        return None
-    if dt in _ITERS_INT_WIDENING and _ITERS_INT_WIDENING[dt] == param_dtype:
-        return None
-    return (
-        f"{ERR_DTYPE_MISMATCH}: source dtype {dt.name} is not "
-        f"representable in the target dtype {param_dtype} (no silent "
-        f"coercion)"
-    )
+    return ckpt.dtype_mismatch_text(value_dtype, param_dtype, allow_int_widening)
 
 
 # --- official -> torch (weights) ------------------------------------------
@@ -556,10 +537,14 @@ def convert_official_to_torch(saveable, d, component=None):
             owners[id(b)] = type(module)
 
     def _lookup_sub(sub_name):
-        value, matched_key = ckpt._lookup_key(d, sub_name)
-        if value is None and scope:
-            value, matched_key = ckpt._lookup_key(d, f"{scope}/{sub_name}")
-        return value, matched_key
+        aliases = ckpt.matching_alias_keys(d, sub_name)
+        if scope:
+            aliases += ckpt.matching_alias_keys(d, f"{scope}/{sub_name}")
+        if len(aliases) > 1:
+            report.errors.append(
+                f"{ERR_DUPLICATE_MAPPING}: source keys {aliases} both provide "
+                f"weight '{sub_name}' (refusing to choose an alias)")
+        return (d[aliases[0]], aliases[0]) if aliases else (None, None)
 
     key_consumers = {}
     planned = []
@@ -588,7 +573,8 @@ def convert_official_to_torch(saveable, d, component=None):
             continue
         key_consumers[matched_key] = sub_name
 
-        dt_err = _dtype_mismatch_text(value.dtype, param.dtype)
+        dt_err = _dtype_mismatch_text(
+            value.dtype, param.dtype, allow_int_widening=sub_name == 'iters:0')
         if dt_err is not None:
             report.errors.append(f"{dt_err} (weight '{sub_name}')")
             continue
@@ -894,7 +880,8 @@ def convert_optimizer_state_official_to_torch(optimizer, d, saveable=None,
                 f"(or a bare int, the official newer-build format)"
             )
         else:
-            dt_err = _dtype_mismatch_text(iters_value.dtype, iters_param.dtype)
+            dt_err = _dtype_mismatch_text(
+                iters_value.dtype, iters_param.dtype, allow_int_widening=True)
             if dt_err is not None:
                 report.errors.append(f"{dt_err} (iters:0)")
             elif iters_value.size != 1:
