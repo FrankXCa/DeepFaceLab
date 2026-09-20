@@ -39,6 +39,10 @@ class SampleGeneratorFaceTemporal(SampleGeneratorBase):
         mult_max = 1
         l = samples_len - ( (self.temporal_image_count)*mult_max - (mult_max-1)  )
         index_host = mplib.IndexHost(l+1)
+        # keep the host reachable from the instance so close() can stop
+        # its helper thread deterministically (same contract as
+        # SampleGeneratorFace)
+        self.index_host = index_host
 
         pickled_samples = pickle.dumps(samples, 4)
         if self.debug:

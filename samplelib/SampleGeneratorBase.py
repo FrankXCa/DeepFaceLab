@@ -15,6 +15,30 @@ class SampleGeneratorBase(object):
     def set_active(self, is_active):
         self.active = is_active
 
+    def close(self):
+        # Deterministic shutdown of everything this sample generator
+        # owns. Order matters: first the index-host helper threads
+        # (they keep writing index results into queues whose readers
+        # are the worker processes — they must stop while those
+        # workers are still alive and draining, otherwise this
+        # process can be left with queued writes to pipes whose
+        # reader is gone, and the interpreter shutdown hangs on them).
+        # Then the generators themselves (subprocess generators ask
+        # their worker process to exit, falling back to terminate +
+        # join; in-process ones have a no-op close). Called by the
+        # model teardown (ModelBase.finalize) so a session can never
+        # leave owned worker processes behind.
+        for host in (getattr(self, 'index_host', None),
+                     getattr(self, 'ct_index_host', None)):
+            if host is not None:
+                try:
+                    host.stop()
+                except Exception:
+                    pass
+        for generator in (getattr(self, 'generators', None) or []):
+            generator.close()
+        self.active = False
+
     def generate_next(self):
         if not self.active and self.last_generation is not None:
             return self.last_generation

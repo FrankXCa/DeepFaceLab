@@ -14,3 +14,8 @@ class ThisThreadGenerator(object):
             self.generator_func = self.generator_func(self.user_param)
 
         return next(self.generator_func)
+
+    def close(self):
+        # In-process generator: the same shutdown contract as
+        # SubprocessGenerator with nothing to stop.
+        pass

@@ -662,6 +662,18 @@ class ModelBase(object):
         self.generate_next_samples()
 
     def finalize(self):
+        # Deterministic teardown of every OS process this model
+        # owns: the preview-history writer (spawned on the first
+        # preview post when write_preview_history is on) and the
+        # training sample generators (subprocess workers when not
+        # in debug mode). Python reaps daemon children only on a
+        # clean interpreter exit, so without these closes a
+        # crashed / killed session leaves them orphaned.
+        writer = getattr(self, 'preview_history_writer', None)
+        if writer is not None:
+            writer.close()
+        for generator in (getattr(self, 'generator_list', None) or []):
+            generator.close()
         nn.close_session()
 
     def enable_default_options_autosave(self):
@@ -828,8 +840,15 @@ class PreviewHistoryWriter():
 
     def process(self, sq):
         while True:
+            closed = False
             while not sq.empty():
-                plist, loss_history, iter = sq.get()
+                item = sq.get()
+                if item is None:
+                    # the host's close() sentinel: finish this
+                    # item's drain and exit the writer process
+                    closed = True
+                    break
+                plist, loss_history, iter = item
 
                 preview_lh_cache = {}
                 for preview, filepath in plist:
@@ -846,10 +865,47 @@ class PreviewHistoryWriter():
                     filepath.parent.mkdir(parents=True, exist_ok=True)
                     cv2_imwrite (filepath, img )
 
+            if closed:
+                break
             time.sleep(0.01)
 
     def post(self, plist, loss_history, iter):
         self.sq.put ( (plist, loss_history, iter) )
+
+    def close(self):
+        # Deterministic shutdown of the writer process this model
+        # owns (idempotent): a graceful None sentinel first (the
+        # child exits after its current item), then a bounded
+        # terminate fallback if the child is stuck. Without this,
+        # the daemon process is only reaped when the host
+        # interpreter exits cleanly, and a crashed / killed / hung
+        # session orphans it (it keeps spinning and pinning its
+        # queues).
+        p = self.p
+        if p is None:
+            return
+        self.p = None
+        if p.is_alive():
+            try:
+                self.sq.put ( None )
+            except Exception:
+                pass
+            deadline = time.time() + 5
+            while p.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
+            if p.is_alive():
+                p.terminate()
+            p.join(10)
+        try:
+            # Never let the interpreter shutdown join this queue's
+            # feeder thread: if it is still blocked in a pipe write
+            # to a worker that is already gone, the join would hang
+            # the process forever. The feeder is a daemon thread and
+            # is simply abandoned at exit.
+            self.sq.cancel_join_thread()
+            self.sq.close()
+        except Exception:
+            pass
 
     # disable pickling
     def __getstate__(self):

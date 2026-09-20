@@ -28,6 +28,8 @@ class IndexHost():
         while True:
             while not sq.empty():
                 obj = sq.get()
+                if obj is None:
+                    return
                 cq_id, count = obj[0], obj[1]
 
                 result = []
@@ -36,9 +38,42 @@ class IndexHost():
                         shuffle_idxs = idxs.copy()
                         rnd_state.shuffle(shuffle_idxs)
                     result.append(shuffle_idxs.pop())
-                self.cqs[cq_id].put (result)
+                try:
+                    self.cqs[cq_id].put (result)
+                except Exception:
+                    return
 
             time.sleep(0.001)
+
+    def stop(self, timeout=5):
+        # Deterministically stop the host thread and close every queue
+        # it uses, so neither can outlive the owner (a host thread
+        # still polling into interpreter shutdown, or a queue feeder
+        # still writing to a worker process that is already gone,
+        # can wedge the shutdown forever). The thread first drains the
+        # requests still queued for it — its counterpart (the worker
+        # process reading the cqs) must therefore still be alive when
+        # this is called — then exits on the None sentinel.
+        # Idempotent.
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
+        try:
+            self.sq.put(None)
+        except Exception:
+            pass
+        self.thread.join(timeout)
+        for q in [self.sq] + self.cqs:
+            try:
+                # Never let interpreter shutdown join this queue's
+                # (possibly stuck) feeder thread — see IndexHost.stop
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
 
     def create_cli(self):
         cq = multiprocessing.Queue()
@@ -96,6 +131,8 @@ class Index2DHost():
         while True:
             while not sq.empty():
                 obj = sq.get()
+                if obj is None:
+                    return
                 cq_id, count = obj[0], obj[1]
 
                 result = []
@@ -125,9 +162,38 @@ class Index2DHost():
 
                     result.append( indexes2D[idx_1D][idx_2D])
 
-                self.cqs[cq_id].put (result)
+                try:
+                    self.cqs[cq_id].put (result)
+                except Exception:
+                    return
 
             time.sleep(0.001)
+
+    def stop(self, timeout=5):
+        # Deterministically stop the host thread and close every queue
+        # it uses (see IndexHost.stop for the contract: the
+        # counterpart reading the cqs must still be alive when this is
+        # called; the thread drains pending requests, then exits on
+        # the None sentinel; idempotent).
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
+        try:
+            self.sq.put(None)
+        except Exception:
+            pass
+        self.thread.join(timeout)
+        for q in [self.sq] + self.cqs:
+            try:
+                # Never let interpreter shutdown join this queue's
+                # (possibly stuck) feeder thread — see IndexHost.stop
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
 
     def create_cli(self):
         cq = multiprocessing.Queue()
@@ -170,27 +236,55 @@ class ListHost():
         while True:
             while not sq.empty():
                 obj = sq.get()
+                if obj is None:
+                    return
                 cq_id, cmd = obj[0], obj[1]
 
-                if cmd == 0:
-                    self.cqs[cq_id].put ( len(self.m_list) )
-                elif cmd == 1:
-                    idx = obj[2]
-                    item = self.m_list[idx ]
-                    self.cqs[cq_id].put ( item )
-                elif cmd == 2:
-                    result = []
-                    for item in obj[2]:
-                        result.append ( self.m_list[item] )
-                    self.cqs[cq_id].put ( result )
-                elif cmd == 3:
-                    self.m_list.insert(obj[2], obj[3])
-                elif cmd == 4:
-                    self.m_list.append(obj[2])
-                elif cmd == 5:
-                    self.m_list.extend(obj[2])
+                try:
+                    if cmd == 0:
+                        self.cqs[cq_id].put ( len(self.m_list) )
+                    elif cmd == 1:
+                        idx = obj[2]
+                        item = self.m_list[idx ]
+                        self.cqs[cq_id].put ( item )
+                    elif cmd == 2:
+                        result = []
+                        for item in obj[2]:
+                            result.append ( self.m_list[item] )
+                        self.cqs[cq_id].put ( result )
+                    elif cmd == 3:
+                        self.m_list.insert(obj[2], obj[3])
+                    elif cmd == 4:
+                        self.m_list.append(obj[2])
+                    elif cmd == 5:
+                        self.m_list.extend(obj[2])
+                except Exception:
+                    return
 
             time.sleep(0.005)
+
+    def stop(self, timeout=5):
+        # Deterministically stop the host thread and close every queue
+        # it uses (see IndexHost.stop for the contract; idempotent).
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
+        try:
+            self.sq.put(None)
+        except Exception:
+            pass
+        self.thread.join(timeout)
+        for q in [self.sq] + self.cqs:
+            try:
+                # Never let interpreter shutdown join this queue's
+                # (possibly stuck) feeder thread — see IndexHost.stop
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
 
     def create_cli(self):
         cq = multiprocessing.Queue()
@@ -264,14 +358,45 @@ class DictHost():
             for sq, cq in zip(self.sqs, self.cqs):
                 if not sq.empty():
                     obj = sq.get()
+                    if obj is None:
+                        return
                     cmd = obj[0]
                     if cmd == 0:
-                        cq.put (d[ obj[1] ])
+                        try:
+                            cq.put (d[ obj[1] ])
+                        except Exception:
+                            return
                     elif cmd == 1:
-                        cq.put ( list(d.keys()) )
+                        try:
+                            cq.put ( list(d.keys()) )
+                        except Exception:
+                            return
 
             time.sleep(0.005)
 
+    def stop(self, timeout=5):
+        # Deterministically stop the host thread and close every queue
+        # it uses (see IndexHost.stop for the contract; idempotent).
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
+        for sq in self.sqs:
+            try:
+                sq.put(None)
+            except Exception:
+                pass
+        self.thread.join(timeout)
+        for q in self.sqs + self.cqs:
+            try:
+                # Never let interpreter shutdown join this queue's
+                # (possibly stuck) feeder thread — see IndexHost.stop
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
 
     def get_cli(self, n_user):
         return self.clis[n_user]

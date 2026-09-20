@@ -84,6 +84,12 @@ class SampleGeneratorFace(SampleGeneratorBase):
             ct_samples = None
             ct_index_host = None
 
+        # Keep the host objects the instance owns (their daemon
+        # threads and queues must be shut down by close() through
+        # these references; see SampleGeneratorBase.close)
+        self.index_host = index_host
+        self.ct_index_host = ct_index_host
+
         if self.debug:
             self.generators = [ThisThreadGenerator ( self.batch_func, (samples, index_host.create_cli(), ct_samples, ct_index_host.create_cli() if ct_index_host is not None else None) )]
         else:
