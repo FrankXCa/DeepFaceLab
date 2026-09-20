@@ -529,6 +529,108 @@ def test_dtype_mismatch_fails():
     assert "float16" in ei.value.args[0]
 
 
+def test_runtime_dtype_and_aliases_are_strict_and_atomic(plain_tmp):
+    init_cpu()
+    source = _fresh_conv()
+    path = Path(plain_tmp) / 'strict_component.npy'
+    source.save_weights(path)
+    canonical = pickle.loads(path.read_bytes())
+
+    def fresh():
+        return _fresh_conv()
+
+    def check(payload, accepted, error=None):
+        path.write_bytes(pickle.dumps(payload, 4))
+        runtime = fresh()
+        converter = fresh()
+        before_runtime = [p.detach().clone() for p in runtime.parameters()]
+        before_converter = [p.detach().clone() for p in converter.parameters()]
+        if accepted:
+            assert runtime.load_weights(path) is True
+            assert cv.convert_official_to_torch(converter, payload).result == 'PASS'
+            for a, b in zip(runtime.parameters(), converter.parameters()):
+                assert torch.equal(a, b)
+        else:
+            with pytest.raises(dfl_ckpt.CheckpointLoadError, match=error):
+                runtime.load_weights(path)
+            with pytest.raises(dfl_ckpt.CheckpointLoadError, match=error):
+                cv.convert_official_to_torch(converter, payload)
+            assert all(torch.equal(a, b) for a, b in
+                       zip(before_runtime, runtime.parameters()))
+            assert all(torch.equal(a, b) for a, b in
+                       zip(before_converter, converter.parameters()))
+
+    check(canonical, True)
+    alias = dict(canonical)
+    alias['weight'] = alias.pop('weight:0')
+    check(alias, True)
+    wrong_dtype = dict(canonical)
+    wrong_dtype['weight:0'] = np.full_like(
+        wrong_dtype['weight:0'], 0.125).astype(np.float16)
+    check(wrong_dtype, False, 'DTYPE_MISMATCH')
+    conflicting = dict(canonical)
+    conflicting['weight'] = conflicting['weight:0'] + 1
+    check(conflicting, False, 'DUPLICATE_MAPPING')
+    identical = dict(canonical)
+    identical['weight'] = identical['weight:0'].copy()
+    check(identical, False, 'DUPLICATE_MAPPING')
+
+    # The converter also accepts explicitly scoped official names, but
+    # a scoped/unscoped pair may never select a winner implicitly.
+    scoped = {f'c/{key}': value for key, value in canonical.items()}
+    assert cv.convert_official_to_torch(fresh(), scoped).result == 'PASS'
+    scoped['weight:0'] = canonical['weight:0'].copy()
+    with pytest.raises(dfl_ckpt.CheckpointLoadError, match='DUPLICATE_MAPPING'):
+        cv.convert_official_to_torch(fresh(), scoped)
+
+
+def test_runtime_optimizer_iters_int32_widening(plain_tmp):
+    init_cpu()
+    _, params = _bound_conv()
+    opt = dfl_nn.AdaBelief(name='opt', lr=0.01)
+    opt.initialize_variables(params, vars_on_cpu=True)
+    _two_steps(opt, params)
+    path = Path(plain_tmp) / 'int32_iters.npy'
+    opt.save_weights(path)
+    state = pickle.loads(path.read_bytes())
+    state['iters:0'] = state['iters:0'].astype(np.int32)
+    path.write_bytes(pickle.dumps(state, 4))
+    _, new_params = _bound_conv()
+    loaded = dfl_nn.AdaBelief(name='loaded', lr=0.01)
+    loaded.initialize_variables(new_params, vars_on_cpu=True)
+    assert loaded.load_weights(path) is True
+    assert int(loaded.iterations) == int(opt.iterations)
+
+    state['iters:0'] = int(opt.iterations)
+    path.write_bytes(pickle.dumps(state, 4))
+    _, bare_params = _bound_conv()
+    bare_loaded = dfl_nn.AdaBelief(name='bare_loaded', lr=0.01)
+    bare_loaded.initialize_variables(bare_params, vars_on_cpu=True)
+    assert bare_loaded.load_weights(path) is True
+    assert int(bare_loaded.iterations) == int(opt.iterations)
+
+
+def test_int32_widening_is_limited_to_optimizer_iters(plain_tmp):
+    init_cpu()
+
+    class PlainCounter(torch.nn.Module, dfl_nn.Saveable):
+        def __init__(self):
+            super().__init__()
+            dfl_nn.Saveable.__init__(self, name='counter')
+            self.register_buffer('count', torch.zeros((), dtype=torch.int64))
+
+    payload = {'count:0': np.asarray(3, dtype=np.int32)}
+    path = Path(plain_tmp) / 'wrong_counter_dtype.npy'
+    path.write_bytes(pickle.dumps(payload, 4))
+    runtime = PlainCounter()
+    converter = PlainCounter()
+    with pytest.raises(dfl_ckpt.CheckpointLoadError, match='DTYPE_MISMATCH'):
+        runtime.load_weights(path)
+    with pytest.raises(dfl_ckpt.CheckpointLoadError, match='DTYPE_MISMATCH'):
+        cv.convert_official_to_torch(converter, payload)
+    assert int(runtime.count) == int(converter.count) == 0
+
+
 def test_ambiguous_mapping_fails():
     # a saveable whose enumeration contains BOTH ':0' variants of the
     # same logical key; one source key serves both -> ambiguous

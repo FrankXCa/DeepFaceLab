@@ -313,19 +313,25 @@ def test_style_moments_formula_unit():
     involved: the op is layout-aware and runs under a restored
     NCHW state (see nn_nchw_state)."""
     with nn_nchw_state():
-        torch.manual_seed(0)
-        t = torch.rand(1, 2, 4, 4)
-        s = torch.rand(1, 2, 4, 4)
+        t = torch.zeros(1, 2, 4, 4)
+        s = torch.zeros_like(t)
+        s[0, 0, 0, 0] = 0.02
+        s[0, 1, 0, 0] = 0.04
         out = leras_ops.style_loss(t, s, gaussian_blur_radius=0.0, loss_weight=1.0)
     per_ch = []
     for c in range(2):
         tc, sc = t[0, c], s[0, c]
         tm, sm = tc.mean(), sc.mean()
-        tv = ((tc - tm).pow(2).mean()).sqrt()
-        sv = ((sc - sm).pow(2).mean()).sqrt()
+        tv = ((tc - tm).pow(2).mean() + 1e-5).sqrt()
+        sv = ((sc - sm).pow(2).mean() + 1e-5).sqrt()
         per_ch.append((tm - sm) ** 2 + (tv - sv) ** 2)
     expected = sum(per_ch) / 2  # loss_weight / C
-    assert torch.allclose(out.reshape(-1)[0], expected, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(out.reshape(-1)[0], expected, rtol=1e-6, atol=1e-9)
+    wrong_no_epsilon = sum(
+        (t[0, c].mean() - s[0, c].mean()) ** 2 +
+        (t[0, c].std(unbiased=False) - s[0, c].std(unbiased=False)) ** 2
+        for c in range(2)) / 2
+    assert abs(float(out.reshape(-1)[0] - wrong_no_epsilon)) > 1e-6
 
 
 def test_bg_style_is_not_the_moments_op_unit():

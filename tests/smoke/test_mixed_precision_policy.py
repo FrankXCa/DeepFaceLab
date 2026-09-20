@@ -300,17 +300,20 @@ def test_precision_is_a_runtime_channel_not_an_option(tmp_path):
 
 
 def test_no_extra_files_after_bf16_training(tmp_path):
-    """a bf16 training step writes NOTHING new: no
-    torch_amp_state.npy, no precision state file, no new
-    bookkeeping — the mode leaves no trace on disk."""
+    """BF16 creates no precision checkpoint state; previews may be async."""
     model = construct_prec(tmp_path, MODE_BF16)
-    files_before = { str(p.relative_to(tmp_path))
-                     for p in Path(tmp_path).rglob('*') if p.is_file() }
+    checkpoint_suffixes = {'.npy', '.dat', '.pth'}
+    files_before = {str(p.relative_to(tmp_path))
+                    for p in Path(tmp_path).rglob('*')
+                    if p.is_file() and p.suffix in checkpoint_suffixes}
     model.train_one_iter()
     model.train_one_iter()
-    files_after = { str(p.relative_to(tmp_path))
-                    for p in Path(tmp_path).rglob('*') if p.is_file() }
+    files_after = {str(p.relative_to(tmp_path))
+                   for p in Path(tmp_path).rglob('*')
+                   if p.is_file() and p.suffix in checkpoint_suffixes}
     assert files_after == files_before
+    assert all('precision' not in p.lower() and 'torch_amp' not in p.lower()
+               for p in files_after)
 
 
 def test_checkpoint_mode_independent_and_keys_invariant(tmp_path_factory):

@@ -454,21 +454,26 @@ def test_no_direct_torch_cuda_in_migrated_sources():
                     pytest.fail(f"direct torch.cuda.* in {path}: torch.{'.'.join(reversed(chain))}")
 
 
-def test_no_autocast_or_bf16_in_morph_archi():
-    # the Phase 7 exclusion: NO Automatic Mixed Precision policy in the
-    # foundation (the use_fp16 knob is the official export-only dtype
-    # handling only)
+def test_only_declared_fp16_res5_island_in_morph_archi():
+    # Phase 8 permits one model-opted FP32 island for the late encoder
+    # residual block. The factory still has no standalone AMP policy.
     path = REPO_ROOT / "core" / "leras" / "archis" / "AMP.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            chain = []
-            cur = node
-            while isinstance(cur, ast.Attribute):
-                chain.append(cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name) and cur.id == "torch" and "autocast" in chain:
-                pytest.fail(f"torch.autocast in {path}")
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == 'torch'
+             and node.func.attr == 'autocast']
+    assert len(calls) == 1
+    assert len(calls[0].args) == 1
+    assert isinstance(calls[0].args[0], ast.Constant)
+    assert calls[0].args[0].value == 'cuda'
+    assert len(calls[0].keywords) == 1
+    assert calls[0].keywords[0].arg == 'enabled'
+    assert isinstance(calls[0].keywords[0].value, ast.Constant)
+    assert calls[0].keywords[0].value.value is False
     text = path.read_text(encoding="utf-8")
+    assert 'self.fp16_fp32_island = False' in text
     assert "bfloat16" not in text
     assert "GradScaler" not in text

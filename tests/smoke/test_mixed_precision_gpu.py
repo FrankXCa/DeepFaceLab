@@ -225,18 +225,45 @@ def _tiny_run(model, mode, iters, tag, master_lists_fn):
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     step_times = []
-    for i in range(iters):
-        t0 = time.time()
-        model.train_one_iter()
-        torch.cuda.synchronize()
-        step_times.append(time.time() - t0)
-        row = model.loss_history[-1]
-        assert len(row) >= 1
-        for v in row:
-            assert math.isfinite(v), (mode, i, row)
-            # the FP32 loss island: the recorded losses are fp32
-            # scalars (python float) in every mode
-            assert isinstance(v, float)
+    forward_dtypes = []
+    loss_dtypes = []
+    first_conv = next(layer for layer in model.encoder.modules()
+                      if isinstance(layer, dfl_nn.Conv2D))
+    handle = first_conv.register_forward_hook(
+        lambda _module, _inputs, output: forward_dtypes.append(
+            (output.dtype, torch.is_autocast_enabled('cuda'))))
+    closure_name = '_src_dst_train' if tag == 'saehd' else 'train'
+    original_closure = getattr(model, closure_name)
+
+    def observed_closure(*args):
+        losses = original_closure(*args)
+        loss_dtypes.extend(x.dtype for x in losses)
+        return losses
+
+    setattr(model, closure_name, observed_closure)
+    try:
+        for i in range(iters):
+            opt_before = int(model.src_dst_opt.iterations)
+            iter_before = model.iter
+            t0 = time.time()
+            model.train_one_iter()
+            torch.cuda.synchronize()
+            step_times.append(time.time() - t0)
+            assert int(model.src_dst_opt.iterations) == opt_before + 1
+            assert model.iter == iter_before + 1
+            row = model.loss_history[-1]
+            assert len(row) >= 1
+            assert all(math.isfinite(v) for v in row), (mode, i, row)
+    finally:
+        handle.remove()
+        setattr(model, closure_name, original_closure)
+    expected_forward = (torch.float16 if mode == MODE_FP16 else
+                        torch.bfloat16 if mode == MODE_BF16 else torch.float32)
+    training_forwards = [dtype for dtype, in_autocast in forward_dtypes
+                         if in_autocast or mode == MODE_OFF]
+    assert training_forwards and all(
+        x == expected_forward for x in training_forwards)
+    assert loss_dtypes and all(x == torch.float32 for x in loss_dtypes)
     _assert_master_fp32(model, master_lists_fn(model))
     _vram_report(f"tiny_{tag}_{mode}", step_times)
     last = model.loss_history[-1]
@@ -354,6 +381,78 @@ def test_fp16_scaler_overflow_nan_skip_gpu(tmp_path):
     assert opt.stepped is True
     model._mp_scaler_update()
     print("FP16 NaN-SKIP (native GradScaler on the DFL update op) PASS")
+
+
+@requires_gpu
+def test_fp16_adabelief_active_scope_and_overflow_gpu(tmp_path):
+    """Actual liae/no-warp AdaBelief ignores excluded inter_AB gradients."""
+    dfl_nn.initialize_main_env()
+    saehd_make_training_dirs(Path(tmp_path))
+    model = make_saehd(
+        SAEHDHeadless, tmp_path, is_training=True,
+        seed=seed(random_warp=False, **TINY), debug=True,
+        force_gpu_idxs=[0], precision=MODE_FP16)
+    model._mp_ensure_resolved()
+    opt = model.src_dst_opt
+    intended = model.src_dst_trainable_weights[0]
+    excluded = model.inter_AB.get_weights()[0]
+    assert all(excluded is not p for p in model.src_dst_trainable_weights)
+    assert any(excluded is p for p in opt._weights)
+    scaler = model._mp_scaler
+    scaler.scale(torch.ones((), device='cuda'))  # initialize native scale
+    scale = scaler.get_scale()
+    intended.grad = torch.full_like(intended, scale * 0.01)
+    excluded.grad = torch.full_like(excluded, float('inf'))
+    before = intended.detach().clone()
+    iter_before = int(opt.iterations)
+    model._mp_unscale_opt(opt, [intended])
+    assert model._mp_opt_step(opt, [(intended.grad, intended)]) is True
+    model._mp_scaler_update()
+    assert int(opt.iterations) == iter_before + 1
+    assert not torch.equal(intended, before)
+    assert opt._grad_scaler_active_weights is None
+
+    intended.grad = torch.full_like(intended, float('inf'))
+    excluded.grad = torch.full_like(excluded, float('inf'))
+    state_before = [x.detach().clone() for x in opt.get_weights()]
+    weight_before = intended.detach().clone()
+    scale_before = scaler.get_scale()
+    model._mp_unscale_opt(opt, [intended])
+    assert model._mp_opt_step(opt, [(intended.grad, intended)]) is False
+    model._mp_scaler_update()
+    assert int(opt.iterations) == iter_before + 1
+    assert torch.equal(intended, weight_before)
+    assert all(torch.equal(a, b) for a, b in zip(state_before, opt.get_weights()))
+    assert scaler.get_scale() < scale_before
+    assert opt._grad_scaler_active_weights is None
+
+
+@requires_gpu
+def test_fp16_nonfinite_forward_aborts_before_bookkeeping_or_gan_gpu(tmp_path):
+    """A nonfinite G forward cannot record an iteration or run the GAN."""
+    dfl_nn.initialize_main_env()
+    saehd_make_training_dirs(Path(tmp_path))
+    model = make_saehd(
+        SAEHDHeadless, tmp_path, is_training=True,
+        seed=seed(gan_power=0.05, **TINY), debug=True,
+        force_gpu_idxs=[0], precision=MODE_FP16)
+    model._mp_ensure_resolved()
+    before = (model.iter, len(model.loss_history),
+              int(model.src_dst_opt.iterations),
+              int(model.D_src_dst_opt.iterations))
+    params = [p.detach().clone() for p in model.src_dst_trainable_weights]
+    handle = model.encoder.register_forward_hook(
+        lambda _module, _inputs, output: torch.full_like(output, float('nan')))
+    try:
+        with pytest.raises(FloatingPointError, match='nonfinite SAEHD FP16'):
+            model.train_one_iter()
+    finally:
+        handle.remove()
+    assert (model.iter, len(model.loss_history),
+            int(model.src_dst_opt.iterations),
+            int(model.D_src_dst_opt.iterations)) == before
+    assert all(torch.equal(a, b) for a, b in
+               zip(params, model.src_dst_trainable_weights))
 
 
 # ======================================================================
@@ -687,7 +786,30 @@ def test_real_saehd_fp16_one_step_cuda(tmp_path_factory, monkeypatch):
 
     # 3 + 4: one mixed-precision training iteration on REAL data
     before = [w.detach().clone() for w in model.src_dst_trainable_weights]
-    model.train_one_iter()
+    iter_before = model.iter
+    history_before = len(model.loss_history)
+    g_before = int(model.src_dst_opt.iterations)
+    code_before = (int(model.D_code_opt.iterations)
+                   if model.options['true_face_power'] != 0 else None)
+    gan_before = (int(model.D_src_dst_opt.iterations)
+                  if model.gan_power != 0 else None)
+    res5_dtypes = []
+    handle = model.encoder.res5.register_forward_hook(
+        lambda _module, _inputs, output: res5_dtypes.append(
+            (output.dtype, torch.is_autocast_enabled('cuda'))))
+    try:
+        model.train_one_iter()
+    finally:
+        handle.remove()
+    assert any(dtype == torch.float32 and in_autocast
+               for dtype, in_autocast in res5_dtypes)
+    assert model.iter == iter_before + 1
+    assert len(model.loss_history) == history_before + 1
+    assert int(model.src_dst_opt.iterations) == g_before + 1
+    if code_before is not None:
+        assert int(model.D_code_opt.iterations) == code_before + 1
+    if gan_before is not None:
+        assert int(model.D_src_dst_opt.iterations) == gan_before + 1
     row = model.loss_history[-1]
     for v in row:
         assert math.isfinite(v), row
@@ -708,11 +830,20 @@ def test_real_saehd_fp16_one_step_cuda(tmp_path_factory, monkeypatch):
                         debug=True, force_gpu_idxs=[0],
                         precision=MODE_FP16)
     assert m2.iter == model.iter
+    for name in ('src_dst_opt',) + \
+            (('D_code_opt',) if code_before is not None else ()) + \
+            (('D_src_dst_opt',) if gan_before is not None else ()):
+        old_opt, new_opt = getattr(model, name), getattr(m2, name)
+        assert int(new_opt.iterations) == int(old_opt.iterations)
+        assert all(torch.equal(a, b) for a, b in
+                   zip(old_opt.get_weights(), new_opt.get_weights()))
     for a, b in zip(model.src_dst_trainable_weights,
                     m2.src_dst_trainable_weights):
         assert torch.equal(a.detach(), b.detach())
+    resumed_g_before = int(m2.src_dst_opt.iterations)
     m2.train_one_iter()
     assert m2.iter == model.iter + 1
+    assert int(m2.src_dst_opt.iterations) == resumed_g_before + 1
     row2 = m2.loss_history[-1]
     for v in row2:
         assert math.isfinite(v)

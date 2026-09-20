@@ -564,7 +564,7 @@ def headless_io(monkeypatch):
     monkeypatch.setattr(io, "input_in_time", lambda s, t: False)
 
 
-def _real_model(root, is_training=True):
+def _real_model(root, is_training=True, precision='off'):
     """Construct the REAL AMPModel on CUDA device 0 (resume mode:
     the caller pre-seeds/copies the file set first)."""
     dfl_nn.initialize_main_env()
@@ -579,6 +579,7 @@ def _real_model(root, is_training=True):
         force_model_class_name='test_AMP',
         debug=True,
         force_gpu_idxs=[0],
+        precision=precision,
     )
 
 
@@ -776,7 +777,8 @@ def test_real_ckpt_path_b_real_samples(tmp_path, headless_io):
 @requires_gpu
 @requires_real_ckpt
 @requires_real_faceset
-def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io):
+@pytest.mark.parametrize('precision', ['off', 'bf16', 'fp16'])
+def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io, precision):
     """PATH C — one-step real training: strict resume of the
     official checkpoint, one real iteration (finite losses,
     encoder/decoder updated, inter bit-identical, both optimizer
@@ -790,7 +792,7 @@ def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io):
     _copy_ckpt(root, ckpt)
     _copy_faceset(root, faceset)
 
-    model = _real_model(root, is_training=True)
+    model = _real_model(root, is_training=True, precision=precision)
     torch.cuda.synchronize()
 
     # the update-set snapshots (CPU copies; GPU stays clean)
@@ -809,7 +811,18 @@ def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io):
                       if has_gan else None)
 
     # one real iteration on real data (debug -> N=1)
-    model.train_one_iter()
+    res5_dtypes = []
+    handle = model.encoder.res5.register_forward_hook(
+        lambda _module, _inputs, output: res5_dtypes.append(
+            (output.dtype, torch.is_autocast_enabled('cuda'))))
+    try:
+        model.train_one_iter()
+    finally:
+        handle.remove()
+    expected_res5 = (torch.bfloat16 if precision == 'bf16' else torch.float32)
+    assert any(dtype == expected_res5 and
+               (in_autocast == (precision != 'off'))
+               for dtype, in_autocast in res5_dtypes)
     torch.cuda.synchronize()
     assert model.iter == it_before + 1
     row = model.loss_history[-1]
@@ -837,14 +850,20 @@ def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io):
     # save -> strict reload
     model.save()
     torch.cuda.synchronize()
-    model2 = _real_model(root, is_training=True)
+    model2 = _real_model(root, is_training=True, precision=precision)
     torch.cuda.synchronize()
     assert model2.iter == model.iter
     assert model2.src_dst_opt.iterations.item() \
         == model.src_dst_opt.iterations.item()
+    for a, b in zip(model.src_dst_opt.get_weights(),
+                    model2.src_dst_opt.get_weights()):
+        assert torch.equal(a, b)
     if has_gan:
         assert model2.GAN_opt.iterations.item() \
             == model.GAN_opt.iterations.item()
+        for a, b in zip(model.GAN_opt.get_weights(),
+                        model2.GAN_opt.get_weights()):
+            assert torch.equal(a, b)
     for name in ('encoder', 'inter_src', 'inter_dst', 'decoder') \
             + (('GAN',) if has_gan else ()):
         a = [w.detach().cpu() for w in getattr(model, name).get_weights()]
@@ -859,6 +878,8 @@ def test_real_ckpt_path_c_one_step_lifecycle(tmp_path, headless_io):
     model2.train_one_iter()
     torch.cuda.synchronize()
     assert model2.iter == model.iter + 1
+    assert model2.src_dst_opt.iterations.item() \
+        == model.src_dst_opt.iterations.item() + 1
     row2 = model2.loss_history[-1]
     assert len(row2) == 2 and all(math.isfinite(v) for v in row2)
     print(f"REAL LIFECYCLE 3 PASS: post-reload iteration "
