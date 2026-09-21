@@ -58,9 +58,11 @@ D. Worker lifecycle (the ``Subprocessor`` machinery, owned ``Process``
    normal completion (final stage, 2 workers, 2 images) -> zero
    owned processes; every owned ``cli.p`` is dead AND joined;
    repeated runs -> no worker accumulation;
-   error path (a worker raises during stage execution:
-   ``jpeg_quality=None`` -> OpenCV error in the child) -> the parent
-   ``run()`` returns normally, the owned worker is reaped, no orphans.
+   error path (a worker raises during final-stage output write:
+   the output directory is deliberately missing, so the write
+   failure surfaces as a raised ``AttributeError`` in the child)
+   -> the parent ``run()`` returns normally, the failed chunk is
+   dropped, the owned worker is reaped, no orphans.
 
 Runs in both validated environments (CPU venv and CUDA venv): every
 test here is CPU-structured and deterministic.
