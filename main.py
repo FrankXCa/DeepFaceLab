@@ -43,6 +43,8 @@ if __name__ == "__main__":
                         jpeg_quality            = arguments.jpeg_quality,
                         cpu_only                = arguments.cpu_only,
                         force_gpu_idxs          = [ int(x) for x in arguments.force_gpu_idxs.split(',') ] if arguments.force_gpu_idxs is not None else None,
+                        gpu_worker_count        = arguments.gpu_worker_count,
+                        final_worker_count      = arguments.final_worker_count,
                       )
 
     p = subparsers.add_parser( "extract", help="Extract the faces from a pictures.")
@@ -60,6 +62,8 @@ if __name__ == "__main__":
     p.add_argument('--manual-window-size', type=int, dest="manual_window_size", default=1368, help="Manual fix window size. Default: 1368.")
     p.add_argument('--cpu-only', action="store_true", dest="cpu_only", default=False, help="Extract on CPU..")
     p.add_argument('--force-gpu-idxs', dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
+    p.add_argument('--gpu-worker-count', type=int, dest="gpu_worker_count", default=None, help="Number of parallel workers per GPU (default prompted, min 1).")
+    p.add_argument('--final-worker-count', type=int, dest="final_worker_count", default=None, help="Number of CPU workers for final stage (default prompted).")
 
     p.set_defaults (func=process_extract)
 

@@ -271,7 +271,7 @@ class ExtractSubprocessor(Subprocessor):
             return data.filepath
 
     @staticmethod
-    def get_devices_for_config (type, device_config):
+    def get_devices_for_config (type, device_config, gpu_worker_count=1, final_worker_count=1):
         devices = device_config.devices
         cpu_only = len(devices) == 0
 
@@ -285,8 +285,14 @@ class ExtractSubprocessor(Subprocessor):
 
                 result = []
 
+                # USER_LEGACY worker-count semantics (Phase 9D restore): each
+                # selected GPU contributes worker_count workers, each staying
+                # attached to its original device_idx; zero/negative values
+                # clamp to 1 (0 NEVER means CPU — CPU-only is controlled only
+                # by the --cpu-only flag / empty device list).
+                worker_count = max(1, int(gpu_worker_count))
                 for device in devices:
-                    count = 1
+                    count = worker_count
 
                     if count == 1:
                         result += [ (device.index, 'GPU', device.name, device.total_mem_gb) ]
@@ -302,9 +308,15 @@ class ExtractSubprocessor(Subprocessor):
                     return [ (i, 'CPU', 'CPU%d' % (i), 0 ) for i in range( min(8, multiprocessing.cpu_count() // 2) ) ]
 
         elif type == 'final':
-            return [ (i, 'CPU', 'CPU%d' % (i), 0 ) for i in (range(min(8, multiprocessing.cpu_count())) if not DEBUG else [0]) ]
+            if DEBUG:
+                return [ (0, 'CPU', 'CPU0', 0) ]
+            # USER_LEGACY worker-count semantics (Phase 9D restore): the
+            # explicit count wins over the old hard-coded min(8, cpu_count);
+            # it is clamped to 1..cpu_count (count <= 0 clamps to 1).
+            count = max(1, min(final_worker_count, multiprocessing.cpu_count()))
+            return [ (i, 'CPU', f'CPU{i}', 0 ) for i in range(count) ]
 
-    def __init__(self, input_data, type, image_size=None, jpeg_quality=None, face_type=None, output_debug_path=None, manual_window_size=0, max_faces_from_image=0, final_output_path=None, device_config=None):
+    def __init__(self, input_data, type, image_size=None, jpeg_quality=None, face_type=None, output_debug_path=None, manual_window_size=0, max_faces_from_image=0, final_output_path=None, device_config=None, gpu_worker_count=1, final_worker_count=1):
         if type == 'landmarks-manual':
             for x in input_data:
                 x.manual = True
@@ -321,7 +333,7 @@ class ExtractSubprocessor(Subprocessor):
         self.max_faces_from_image = max_faces_from_image
         self.result = []
 
-        self.devices = ExtractSubprocessor.get_devices_for_config(self.type, device_config)
+        self.devices = ExtractSubprocessor.get_devices_for_config(self.type, device_config, gpu_worker_count, final_worker_count)
 
         super().__init__('Extractor', ExtractSubprocessor.Cli,
                              999999 if type == 'landmarks-manual' or DEBUG else 120)
@@ -717,6 +729,8 @@ def main(detector=None,
          jpeg_quality=None,
          cpu_only = False,
          force_gpu_idxs = None,
+         gpu_worker_count = None,
+         final_worker_count = None,
          ):
 
     if not input_path.exists():
@@ -759,6 +773,30 @@ def main(detector=None,
 
     device_config = nn.DeviceConfig.GPUIndexes( force_gpu_idxs or nn.ask_choose_device_idxs(choose_only_one=detector=='manual', suggest_all_gpu=True) ) \
                     if not cpu_only else nn.DeviceConfig.CPU()
+
+    # USER_LEGACY worker-count semantics (Phase 9D restore): explicit CLI
+    # values are used as-is (zero/negative values are clamped later in
+    # get_devices_for_config); None prompts (GPU prompt suppressed on
+    # --cpu-only, where the count resolves silently to 1); the final
+    # default is min(8, max(1, cpu_count // 2)) clamped to 1..cpu_count.
+    if gpu_worker_count is None and not cpu_only:
+        gpu_worker_count = io.input_int(
+            "Parallel GPU workers per device",
+            1,
+            valid_range=[1, 32],
+            help_message="Increase only if VRAM allows. Each worker loads S3FD + FAN simultaneously."
+        )
+    elif gpu_worker_count is None:
+        gpu_worker_count = 1
+
+    if final_worker_count is None:
+        default_final = min(8, max(1, multiprocessing.cpu_count() // 2))
+        final_worker_count = io.input_int(
+            "Parallel CPU workers for final stage",
+            default_final,
+            valid_range=[1, max(1, multiprocessing.cpu_count())],
+            help_message="Controls how many final-stage (crop/JPEG) workers run in parallel."
+        )
 
     if face_type is None:
         face_type = io.input_str ("Face type", 'wf', ['f','wf','head'], help_message="Full face / whole face / head. 'Whole face' covers full area of face include forehead. 'head' covers full head, but requires XSeg for src and dst faceset.").lower()
@@ -809,10 +847,10 @@ def main(detector=None,
     if images_found != 0:
         if detector == 'manual':
             io.log_info ('Performing manual extract...')
-            data = ExtractSubprocessor ([ ExtractSubprocessor.Data(Path(filename)) for filename in input_image_paths ], 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config).run()
+            data = ExtractSubprocessor ([ ExtractSubprocessor.Data(Path(filename)) for filename in input_image_paths ], 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config, gpu_worker_count=gpu_worker_count, final_worker_count=final_worker_count).run()
 
             io.log_info ('Performing 3rd pass...')
-            data = ExtractSubprocessor (data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config).run()
+            data = ExtractSubprocessor (data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config, gpu_worker_count=gpu_worker_count, final_worker_count=final_worker_count).run()
 
         else:
             io.log_info ('Extracting faces...')
@@ -824,7 +862,9 @@ def main(detector=None,
                                          output_debug_path if output_debug else None,
                                          max_faces_from_image=max_faces_from_image,
                                          final_output_path=output_path,
-                                         device_config=device_config).run()
+                                         device_config=device_config,
+                                         gpu_worker_count=gpu_worker_count,
+                                         final_worker_count=final_worker_count).run()
 
         faces_detected += sum([d.faces_detected for d in data])
 
@@ -834,8 +874,8 @@ def main(detector=None,
             else:
                 fix_data = [ ExtractSubprocessor.Data(d.filepath) for d in data if d.faces_detected == 0 ]
                 io.log_info ('Performing manual fix for %d images...' % (len(fix_data)) )
-                fix_data = ExtractSubprocessor (fix_data, 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config).run()
-                fix_data = ExtractSubprocessor (fix_data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config).run()
+                fix_data = ExtractSubprocessor (fix_data, 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config, gpu_worker_count=gpu_worker_count, final_worker_count=final_worker_count).run()
+                fix_data = ExtractSubprocessor (fix_data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config, gpu_worker_count=gpu_worker_count, final_worker_count=final_worker_count).run()
                 faces_detected += sum([d.faces_detected for d in fix_data])
 
 
