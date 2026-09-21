@@ -36,10 +36,15 @@ numpy==2.5.3
 scipy==1.18.1
 numexpr==2.14.2
 
+# Phase 9: the extractors (facelib/S3FDExtractor.py, facelib/
+# FANExtractor.py) import cv2 at module import time (BGR->RGB flip +
+# INTER_LINEAR resize preprocessing); Phase 8 deliberately left it
+# out. The version matches the frozen official-TF reference env.
+opencv-python==5.0.0.93
+
 # --- optional (not part of the Phase 1 baseline) ---
 # torchvision — revisit in Phase 9 (extractors) if needed
 # onnx          — required in Phase 11 (DFM/ONNX export)
-# opencv-python — required in Phase 9 (extractors)
 #
 # Deliberately excluded from this phase (IMPLEMENTATION_PLAN.md section 12):
 # FP8, INT4, NVFP4, TorchAO, TensorRT

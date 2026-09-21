@@ -25,3 +25,9 @@ numpy==2.5.3
 # of the model/training phases.
 scipy==1.18.1
 numexpr==2.14.2
+
+# Phase 9: the extractors (facelib/S3FDExtractor.py, facelib/
+# FANExtractor.py) import cv2 at module import time (BGR->RGB flip +
+# INTER_LINEAR resize preprocessing); Phase 8 deliberately left it
+# out. The version matches the frozen official-TF reference env.
+opencv-python==5.0.0.93
