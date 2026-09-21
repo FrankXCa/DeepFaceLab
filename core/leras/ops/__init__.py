@@ -18,13 +18,18 @@ reference code, never imported by torch paths):
   helpers used by the official model code).
 - Phase 3E2: ``random_binomial`` (the official lr_dropout mask
   source for the migrated AdaBelief/RMSprop optimizers).
+- Phase 9C: ``upsample2d`` (nearest-neighbor ``size``x spatial
+  upsample — the official FAN HourGlass
+  ``tf.image.resize_nearest_neighbor`` call; the official NCHW
+  branch resizes in the NHWC layout, so the torch body boundary-
+  permutes to NCHW, resizes, and boundary-permutes back).
 
 Still TensorFlow (later Phase 3 subphases / model phases; see
 ``ops/ops_tf.py``): rgb_to_lab (dead in the official baseline - no
 callers; documented deferral), gelu (no baseline callers),
-upsample2d (FANExtractor - facelib TF code), resize2d_* (FaceEnhancer
-- facelib TF code), max_pool (no nn-namespace callers in the
-baseline), space_to_depth (no baseline callers),
+resize2d_* (FaceEnhancer - facelib TF code), max_pool (no
+nn-namespace callers in the baseline), space_to_depth (no baseline
+callers),
 tf_gradients/nn.gradients + average_gv_list (-> the model-phase
 gradient flow / dedicated multi-GPU phase), batch_set_value/
 tf_get_value (session machinery - disappears under the torch
@@ -539,6 +544,33 @@ def random_binomial(shape, p=0.0, dtype=None, seed=None, device=None):
     return mask.to(dtype)
 
 
+# ---------------------------------------------------------------------------
+# Phase 9C: upsample2d (official FAN HourGlass nearest-neighbor upsample)
+# ---------------------------------------------------------------------------
+
+def upsample2d(x, size=2):
+    """Official DFL ``upsample2d``: nearest-neighbor ``size``x
+    spatial upsample. The official body is
+    ``tf.image.resize_nearest_neighbor(x, (h*size, w*size))`` on the
+    NHWC branch; the official NCHW branch transposes to NHWC,
+    resizes, and transposes back — i.e. the resize always happens on
+    the NHWC layout. torch ``F.interpolate`` consumes NCHW, so an
+    NHWC input is boundary-permuted first (the same boundary
+    contract as the Phase 3C ops); nearest mode with an integer
+    ``scale_factor`` is exactly ``resize_nearest_neighbor`` (top-
+    left aligned, ``out[i, j] = in[i // s, j // s]``).
+    """
+    nhwc = nn.data_format == "NHWC"
+    if nhwc:
+        x = nn.to_data_format(x, "NCHW", "NHWC")
+
+    x = F.interpolate(x, scale_factor=size, mode="nearest")
+
+    if nhwc:
+        x = nn.to_data_format(x, "NHWC", "NCHW")
+    return x
+
+
 nn.depth_to_space = depth_to_space
 nn.dssim = dssim
 nn.gaussian_blur = gaussian_blur
@@ -550,3 +582,4 @@ nn.average_tensor_list = average_tensor_list
 nn.total_variation_mse = total_variation_mse
 nn.random_binomial = random_binomial
 nn.sigmoid_cross_entropy = sigmoid_cross_entropy
+nn.upsample2d = upsample2d
