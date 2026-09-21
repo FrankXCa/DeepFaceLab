@@ -110,6 +110,7 @@ import core.leras.layers  # noqa: F401
 import core.leras.models  # noqa: F401
 import core.leras.ops  # noqa: F401
 from core.leras import convert
+from ._extractor_precision import cudnn_fp32_for_extractor
 
 
 def _avg_pool2(x):
@@ -263,6 +264,10 @@ class FANExtractor(object):
                         self.register_module(f"{attr}_{i}", sub)
 
             def forward(self, x):
+                with cudnn_fp32_for_extractor(x):
+                    return self._forward_impl(x)
+
+            def _forward_impl(self, x):
                 # torch container contract: ModelBase.run feeds each run
                 # input as a positional argument (the official TF
                 # placeholder list is already unpacked — the official

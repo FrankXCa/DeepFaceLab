@@ -84,6 +84,7 @@ from core.leras import nn
 import core.leras.layers  # noqa: F401
 import core.leras.models  # noqa: F401
 from core.leras import convert
+from ._extractor_precision import cudnn_fp32_for_extractor
 
 
 def _max_pool2(x, kernel_size=2, strides=2):
@@ -204,6 +205,10 @@ class S3FD(nn.ModelBase):
         self.conv7_2_mbox_loc = nn.Conv2D(256, 4, kernel_size=3, strides=1, padding='SAME')
 
     def forward(self, x):
+        with cudnn_fp32_for_extractor(x):
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         # torch container contract: ModelBase.run feeds each run input as
         # a positional argument (the official TF ``inp`` list of
         # placeholders is already unpacked — the official ``x, = inp``
