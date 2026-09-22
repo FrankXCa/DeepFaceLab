@@ -11,9 +11,8 @@ from .CodeDiscriminator import *
 # like discriminators_tf.py).
 from .ModelBase import *
 
-# The official TF XSeg model foundation executes ``tf = nn.tf`` at import
-# time, so it is importable only when the TF foundation is active. Under
-# the torch foundation (Phase 3A+) it is skipped here and is rebuilt in the
-# XSeg model phase (see core/leras/nn.py).
-if hasattr(nn, 'tf'):
-    from .XSeg import *
+# Phase 10B: the official XSeg model foundation is torch (see XSeg.py;
+# the official TF source is preserved verbatim in XSeg_tf.py, dead
+# reference like ModelBase_tf.py) and is importable under both
+# foundations, unguarded.
+from .XSeg import *

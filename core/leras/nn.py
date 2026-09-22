@@ -51,8 +51,8 @@ classes CodeDiscriminator/PatchDiscriminator/UNetPatchDiscriminator in
 core.leras.models to torch - the official TF source is preserved in
 models/discriminators_tf.py); models/* (Phase 5 migrated the leras
 ModelBase container to torch - the official TF source is preserved in
-models/ModelBase_tf.py; Phases 6-8: the remaining TF XSeg foundation
-and the model phases).
+models/ModelBase_tf.py; Phase 10B migrated the official XSeg model to
+torch - the official TF source is preserved in models/XSeg_tf.py).
 
 NCHW speed up training for 10-20%.
 """
@@ -102,8 +102,8 @@ class nn():
             # ArchiBase, the DeepFakeArchi factory (Encoder/Inter/Decoder
             # block classes) and the official discriminator classes
             # (CodeDiscriminator, PatchDiscriminator,
-            # UNetPatchDiscriminator - the remaining TF ModelBase/XSeg
-            # model foundation stays until Phases 6-8). The remaining
+            # UNetPatchDiscriminator; Phase 5: the torch ModelBase
+            # container; Phase 10B: the torch XSeg model). The remaining
             # leras subpackages (remaining ops) are rebuilt in later Phase
             # 3 subphases / model phases and are imported by their own
             # subphase entry points.
