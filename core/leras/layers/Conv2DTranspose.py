@@ -7,13 +7,17 @@ Official behavior preserved:
   trainable, dtype, **kwargs);
 - output sizing is the official ``deconv_length`` (SAME -> in*stride,
   VALID -> in*stride + (k-stride)_+, FULL -> in*stride - (stride+k-2));
-  the torch equivalent is an F.conv_transpose2d with
-  output_padding = target - base, where
-  base = (in-1)*stride - 2*padding + kernel_size. If the required
-  output_padding falls outside [0, stride) the configuration cannot be
-  represented and an explicit ValueError is raised (no silent repair;
-  all official DFL configs — k=3/4, stride 2, SAME/VALID — satisfy it);
-- SAME padding uses padding=(k-1)//2 (the TF SAME transpose pad);
+- the geometry is the official TF ``tf.nn.conv2d_transpose`` contract,
+  pinned empirically against the official TF runtime in Phase 10B
+  (marker + random-kernel parity on the XSeg decoder configs):
+  ``out[b] = sum_t in[b*stride + t] * K[t]`` — an UNFLIPPED scatter at
+  offset 0, i.e. NO input padding (F.conv_transpose2d with
+  padding=0, output_padding=0). VALID keeps the full extent
+  (in-1)*stride + k; SAME crops the tail of that same extent to
+  in*stride (all official DFL transpose-conv feeds are even-sized maps,
+  where TF's SAME padding reduces to exactly this scatter + tail crop);
+  FULL is unused by every official DFL configuration but stays reachable
+  through the same exact tail crop (no silent repair, no special-casing);
 - use_wscale as in the official Conv2D (constant float, not saved;
   random_normal(0,1) forced when no kernel_initializer);
 - weight is stored in torch layout (in_ch, out_ch, kH, kW); the official
@@ -22,6 +26,18 @@ Official behavior preserved:
   torch[in,out,h,w] = official[h,w,out,in] (permute(3,2,0,1)).
 
 Device/dtype: nn.device / nn.floatx via the Phase 2 abstraction.
+
+Phase 10B fix (latent Phase 3B defect, no value-verified consumer
+before XSeg): the Phase 3B forward padded the input by p=(k-1)//2 and
+stretched the extent with output_padding = target - base. That geometry
+places the kernel one cell EARLIER (offset -p) than the official TF op
+and clips different edges — a global O(1) divergence starting at the
+first Conv2DTranspose (the XSeg decoder ``up5``; the encoder bisection
+is clean at ~1e-5). XSeg is the first value-verified
+Conv2DTranspose consumer: the Phase 3B layer test pinned the wrong
+reference (its manual scatter used ``2*h-1+kh``), and the Phase 6-8
+UNet discriminator tests are shape-only, so the defect was undetectable
+until the XSeg forward parity.
 """
 
 import numpy as np
@@ -137,36 +153,53 @@ class Conv2DTranspose(LayerBase):
         if self.use_wscale:
             weight = weight * self.wscale
 
-        # padding per the official TF semantics of tf.nn.conv2d_transpose:
-        # SAME pads the input by floor((k-1)/2); VALID/FULL do not.
-        p = (self.kernel_size - 1) // 2 if self.padding == 'SAME' else 0
-
+        # official TF tf.nn.conv2d_transpose geometry (Phase 10B: pinned
+        # empirically against the official TF runtime — marker + random-
+        # kernel parity on the XSeg decoder configs): an UNFLIPPED scatter
+        # at offset 0 with NO input padding,
+        #     out[b] = sum_t in[b*stride + t] * K[t]
+        # which F.conv_transpose2d reproduces exactly with padding=0 /
+        # output_padding=0 over the full extent (in-1)*stride + k. The
+        # official deconv_length is then recovered by cropping the tail of
+        # that same extent:
+        #   VALID -> the full extent itself (target == extent for k>=s),
+        #   SAME  -> in*stride,   FULL -> in*stride - (s + k - 2).
+        # No official DFL configuration uses FULL, but the exact same tail
+        # crop represents it, so all three paddings stay reachable (no
+        # silent repair, no special-casing).
         in_h, in_w = int(x.shape[2]), int(x.shape[3])
         target_h = self.deconv_length(in_h, self.strides, self.kernel_size, self.padding)
         target_w = self.deconv_length(in_w, self.strides, self.kernel_size, self.padding)
+        full_h = (in_h - 1) * self.strides + self.kernel_size
+        full_w = (in_w - 1) * self.strides + self.kernel_size
 
-        base_h = (in_h - 1) * self.strides - 2 * p + self.kernel_size
-        base_w = (in_w - 1) * self.strides - 2 * p + self.kernel_size
-        out_pad_h = int(target_h - base_h)
-        out_pad_w = int(target_w - base_w)
-
-        # F.conv_transpose2d requires 0 <= output_padding < stride; the
-        # official deconv_length sizing always satisfies this for the
-        # configurations DeepFaceLab uses (k=3/4, stride 2, SAME/VALID).
-        if not (0 <= out_pad_h < self.strides) or not (0 <= out_pad_w < self.strides):
+        # stretch the extent when the target exceeds it (unreachable for the
+        # DFL configs, where kernel >= stride); F.conv_transpose2d requires
+        # 0 <= output_padding < stride
+        op_h = max(0, target_h - full_h)
+        op_w = max(0, target_w - full_w)
+        if op_h >= self.strides or op_w >= self.strides:
             raise ValueError(
-                f"Conv2DTranspose: required output_padding=({out_pad_h},{out_pad_w}) "
-                f"is outside [0, {self.strides}) for input ({in_h},{in_w}) with "
-                f"kernel {self.kernel_size}, stride {self.strides}, padding "
-                f"{self.padding!r}; this configuration cannot be represented"
+                f"Conv2DTranspose: required output_padding=({op_h},{op_w}) "
+                f"is outside [0, {self.strides}) for input ({in_h},{in_w}) "
+                f"with kernel {self.kernel_size}, stride {self.strides}, "
+                f"padding {self.padding!r}; this configuration cannot be "
+                f"represented"
             )
 
         x = F.conv_transpose2d(
             x, weight,
             bias=self.bias if self.use_bias else None,
-            stride=self.strides, padding=p,
-            output_padding=(out_pad_h, out_pad_w),
+            stride=self.strides, padding=0,
+            output_padding=(op_h, op_w),
         )
+
+        # crop the tail to the official deconv_length (a no-op for VALID,
+        # where the extent already equals the target)
+        if x.shape[2] > target_h:
+            x = x[..., :target_h, :]
+        if x.shape[3] > target_w:
+            x = x[..., :, :target_w]
 
         if nhwc:
             x = x.permute(0, 2, 3, 1).contiguous()

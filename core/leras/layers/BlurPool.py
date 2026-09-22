@@ -17,6 +17,14 @@ Official behavior preserved:
 
 Device/dtype: the convolution runs on the input tensor's device (the
 kernel is materialized there); no nn.device dependency, no CUDA calls.
+
+Phase 10B fix (latent Phase 3B defect, no consumer before XSeg): the
+channel count is read from the input in its native data format BEFORE
+the NHWC boundary permute (official semantics:
+``x.shape[nn.conv2d_ch_axis]`` on the raw tensor). The Phase 3B
+forward computed it after the permute, which under NHWC indexed the
+width axis and broke every NHWC forward (XSeg is the first
+BlurPool consumer; the Phase 3B layer test exercised NCHW only).
 """
 
 import numpy as np
@@ -66,11 +74,15 @@ class BlurPool(LayerBase):
         pass
 
     def forward(self, x):
+        # official: the channel count is read from the input in its
+        # NATIVE data format (x.shape[nn.conv2d_ch_axis] on the raw
+        # tensor) — the NHWC boundary permute below happens AFTER, so
+        # the channel axis must be resolved before it (reading it after
+        # would index the width axis, breaking every NHWC forward)
         nhwc = (nn.data_format == "NHWC")
+        ch = int(x.shape[nn.conv2d_ch_axis])
         if nhwc:
             x = x.permute(0, 3, 1, 2).contiguous()
-
-        ch = int(x.shape[nn.conv2d_ch_axis])
         k = (
             torch.from_numpy(self.a[None, None, :, :].astype(np.float32))
             .to(device=x.device, dtype=x.dtype)

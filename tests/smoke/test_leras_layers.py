@@ -240,7 +240,13 @@ def test_conv2dtranspose_config_and_build():
 
 
 def test_conv2dtranspose_forward_parity_cpu():
-    # parity: WITHIN_TOLERANCE(1e-4) vs a manual scatter reference
+    # parity: WITHIN_TOLERANCE(1e-4) vs a manual reference implementing
+    # the official TF conv2d_transpose geometry (Phase 10B, pinned
+    # against the official TF runtime): an UNFLIPPED scatter at offset 0
+    # (NO input padding) over the full extent (in-1)*s + k = 9x9, then
+    # the SAME tail crop to in*s = 8x8. The Phase 3B reference pinned
+    # the WRONG geometry (offset -1, i.e. the input padded by p=(k-1)//2);
+    # it was corrected here together with the production fix.
     t = Conv2DTranspose(2, 4, kernel_size=3, strides=2, padding="SAME", name="t")
     t.build_weights(); t.init_weights()
     x = torch.from_numpy(_seq(32, 3.0, 2.0).reshape(1, 2, 4, 4))
@@ -255,27 +261,87 @@ def test_conv2dtranspose_forward_parity_cpu():
             for wi in range(4):
                 for kh in range(3):
                     for kw in range(3):
-                        oh, ow = 2 * h - 1 + kh, 2 * wi - 1 + kw
-                        if 0 <= oh < 8 and 0 <= ow < 8:
+                        # offset-0 scatter: in[h, wi] -> (2*h + kh, 2*wi + kw)
+                        oh, ow = 2 * h + kh, 2 * wi + kw
+                        if 0 <= oh < 8 and 0 <= ow < 8:  # SAME tail crop
                             outref[0, oh, ow, :] += xref[0, h, wi, i] * wref[i, :, kh, kw]
     outref += t.bias.detach().numpy()
     assert np.allclose(y.numpy().transpose(0, 2, 3, 1), outref,
                        rtol=1e-4, atol=1e-4)
 
 
-def test_conv2dtranspose_forward_valid_and_unreachable_full():
+def test_conv2dtranspose_forward_valid_and_full():
+    # VALID: the offset-0 scatter keeps the full extent (in-1)*s + k =
+    # 9x9 (== the official deconv_length VALID for k>=s) — no crop.
     t = Conv2DTranspose(2, 4, kernel_size=3, strides=2, padding="VALID", name="t")
     t.build_weights(); t.init_weights()
     x = torch.from_numpy(_seq(32, 1.0, 1.0).reshape(1, 2, 4, 4))
     assert tuple(t(x).shape) == (1, 4, 9, 9)  # VALID: 4*2 + (3-2)
 
-    # FULL convT is unreachable in torch (output_padding >= stride):
-    # explicit failure, not a silent repair (unused by official DFL)
+    # FULL: unused by every official DFL configuration, but reachable
+    # under the Phase 10B official geometry — the same offset-0 scatter
+    # (full extent 9x9) with the tail cropped to the official
+    # deconv_length FULL = 4*2 - (2+3-2) = 5. (The pre-fix Phase 3B
+    # geometry made FULL an explicit ValueError; that byproduct went away
+    # with the geometry fix, so this is now a positive parity check.)
     f = Conv2DTranspose(2, 4, kernel_size=3, strides=2, padding="FULL", name="f")
     f.build_weights(); f.init_weights()
     xf = torch.from_numpy(_seq(32, 1.0, 1.0).reshape(1, 2, 4, 4))
-    with pytest.raises(ValueError):
-        f(xf)
+    yf = f(xf).detach()
+    assert tuple(yf.shape) == (1, 4, 5, 5)  # FULL: 4*2 - (2+3-2)
+
+    # value parity: offset-0 scatter over the 9x9 extent, head crop to 5x5
+    wref = f.weight.detach().numpy()  # (in, out, k, k)
+    xref = xf.numpy().transpose(0, 2, 3, 1)
+    outref = np.zeros((1, 9, 9, 4), np.float32)
+    for i in range(2):
+        for h in range(4):
+            for wi in range(4):
+                for kh in range(3):
+                    for kw in range(3):
+                        oh, ow = 2 * h + kh, 2 * wi + kw
+                        if 0 <= oh < 9 and 0 <= ow < 9:
+                            outref[0, oh, ow, :] += xref[0, h, wi, i] * wref[i, :, kh, kw]
+    outref = outref[:, :5, :5, :]  # FULL tail crop (head kept)
+    outref += f.bias.detach().numpy()
+    assert np.allclose(yf.numpy().transpose(0, 2, 3, 1), outref,
+                       rtol=1e-4, atol=1e-4)
+
+
+def test_conv2dtranspose_geometry_offset0_scatter_pinned():
+    # Phase 10B: the official TF conv2d_transpose geometry, pinned against
+    # the official TF runtime with marker kernels (identity at a single
+    # offset t + random input): out[b] = sum_t in[b*stride + t] * K[t] —
+    # an UNFLIPPED scatter at offset 0 with NO input padding. With the
+    # marker K[0,0]=1 every input cell in[h, w, i] must land EXACTLY at
+    # (2h, 2w); the Phase 3B defect (kernel placed at offset -1 via
+    # padding=(k-1)//2) would land it at (2h-1, 2w-1) and fail here.
+    # Out-channels 2/3 carry no marker weight and must stay exactly zero.
+    t = Conv2DTranspose(2, 4, kernel_size=3, strides=2, padding="SAME", name="t")
+    t.build_weights(); t.init_weights()
+    w = torch.zeros_like(t.weight)
+    w[0, 0, 0, 0] = 1.0  # in 0 -> out 0 at offset (0,0)
+    w[1, 1, 0, 0] = 1.0  # in 1 -> out 1 at offset (0,0)
+    with torch.no_grad():  # the parameters require grad; pin them in place
+        t.weight.copy_(w)
+        t.bias.fill_(0.0)
+    x = torch.from_numpy(_seq(32, 1.0, 0.0).reshape(1, 2, 4, 4))
+    y = t(x).detach()
+    assert tuple(y.shape) == (1, 4, 8, 8)  # SAME: 4*2
+    yn = y.numpy().transpose(0, 2, 3, 1)  # (1, 8, 8, 4)
+    xn = x.numpy().transpose(0, 2, 3, 1)  # (1, 4, 4, 2)
+    for h in range(4):
+        for w_ in range(4):
+            for i in range(2):
+                # the scattered value lands exactly at (2h, 2w)
+                assert yn[0, 2 * h, 2 * w_, i] == pytest.approx(xn[0, h, w_, i], abs=1e-6)
+    # no marker weight anywhere else: zero the scattered cells and the
+    # remainder must be exactly 0 (offset 0 -> every other cell is empty)
+    rem = yn.copy()
+    for h in range(4):
+        for w_ in range(4):
+            rem[0, 2 * h, 2 * w_, :] = 0.0
+    assert float(np.max(np.abs(rem))) < 1e-7
 
 
 def test_conv2dtranspose_layout_conversion_exact():
@@ -571,6 +637,32 @@ def test_blurpool_parity_and_empty_checkpoint(plain_tmp):
     bp2 = BlurPool(filt_size=3, stride=2, name="bp3")
     bp2.build_weights()
     assert bp2.load_weights(path) is True
+
+    # Phase 10B regression: the same parity under an NHWC session.
+    # The channel count must be read from the input in its NATIVE
+    # format before the boundary permute (the latent Phase 3B defect
+    # read it after, indexing the width axis); the reference above is
+    # layout-independent (per-channel depthwise), so the NHWC output
+    # transposed to NCHW must equal the NCHW reference.
+    dfl_nn.initialize(dfl_nn.DeviceConfig.CPU(), data_format="NHWC")
+    for fs, (p0, p1) in ((2, (0, 1)), (3, (1, 1)), (4, (1, 2))):
+        bpn = BlurPool(filt_size=fs, stride=2, name=f"bph{fs}")
+        bpn.build_weights()
+        x = torch.from_numpy(_seq(3 * 7 * 7, 0.3, 0.1).reshape(1, 7, 7, 3))
+        y = bpn(x).detach()
+        oh = (7 + p0 + p1 - fs) // 2 + 1
+        ow = oh
+        assert tuple(y.shape) == (1, oh, ow, 3)
+        ref = np.zeros((1, 3, oh, ow), np.float32)
+        xp = np.pad(x.numpy().transpose(0, 3, 1, 2),
+                    ((0, 0), (0, 0), (p0, p1), (p0, p1)), mode="constant")
+        k = np.repeat(bpn.a.astype(np.float32)[None, None], 3, axis=0)
+        for c in range(3):
+            for h in range(oh):
+                for w in range(ow):
+                    ref[0, c, h, w] = (xp[0, c, h * 2:h * 2 + fs, w * 2:w * 2 + fs] * k[0, 0]).sum()
+        assert np.allclose(y.numpy().transpose(0, 3, 1, 2), ref,
+                           rtol=1e-4, atol=1e-4)
 
 
 def test_adain_build_and_parity():
