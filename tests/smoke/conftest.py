@@ -65,6 +65,7 @@ def plain_tmp():
     Cleanup is lenient: leftovers in the platform temp area are removed
     by the OS, and workspace leftovers are git-ignored.
     """
+    import shutil
     import tempfile
     from pathlib import Path
 
@@ -74,17 +75,16 @@ def plain_tmp():
         os.makedirs(root, exist_ok=True)
     name = "dfl_p3a_%s" % "".join(random.choices("0123456789abcdef", k=8))
     d = os.path.join(root, name)
+    # A test (or a killed run) may have left this exact name behind:
+    # the per-test RNG-restore fixtures reset the Python RNG, so this
+    # fixture regenerates the same name for every test — re-create the
+    # directory fresh and remove it recursively (tests may create
+    # subdirectories the old flat-file teardown could not unlink, which
+    # made the next test's same-name makedirs collide).
+    shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
     yield d
-    for entry in os.listdir(d):
-        try:
-            os.unlink(os.path.join(d, entry))
-        except OSError:
-            pass
-    try:
-        os.rmdir(d)
-    except OSError:
-        pass
+    shutil.rmtree(d, ignore_errors=True)
 
 
 # --- deterministic owned-process audit (Q11 stability audit) ----------------
