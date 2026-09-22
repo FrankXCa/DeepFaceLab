@@ -42,9 +42,17 @@ numexpr==2.14.2
 # out. The version matches the frozen official-TF reference env.
 opencv-python==5.0.0.93
 
+# Phase 10E: XSeg ONNX export (models/Model_XSeg/Model.py export_dfm —
+# the legacy torch TorchScript ONNX exporter serializes through the
+# onnx package) and the export/parity validation (onnxruntime CPU).
+# Both pins verified in the exact project venv (Python 3.12.11,
+# numpy 2.5.3, torch 2.14.0+cu130). onnxscript is NOT required: the
+# exporter uses the legacy path, not torch's dynamo ONNX path.
+onnx==1.23.0
+onnxruntime==1.30.0
+
 # --- optional (not part of the Phase 1 baseline) ---
 # torchvision — revisit in Phase 9 (extractors) if needed
-# onnx          — required in Phase 11 (DFM/ONNX export)
 #
 # Deliberately excluded from this phase (IMPLEMENTATION_PLAN.md section 12):
 # FP8, INT4, NVFP4, TorchAO, TensorRT

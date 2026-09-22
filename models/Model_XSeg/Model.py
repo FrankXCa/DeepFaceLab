@@ -97,10 +97,16 @@ graph/session concepts removed, exactly like the Phase 6 SAEHD port):
   ``pretrain_just_disabled`` transition keeps its official
   semantics: iteration reset, optimizer state preserved through the
   persistent ``.npy`` files);
-- ``export_dfm`` (DFM/ONNX via tf2onnx) is Phase 10E — the method
-  exists and fails explicitly (the SAEHD precedent; the official
-  ``in_face:0 -> out_mask:0`` opset-13 contract is documented in the
-  phase plan).
+- ``export_dfm`` (Phase 10E, DFM/ONNX): the official tf2onnx export
+  becomes the legacy torch TorchScript ONNX exporter
+  (``dynamo=False`` — torch 2.14's dynamo path requires onnxscript,
+  which the project deliberately does not install) driven by a
+  plain-``torch.nn.Module`` wrapper that implements the official
+  NHWC -> NCHW -> NHWC boundary around the NCHW net and the official
+  ``_, pred`` flow-tuple selection (the sigmoid is ``out_mask``);
+  the official ``in_face:0 -> out_mask:0`` opset-13 contract, the
+  name-based dynamic batch axis and the onnxproto annotation of
+  ``out_mask`` are preserved (see the method).
 
 No TensorFlow import appears on this path and device placement remains
 through the Phase 2 abstraction. CUDA training temporarily disables
@@ -112,6 +118,7 @@ import multiprocessing
 from contextlib import contextmanager
 
 import numpy as np
+import onnx
 import torch
 
 from core import mathlib
@@ -434,13 +441,61 @@ class XSegModel(ModelBase):
 
         return result
 
-    # Phase 10E (DFM/ONNX): the official tf2onnx export (the
-    # in_face:0 (None,256,256,3) -> out_mask:0 (None,256,256,1)
-    # opset-13 contract) is out of the 10C scope; the method exists
-    # and fails explicitly (the SAEHD precedent).
+    # Phase 10E (DFM/ONNX): the official tf2onnx export
+    # (Model_tf.py L254-281 — the in_face:0 (None,256,256,3) NHWC ->
+    # out_mask:0 (None,256,256,1) NHWC opset-13 contract) on the
+    # torch foundation.
     def export_dfm (self):
-        raise NotImplementedError(
-            "XSeg DFM/ONNX export is Phase 10E — Phase 10C implements "
-            "the training foundation only")
+        output_path = self.get_strpath_storage_for_file('model.onnx')
+        io.log_info(f'Dumping .onnx to {output_path}')
+
+        # torch replacement for the official placeholder graph: the
+        # official 'in_face' NHWC placeholder is transposed to NCHW
+        # (the NCHW net built by the is_exporting data-format rule
+        # above), the official `_, pred_t` selection of the flow
+        # tuple (the sigmoid — the contract's out_mask) is executed
+        # and transposed back to NHWC under the name 'out_mask'.
+        # The torch exporter is the legacy TorchScript ONNX exporter
+        # (dynamo=False): torch 2.14's dynamo path requires
+        # onnxscript (deliberately not installed — the Phase 10E
+        # dependency decision in PHASE10_STATE.md), and the legacy
+        # path reproduces the official tf2onnx name-based contract
+        # (dynamic_axes + opset_version + input/output names) exactly.
+        class _OnnxWrapper (torch.nn.Module):
+            def __init__ (self, model):
+                super().__init__()
+                self.model = model
+
+            def forward (self, x_nhwc):
+                x = x_nhwc.permute(0, 3, 1, 2)
+                _, pred = self.model(x)
+                return pred.permute(0, 2, 3, 1)
+
+        wrapper = _OnnxWrapper(self.model.model)
+        example = torch.zeros(1, self.resolution, self.resolution, 3,
+                              dtype=nn.floatx)
+
+        torch.onnx.export(
+            wrapper, (example,),
+            f=output_path,
+            input_names=['in_face'],
+            output_names=['out_mask'],
+            opset_version=13,
+            dynamo=False,
+            dynamic_axes={'in_face': {0: 'batch'},
+                          'out_mask': {0: 'batch'}},
+            do_constant_folding=True,
+        )
+
+        # The TorchScript exporter leaves the out_mask H/W annotation
+        # symbolic although the executed output is always
+        # (N,res,res,1) — align the annotation with the contract.
+        model = onnx.load(output_path)
+        for out in model.graph.output:
+            if out.name == 'out_mask':
+                dims = out.type.tensor_type.shape.dim
+                dims[1].dim_value = self.resolution
+                dims[2].dim_value = self.resolution
+        onnx.save(model, output_path)
 
 Model = XSegModel
