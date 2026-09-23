@@ -45,10 +45,14 @@ NOT copied)):
   proof);
 - strict two-pass (all-or-nothing) conversion: missing required
   weights, unexpected extra keys, shape mismatch (including
-  same-element-count wrong shapes), dtype mismatch (float16 file into
-  a float32 module), ambiguous mapping (two sub-names resolving to
-  one source key), corrupt values -> ``CheckpointLoadError`` with the
-  full structured report; on failure NOTHING is copied;
+  same-element-count wrong shapes), cross-kind dtype mismatch
+  (integer file into a float module), ambiguous mapping (two
+  sub-names resolving to one source key), corrupt values ->
+  ``CheckpointLoadError`` with the full structured report; on failure
+  NOTHING is copied. Float-kind source -> float-kind target follows
+  official ``batch_set_value`` semantics: the target parameter dtype
+  is authoritative and the file value is cast to it (including the
+  fp32-checkpoint -> export-only-fp16 architecture flow);
 - reverse export (torch -> official): the official-layout dict via
   the per-layer ``convert_weight_to_official`` hooks; explicit
   rejection with ``UnsupportedExportError`` (never a silent drop /
@@ -517,16 +521,34 @@ def test_same_element_count_wrong_shape_fails():
     assert "SHAPE_MISMATCH" in e2.value.args[0]
 
 
-def test_dtype_mismatch_fails():
+def test_float_kind_cast_and_cross_kind_rejection():
     c = _fresh_conv()
-    # float16 official file (FaceEnhancer convention) into a float32
-    # module: strict - no silent coercion
+    # Official batch_set_value casts a float-kind checkpoint value to
+    # the target variable dtype. This is also the Phase 11 fp32
+    # checkpoint -> export-only fp16 architecture contract.
+    src_weight = unique_value((3, 3, 3, 5)).astype(np.float16)
+    src_bias = unique_value((5,)).astype(np.float16)
+    rep = cv.convert_official_to_torch(
+        c, {"weight:0": src_weight, "bias:0": src_bias}, component="c")
+    assert rep.result == "PASS"
+    assert c.weight.dtype == torch.float32
+    assert c.bias.dtype == torch.float32
+    assert torch.equal(c.weight, torch.from_numpy(np.ascontiguousarray(
+        src_weight.transpose(3, 2, 0, 1))).to(torch.float32))
+    assert torch.equal(c.bias, torch.from_numpy(src_bias).to(torch.float32))
+
+    # Cross-kind coercion remains forbidden and atomic.
+    cross_kind = _fresh_conv()
+    before = [p.detach().clone() for p in cross_kind.parameters()]
     with pytest.raises(dfl_ckpt.CheckpointLoadError) as ei:
         cv.convert_official_to_torch(
-            c, {"weight:0": unique_value((3, 3, 3, 5)).astype(np.float16),
-                "bias:0": unique_value((5,))}, component="c")
+            cross_kind,
+            {"weight:0": unique_value((3, 3, 3, 5), dtype=np.int32),
+             "bias:0": unique_value((5,))}, component="c")
     assert "DTYPE_MISMATCH" in ei.value.args[0]
-    assert "float16" in ei.value.args[0]
+    assert "int32" in ei.value.args[0]
+    assert all(torch.equal(a, b) for a, b in
+               zip(before, cross_kind.parameters()))
 
 
 def test_runtime_dtype_and_aliases_are_strict_and_atomic(plain_tmp):
@@ -564,10 +586,14 @@ def test_runtime_dtype_and_aliases_are_strict_and_atomic(plain_tmp):
     alias = dict(canonical)
     alias['weight'] = alias.pop('weight:0')
     check(alias, True)
-    wrong_dtype = dict(canonical)
-    wrong_dtype['weight:0'] = np.full_like(
-        wrong_dtype['weight:0'], 0.125).astype(np.float16)
-    check(wrong_dtype, False, 'DTYPE_MISMATCH')
+    float_dtype = dict(canonical)
+    float_dtype['weight:0'] = np.full_like(
+        float_dtype['weight:0'], 0.125).astype(np.float16)
+    check(float_dtype, True)
+    wrong_kind = dict(canonical)
+    wrong_kind['weight:0'] = np.full(
+        canonical['weight:0'].shape, 1, dtype=np.int32)
+    check(wrong_kind, False, 'DTYPE_MISMATCH')
     conflicting = dict(canonical)
     conflicting['weight'] = conflicting['weight:0'] + 1
     check(conflicting, False, 'DUPLICATE_MAPPING')

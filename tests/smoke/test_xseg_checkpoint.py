@@ -24,7 +24,7 @@ so this file runs standalone on the tracked tree:
   exact failure this must not reproduce);
 - strict negatives (all-or-nothing pass 1): missing key, extra key,
   same-element-count shape mismatch (the exact failure mode of the
-  Phase 10B scratch-driver layout bug), dtype mismatch ->
+  Phase 10B scratch-driver layout bug), cross-kind dtype mismatch ->
   ``CheckpointLoadError`` and ZERO mutation (every parameter
   bit-identical to the pre-attempt snapshot);
 - ``facelib.XSegNet`` (torch port of the official wrapper,
@@ -267,7 +267,9 @@ def test_xseg_strict_load_negatives(plain_tmp, fmt, corrupt):
         w = d["dense1/weight:0"]
         d["dense1/weight:0"] = w.reshape(w.shape[::-1]).copy()
     elif corrupt == "dtype":
-        d["dense1/weight:0"] = d["dense1/weight:0"].astype(np.float16)
+        # Float-kind source -> float-kind target is the official cast
+        # policy; use a cross-kind value to pin the hard rejection.
+        d["dense1/weight:0"] = d["dense1/weight:0"].astype(np.int32)
     elif corrupt == "duplicate_alias":
         d[target[:-2]] = d[target]
 

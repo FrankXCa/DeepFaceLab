@@ -33,8 +33,9 @@ snapshot STAYS enabled — AMP never calls
 disable_default_options_autosave, the F-A4 note), the official
 model_filename_list, save -> strict resume -> continue, the
 official gan_model_changed GAN+GAN_opt re-init rule and the
-missing-file hard error, the export_dfm deferral stub, the
-predictor/merger inference paths.
+missing-file hard error, the predictor/merger inference paths
+(the export_dfm deferral stub was replaced by the Phase 11
+ONNX/DFM export tests — test_amp_onnx_export.py).
 
 Numerical labels (mandated): every formula pin here is
 FORMULA_VERIFIED; TF runtime parity is TF_RUNTIME_NOT_VERIFIED
@@ -565,16 +566,6 @@ def test_ae_merge_nontraining_morph_edges(tmp_path):
     assert p_msrc.shape == (res, res)
     assert p_md.shape == (res, res)
     assert p_bgr.dtype == np.float32
-
-
-def test_export_dfm_deferral_stub(tmp_path):
-    """The official export_dfm is a TF/tf2onnx graph export —
-    out of scope for Phase 7 (the ONNX/DFM exclusion): the
-    torch model raises NotImplementedError, like the Phase 6B
-    SAEHD port."""
-    model = construct(tmp_path, is_training=False, seed_options=seed(**TINY))
-    with pytest.raises(NotImplementedError, match='ONNX'):
-        model.export_dfm()
 
 
 # --- preview (the official L660-705 layout) --------------------------------------

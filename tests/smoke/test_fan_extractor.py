@@ -372,7 +372,9 @@ def test_strict_load_1d_state_outside_whitelist(fan2d):
 
 def test_strict_load_dtype_mismatch(fan2d):
     d = dict(FAN2D_OFFICIAL)
-    d["bn1/bias:0"] = np.zeros((1, 1, 1, 64), dtype=np.float64)
+    # Float-kind checkpoint values follow official target-dtype cast
+    # semantics; a cross-kind integer value must still fail.
+    d["bn1/bias:0"] = np.zeros((1, 1, 1, 64), dtype=np.int32)
     _fail_load(fan2d.model, d, "DTYPE_MISMATCH", "bn1/bias:0")
 
 

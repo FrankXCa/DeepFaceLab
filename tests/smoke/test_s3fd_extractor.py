@@ -282,7 +282,9 @@ def test_strict_load_shape_mismatch_l2norm_gain(bare_model):
 
 def test_strict_load_dtype_mismatch(bare_model):
     d = dict(S3FD_OFFICIAL)
-    d["conv1_1/bias:0"] = np.zeros((1, 1, 1, 64), dtype=np.float64)
+    # Float-kind checkpoint values follow official target-dtype cast
+    # semantics; a cross-kind integer value must still fail.
+    d["conv1_1/bias:0"] = np.zeros((1, 1, 1, 64), dtype=np.int32)
     _fail_load(bare_model, d, "DTYPE_MISMATCH", "conv1_1/bias:0")
 
 
