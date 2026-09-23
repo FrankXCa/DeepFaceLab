@@ -116,6 +116,7 @@ the migrated Phases 3F/3E2 foundations (nothing duplicated here).
 import multiprocessing
 
 import numpy as np
+import onnx
 import torch
 
 from core import mathlib
@@ -1242,15 +1243,116 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
         return result
 
-    # Phase 11 (DFM/ONNX): the official tf2onnx export is out of the
-    # torch-6A scope; the official I/O contract (in_face:0 ->
-    # out_face_mask:0 / out_celeb_face:0 / out_celeb_face_mask:0,
-    # opset 12, dynamic batch) is documented in
-    # docs/IMPLEMENTATION_PLAN_v2.md section 33.
+    # Phase 11 (DFM/ONNX): the official tf2onnx export
+    # (Model_tf.py L700-750 — the in_face:0 (None,res,res,3) NHWC ->
+    # out_face_mask:0 / out_celeb_face:0 / out_celeb_face_mask:0 NHWC
+    # opset-12 contract, name='SAEHD') on the torch foundation.
     def export_dfm (self):
-        raise NotImplementedError(
-            "SAEHD DFM/ONNX export is Phase 11 — Phase 6A implements "
-            "the structural foundation only")
+        output_path = self.get_strpath_storage_for_file('model.dfm')
+        io.log_info(f'Dumping .dfm to {output_path}')
+
+        # Official L706: the export graph is NCHW.  The model's own
+        # data-format rule (on_initialize, the official L191 rule — no
+        # is_exporting clause) is overridden for the export only; the
+        # production ExportDFM process exits right after this call, so
+        # the switch is harmless there (the test harness restores it).
+        nn.set_data_format ('NCHW')
+
+        # torch replacement for the official placeholder graph: the
+        # official 'in_face' NHWC placeholder is transposed to NCHW,
+        # the official non-training inference chain (the AE_merge code
+        # chain, official L709-730 — the df and liae branches) runs,
+        # and the three heads are transposed back to NHWC under the
+        # official names.  The torch exporter is the legacy TorchScript
+        # ONNX exporter (dynamo=False): torch 2.14's dynamo path
+        # requires onnxscript (deliberately not installed — the Phase
+        # 10E dependency decision in PHASE10_STATE.md), and the legacy
+        # path reproduces the official tf2onnx name-based contract
+        # (dynamic_axes + opset_version + input/output names) exactly.
+        class _DFMWrapper (torch.nn.Module):
+            def __init__ (self, model):
+                super().__init__()
+                # register only the archi sub-models (the exported
+                # graph); the discriminators / optimizers / sample
+                # state are training-side and never traced
+                if 'df' in model.archi_type:
+                    self.encoder = model.encoder
+                    self.inter = model.inter
+                    self.decoder_src = model.decoder_src
+                    self.decoder_dst = model.decoder_dst
+                    self.is_df = True
+                else:
+                    self.encoder = model.encoder
+                    self.inter_B = model.inter_B
+                    self.inter_AB = model.inter_AB
+                    self.decoder = model.decoder
+                    self.is_df = False
+
+            def forward (self, in_face):
+                # in_face: NHWC float32 [0..1] (the official
+                # placeholder layout)
+                x = in_face.permute (0, 3, 1, 2).contiguous()
+
+                if self.is_df:
+                    dst_code = self.inter ( self.encoder (x) )
+                    pred_src_dst, pred_src_dstm = self.decoder_src (dst_code)
+                    _, pred_dst_dstm = self.decoder_dst (dst_code)
+                else:
+                    code = self.encoder (x)
+                    dst_inter_B_code = self.inter_B (code)
+                    dst_inter_AB_code = self.inter_AB (code)
+                    dst_code = torch.cat ( [dst_inter_B_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis )
+                    src_dst_code = torch.cat ( [dst_inter_AB_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis )
+
+                    pred_src_dst, pred_src_dstm = self.decoder (src_dst_code)
+                    _, pred_dst_dstm = self.decoder (dst_code)
+
+                # the use_fp16 export knob: the archi boundary casts
+                # already return fp32 heads (the official decoder
+                # casts x/m back to float32) — the explicit casts keep
+                # the ONNX output dtype contract (float32) explicit
+                # for both precisions
+                pred_dst_dstm = pred_dst_dstm.to(torch.float32)
+                pred_src_dst = pred_src_dst.to(torch.float32)
+                pred_src_dstm = pred_src_dstm.to(torch.float32)
+
+                # official output order: out_face_mask (the DST
+                # learned mask), out_celeb_face, out_celeb_face_mask
+                return ( pred_dst_dstm.permute (0, 2, 3, 1),
+                         pred_src_dst.permute (0, 2, 3, 1),
+                         pred_src_dstm.permute (0, 2, 3, 1) )
+
+        wrapper = _DFMWrapper(self)
+        example = torch.zeros(1, self.resolution, self.resolution, 3,
+                              dtype=torch.float32)
+
+        torch.onnx.export(
+            wrapper, (example,),
+            f=output_path,
+            input_names=['in_face:0'],
+            output_names=['out_face_mask:0', 'out_celeb_face:0',
+                          'out_celeb_face_mask:0'],
+            opset_version=12,
+            dynamo=False,
+            dynamic_axes={'in_face:0': {0: 'batch'},
+                          'out_face_mask:0': {0: 'batch'},
+                          'out_celeb_face:0': {0: 'batch'},
+                          'out_celeb_face_mask:0': {0: 'batch'}},
+            do_constant_folding=True,
+        )
+
+        # The TorchScript exporter can leave the output H/W
+        # annotations symbolic although the executed outputs are
+        # always (N,res,res,C) — align the annotation with the
+        # contract (the Phase 10E XSeg pattern).
+        model = onnx.load(output_path)
+        for out in model.graph.output:
+            if out.name in ('out_face_mask:0', 'out_celeb_face:0',
+                            'out_celeb_face_mask:0'):
+                dims = out.type.tensor_type.shape.dim
+                dims[1].dim_value = self.resolution
+                dims[2].dim_value = self.resolution
+        onnx.save(model, output_path)
 
     #override
     def get_model_filename_list(self):

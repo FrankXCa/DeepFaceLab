@@ -173,6 +173,7 @@ Torch deviations (documented, numerics unchanged):
 import multiprocessing
 
 import numpy as np
+import onnx
 import torch
 
 from core import mathlib
@@ -907,12 +908,123 @@ class AMPModel(ModelBase):
                         generators_count=dst_generators_count )
                          ])
 
+    # Phase 11 (DFM/ONNX): the official tf2onnx export
+    # (Model_tf.py L585-629 — in_face:0 (None,res,res,3) +
+    # morph_value:0 (1,) -> out_face_mask:0 / out_celeb_face:0 /
+    # out_celeb_face_mask:0, opset 12, name='AMP') on the torch
+    # foundation.  AMP is always NCHW (the hard-wired official
+    # model_data_format, L107/L288) — the official AMP export calls
+    # no set_data_format (unlike SAEHD's L706).
     def export_dfm (self):
-        raise NotImplementedError(
-            "AMP DFM/ONNX export is out of scope for Phase 7 (the "
-            "official export_dfm is a TF/tf2onnx graph export — the "
-            "ONNX/DFM exclusion); the torch AE_merge path serves the "
-            "merger and the predictor")
+        output_path = self.get_strpath_storage_for_file('model.dfm')
+        io.log_info(f'Dumping .dfm to {output_path}')
+
+        # torch replacement for the official placeholder graph: the
+        # official 'in_face' NHWC placeholder is transposed to NCHW,
+        # the official AE_merge code chain (official L588-612) runs
+        # with the morph floor-slice (official L600-602) as a
+        # DYNAMIC graph input, and the three heads are transposed
+        # back to NHWC under the official names.  The torch exporter
+        # is the legacy TorchScript ONNX exporter (dynamo=False):
+        # torch 2.14's dynamo path requires onnxscript (deliberately
+        # not installed — the Phase 10E dependency decision in
+        # PHASE10_STATE.md), and the legacy path reproduces the
+        # official tf2onnx name-based contract (dynamic_axes +
+        # opset_version + input/output names) exactly.
+        class _DFMWrapper (torch.nn.Module):
+            def __init__ (self, model):
+                super().__init__()
+                # register only the archi sub-models (the exported
+                # graph); the discriminators / optimizers / sample
+                # state are training-side and never traced
+                self.encoder = model.encoder
+                self.inter_src = model.inter_src
+                self.inter_dst = model.inter_dst
+                self.decoder = model.decoder
+                self.inter_dims = int(model.inter_dims)
+
+            def forward (self, in_face, morph_value):
+                # in_face: NHWC float32 [0..1]; morph_value: float32
+                # (1,) — the official placeholder shape
+                x = in_face.permute (0, 3, 1, 2).contiguous()
+
+                code = self.encoder (x)
+                dst_inter_src_code = self.inter_src (code)
+                dst_inter_dst_code = self.inter_dst (code)
+
+                # Official morph semantics (Model_tf.py L600-602):
+                #   inter_dims_slice = cast (inter_dims *
+                #   morph_value[0], int32)  (the floor slice) and
+                #   src_dst_code = concat ( inter_src [0..k),
+                #   inter_dst [k..) ) on the channel axis — the
+                #   leading k channels from the inter_src head, the
+                #   remainder from inter_dst.
+                #
+                # Graph-traceable form of the same math (no Python
+                # int, no branch on morph): the boolean channel mask
+                #   m[c] = c < k,  k = floor (clamp (mv, 0, 1) * D)
+                # implements exactly that split —
+                #   src_dst_code = src * m + dst * (1 - m)
+                mv = morph_value.reshape (-1)[0].float()
+                k = torch.clamp ( torch.floor ( torch.clamp (mv, 0.0, 1.0) * self.inter_dims ) .long (), 0, self.inter_dims )
+                c_idx = torch.arange (self.inter_dims, device=dst_inter_src_code.device).view (1, self.inter_dims, 1, 1)
+                m = (c_idx < k).to(dst_inter_src_code.dtype)
+
+                src_dst_code = dst_inter_src_code * m + dst_inter_dst_code * (1.0 - m)
+
+                pred_src_dst, pred_src_dstm = self.decoder (src_dst_code)
+                _, pred_dst_dstm = self.decoder (dst_inter_dst_code)
+
+                # the use_fp16 export knob: the archi boundary casts
+                # already return fp32 heads (the official decoder
+                # casts x/m back to float32) — the explicit casts keep
+                # the ONNX output dtype contract (float32) explicit
+                # for both precisions
+                pred_src_dst = pred_src_dst.to(torch.float32)
+                pred_src_dstm = pred_src_dstm.to(torch.float32)
+                pred_dst_dstm = pred_dst_dstm.to(torch.float32)
+
+                # official output order: out_face_mask (the DST
+                # learned mask), out_celeb_face, out_celeb_face_mask
+                return ( pred_dst_dstm.permute (0, 2, 3, 1),
+                         pred_src_dst.permute (0, 2, 3, 1),
+                         pred_src_dstm.permute (0, 2, 3, 1) )
+
+        wrapper = _DFMWrapper(self)
+        example_face = torch.zeros(1, self.resolution, self.resolution, 3,
+                                   dtype=torch.float32)
+        # the morph example value is irrelevant to the graph shape
+        # (all mask ops are data-dependent — no Python control flow
+        # over k); any value traces the same graph
+        example_morph = torch.tensor([1.0], dtype=torch.float32)
+
+        torch.onnx.export(
+            wrapper, (example_face, example_morph),
+            f=output_path,
+            input_names=['in_face:0', 'morph_value:0'],
+            output_names=['out_face_mask:0', 'out_celeb_face:0',
+                          'out_celeb_face_mask:0'],
+            opset_version=12,
+            dynamo=False,
+            dynamic_axes={'in_face:0': {0: 'batch'},
+                          'out_face_mask:0': {0: 'batch'},
+                          'out_celeb_face:0': {0: 'batch'},
+                          'out_celeb_face_mask:0': {0: 'batch'}},
+            do_constant_folding=True,
+        )
+
+        # The TorchScript exporter can leave the output H/W
+        # annotations symbolic although the executed outputs are
+        # always (N,res,res,C) — align the annotation with the
+        # contract (the Phase 10E XSeg pattern).
+        model = onnx.load(output_path)
+        for out in model.graph.output:
+            if out.name in ('out_face_mask:0', 'out_celeb_face:0',
+                            'out_celeb_face_mask:0'):
+                dims = out.type.tensor_type.shape.dim
+                dims[1].dim_value = self.resolution
+                dims[2].dim_value = self.resolution
+        onnx.save(model, output_path)
 
     #override
     def get_model_filename_list(self):
