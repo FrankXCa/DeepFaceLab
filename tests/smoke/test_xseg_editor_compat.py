@@ -333,6 +333,22 @@ def test_qtex_package_imports_are_tf_free():
         assert not tf_like, f"{path.name} imports TF: {tf_like}"
 
 
+def test_editor_numpy2_gui_paths_avoid_removed_int_alias():
+    """Normal paint/polygon paths must remain usable with pinned NumPy 2."""
+    paths = [EDITOR_DIR / "XSegEditor.py", QTEX_DIR / "qtex.py"]
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        removed_aliases = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "np"
+            and node.attr == "int"
+        ]
+        assert not removed_aliases, (
+            f"{path.name} uses removed np.int on a classic editor GUI path")
+
+
 # --- 2. live import (real PyQt5 or stub) -----------------------------
 
 
