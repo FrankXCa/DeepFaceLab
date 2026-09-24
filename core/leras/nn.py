@@ -29,8 +29,11 @@ Phase 3A: torch-only foundation.
   top-level training lifecycle) runs on the torch foundation unchanged
   except documented hardenings; the official TF leras ModelBase source is
   preserved in core.leras.models.ModelBase_tf.py; model phases use native
-  torch autograd in onTrainOneIter (nn.tf.gradients is not stubbed);
-  nn.average_gv_list stays TF until the multi-GPU phase
+  torch autograd in onTrainOneIter;
+  nn.gradients is not stubbed (native torch autograd drives
+  single-device training); the torch nn.average_gv_list (Phase 12
+  multi-GPU replica gradient aggregation, core.leras.multidevice)
+  is available
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
@@ -40,11 +43,11 @@ total_variation_mse; Phase 3E2 migrated random_binomial; the rest of
 the official ops are preserved in ops/ops_tf.py and rebuilt in later
 subphases), optimizers/* (Phase 3E2 migrated the optimizer
 foundation, AdaBelief and RMSprop in torch; the TF reference is
-preserved in optimizers/optimizers_tf.py; the TF gradient
-machinery - nn.gradients/average_gv_list - is NOT stubbed under
-torch: Phase 5 single-device model code uses native torch autograd;
-average_gv_list (multi-GPU gradient averaging) stays TF until the
-multi-GPU phase); archis/* (Phase 3F migrated ArchiBase and the
+preserved in optimizers/optimizers_tf.py; nn.gradients is NOT stubbed
+under torch: Phase 5 single-device model code uses native torch
+autograd; average_gv_list (multi-GPU replica gradient averaging) is
+migrated to torch in Phase 12 (core.leras.multidevice, exposed as
+nn.average_gv_list)); archis/* (Phase 3F migrated ArchiBase and the
 DeepFakeArchi factory to torch - the official TF source is preserved in
 archis/archis_tf.py; Phase 3F also migrated the official discriminator
 classes CodeDiscriminator/PatchDiscriminator/UNetPatchDiscriminator in
@@ -63,6 +66,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import numpy as np
 
 from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
+from .multidevice import average_gv_list  # noqa: F401  (Phase 12 Commit 1: torch port of the official nn.average_gv_list replica gradient aggregation)
 
 
 class nn():
@@ -73,6 +77,10 @@ class nn():
     # `from core.leras import nn` (the class), not the nn.py module.
     DeviceConfig = DeviceConfig
     ask_choose_device_idxs = staticmethod(ask_choose_device_idxs)
+    # Phase 12 Commit 1: the torch port of the official nn.average_gv_list
+    # (replica gradient aggregation, core.leras.multidevice) is exposed here
+    # so `nn.average_gv_list` keeps working like the official call sites.
+    average_gv_list = staticmethod(average_gv_list)
 
     torch = None
     device = None
