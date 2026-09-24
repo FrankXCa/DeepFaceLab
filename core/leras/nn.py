@@ -39,7 +39,21 @@ Phase 3A: torch-only foundation.
   canonical<->mirror parameter mapping, buffer policy, initial +
   post-step sync, gradient-installation foundation, disposable
   mirrors — exposed as nn.ReplicaPlan, nn.ReplicaPlanError and
-  nn.build_replica_mirrors)
+  nn.build_replica_mirrors); Phase 12 Commit 3 adds
+  mixed-precision validation ACROSS replica devices (all-device
+  capability validation via mixed_precision.
+  resolve_precision_devices — the ONE global PrecisionPlan of the
+  run; the one-global-GradScaler canonical-side precision step
+  nn.run_replica_precision_step: canonicalization, structural
+  validation, pre-unscale nonfinite policy, official aggregation,
+  canonical install, exactly one unscale/step/update per attempt
+  THROUGH THE INJECTED MODEL-LAYER HOOKS (the existing
+  ModelBase._mp_unscale_opt / _mp_opt_step / _mp_scaler_update bound
+  hooks — no native scaler calls in this module), Class B cleanup;
+  nn.clear_replica_grads: the
+  complete canonical + mirror grad cleanup; nn.replica_param_lists:
+  per-replica gradient-ownership parameter lists; the precision
+  error is nn.ReplicaPrecisionError)
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
@@ -72,11 +86,15 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import numpy as np
 
 from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
-from .multidevice import (  # noqa: F401  (Phase 12: torch port of the official nn.average_gv_list replica gradient aggregation (Commit 1); device-independent replica mirror management (Commit 2))
+from .multidevice import (  # noqa: F401  (Phase 12: torch port of the official nn.average_gv_list replica gradient aggregation (Commit 1); device-independent replica mirror management (Commit 2); mixed-precision validation across replica devices (Commit 3))
     average_gv_list,
     ReplicaPlan,
     ReplicaPlanError,
     build_replica_mirrors,
+    ReplicaPrecisionError,
+    clear_replica_grads,
+    replica_param_lists,
+    run_replica_precision_step,
 )
 
 
@@ -101,6 +119,16 @@ class nn():
     ReplicaPlan = ReplicaPlan
     ReplicaPlanError = ReplicaPlanError
     build_replica_mirrors = staticmethod(build_replica_mirrors)
+    # Phase 12 Commit 3: mixed precision across replica devices
+    # (core.leras.multidevice) — the one-global-scaler canonical-side
+    # precision step (pre-unscale nonfinite policy, canonicalization,
+    # official aggregation, canonical install, one unscale/step/
+    # update, Class B cleanup), the complete replica grad cleanup
+    # and the per-replica gradient-ownership parameter lists.
+    ReplicaPrecisionError = ReplicaPrecisionError
+    clear_replica_grads = staticmethod(clear_replica_grads)
+    replica_param_lists = staticmethod(replica_param_lists)
+    run_replica_precision_step = staticmethod(run_replica_precision_step)
 
     torch = None
     device = None

@@ -207,6 +207,70 @@ replica mirror management, per the approved Phase 12 plan
   results are labeled ``SIMULATED_MULTI_REPLICA`` and physical
   multi-GPU acceptance stays ``PENDING_ENVIRONMENTALLY /
   NOT_VERIFIED``.
+
+Commit 3 (below the Commit-2 section): mixed-precision validation
+ACROSS REPLICA DEVICES (Phase 12 §6/§6.1):
+
+- **All-device precision validation** (§6, Milestone E): the
+  requested mode is validated against EVERY selected replica device
+  (``mixed_precision.resolve_precision_devices`` — fp16 needs
+  >= (5,3) on each CUDA device, bf16 >= (8,0) on each CUDA device
+  or a CPU device, ``off`` anywhere); an unsupported mode on ANY
+  selected device raises ``PrecisionUnsupportedError`` naming every
+  failing device — NO silent per-device fallback. The returned plan
+  is the ONE global ``PrecisionPlan`` of the run; each replica's
+  autocast region pins its own device type via
+  ``autocast_context(device_type=...)``.
+- **One global GradScaler** (§6): there is exactly ONE model-level
+  ``torch.amp.GradScaler`` (the fp16 plan's native-default scaler;
+  off/bf16 plans carry NONE) — never one scaler per replica, per
+  mirror, or per device. ``run_replica_precision_step`` refuses any
+  plan/scaler combination that violates this (an fp16 plan with
+  no scaler, or an off/bf16 plan with a scaler).
+- **Canonical-side precision step** (§6.1/§10.1.3,
+  ``run_replica_precision_step``): Commit-2
+  ``canonicalize_grads`` (association + secondary mirror grads
+  transferred to the canonical device, rebound to the canonical
+  parameters) → STRUCTURAL validation before any value-level policy
+  (Commit-1 ``average_gv_list`` layout/shape/dtype/None contract at
+  N>1; entry validation at N==1 — sparse/compressed-sparse
+  gradients always fail through ``ReplicaGradientError``) →
+  mode-aware PRE-unscale nonfinite policy over the structurally
+  valid grads (fp16: nonfinite SCALED grad values are NOT
+  rejected — a numeric overflow, not a layout defect: they pass
+  through canonical ``.grad`` installation so the GradScaler owns
+  overflow detection; off/bf16: hard error, matching the
+  single-device behavior) → ``average_gv_list`` (per-variable MEAN
+  over replicas; identity at N==1) → the averaged (scaled) grads
+  installed on the canonical ``.grad`` → exactly ONE canonical
+  ``unscale`` / ``step`` / ``update`` sequence per attempt,
+  executed THROUGH THE INJECTED MODEL-LAYER HOOKS (the existing
+  ``ModelBase._mp_unscale_opt`` / ``_mp_opt_step`` /
+  ``_mp_scaler_update`` bound methods supplied by the model — this
+  module never calls native scaler methods itself and never
+  imports ``models/``; off/bf16 hooks are the no-op / direct
+  ``get_update_op`` semantics). A skipped canonical step (Class B
+  overflow) clears ALL canonical + secondary mirror grads before
+  returning ``False`` — the caller raises ``SkippedGeneratorStep``
+  (model layer) and the existing ``_mp_run_generator`` retry policy
+  applies (16 bounded attempts under fp16, 1 under off/bf16).
+  Likewise the per-replica SCALED backward is the model layer's
+  existing ``ModelBase._mp_backward`` (the one global scaler
+  scales every replica's per-sample loss vector; off/bf16 stays
+  unscaled) — no second scaler path exists.
+- **Class A / Class B separation** (§6.1): a nonfinite forward
+  output or loss on ANY replica is Class A — the attempt closure
+  clears the canonical + all mirror grads (``clear_replica_grads``)
+  and raises the hard ``FloatingPointError`` (never retried, never
+  scaler-recorded, never a ``SkippedGeneratorStep``); Class B is
+  the GradScaler's overflow bookkeeping only.
+- **Replica gradient ownership** (§6.1): replica 0 (primary)
+  computes on the CANONICAL parameters (it has no mirror); replica
+  r > 0 computes on its MIRROR parameters. ``replica_param_lists``
+  returns the per-replica parameter lists that own each replica's
+  gradients (path-aligned through the Commit-2 §10.1.2 mapping);
+  ``clear_replica_grads`` is the complete attempt-start / Class A /
+  Class B grad cleanup over canonical + all mirrors.
 """
 
 import copy
@@ -214,6 +278,7 @@ import copy
 import torch
 
 from .checkpoint import official_name as _official_name
+from .mixed_precision import PrecisionPlan as _PrecisionPlan
 
 __all__ = [
     "average_gv_list",
@@ -222,6 +287,10 @@ __all__ = [
     "ReplicaPlan",
     "ComponentMirrorSet",
     "build_replica_mirrors",
+    "ReplicaPrecisionError",
+    "clear_replica_grads",
+    "replica_param_lists",
+    "run_replica_precision_step",
 ]
 
 
@@ -1373,3 +1442,312 @@ class ReplicaPlan:
         self._seen_obj_ids = set()
         self._seen_storage_ptrs = set()
         self._disposed = True
+
+
+# ---------------------------------------------------------------------------
+# Commit 3: mixed precision across replica devices (Phase 12 §6/§6.1)
+# ---------------------------------------------------------------------------
+
+class ReplicaPrecisionError(ValueError):
+    """A canonical-side precision-lifecycle contract violation
+    (Phase 12 Commit 3): a plan/precision-plan/scaler/optimizer
+    combination that violates the ONE-global-scaler rule, a
+    replica-count mismatch, or a nonfinite replica gradient under
+    an off/bf16 plan (no GradScaler exists there to own overflow
+    detection — hard error, matching the single-device behavior).
+
+    Distinct from ``ReplicaPlanError`` (construction/registry
+    state) and ``ReplicaGradientError`` (Commit-1 aggregation
+    structure): this is the precision step's own contract layer.
+    """
+
+
+def clear_replica_grads(plan):
+    """Clear the accumulated gradients of EVERY trainable tensor the
+    plan's components own: the CANONICAL (primary, replica 0)
+    parameters AND all secondary MIRROR parameters (the §6.1
+    attempt-start, Class A and Class B cleanup).
+
+    Gradients accumulated by an aborted or skipped attempt must
+    NEVER survive into a later attempt or step (a later replica's
+    overflow discards every earlier replica's grads; a Class A
+    abort clears the partial-attempt state before the hard
+    ``FloatingPointError`` propagates). Only ``.grad`` references
+    drop — parameter/buffer DATA, optimizer state and all
+    checkpoint-owned state are untouched, and the mirrors stay in
+    place (only their accumulated gradients clear)."""
+    if not isinstance(plan, ReplicaPlan):
+        raise TypeError(
+            f"clear_replica_grads: plan must be a ReplicaPlan (got "
+            f"{type(plan).__name__})"
+        )
+    plan._check_alive("clear_replica_grads")
+    for component in plan.components:
+        for p in component.canonical_params:
+            p.grad = None
+        for replica in range(1, plan.num_replicas):
+            for p in component.mirror_params[replica]:
+                p.grad = None
+
+
+def replica_param_lists(plan, canonical_params):
+    """The per-replica parameter lists that OWN each replica's
+    gradients (the §6.1 ownership rule, exposed for the attempt
+    closures): replica 0 (primary) computes on the CANONICAL
+    parameters — the returned replica-0 list is ``canonical_params``
+    itself (same objects, same order); replica r > 0 computes on its
+    MIRROR counterpart of each canonical parameter (path-aligned
+    through the Commit-2 §10.1.2 mapping).
+
+    ``canonical_params`` must be canonical parameters of the
+    plan's registered components — a subset (one optimizer's
+    variable group) is fine; the production G/D closures pass each
+    optimizer's weight list. Returns a list of ``num_replicas``
+    per-replica parameter lists.
+
+    Raises:
+        TypeError: ``plan`` is not a :class:`ReplicaPlan`.
+        ReplicaPrecisionError: a listed parameter is not a
+            canonical parameter of a registered component, or the
+            plan is disposed.
+    """
+    if not isinstance(plan, ReplicaPlan):
+        raise TypeError(
+            f"replica_param_lists: plan must be a ReplicaPlan (got "
+            f"{type(plan).__name__})"
+        )
+    plan._check_alive("replica_param_lists")
+    index_by_id = {}
+    for component in plan.components:
+        for i, p in enumerate(component.canonical_params):
+            index_by_id[id(p)] = (component, i)
+    n = plan.num_replicas
+    result = [[] for _ in range(n)]
+    for p in canonical_params:
+        hit = index_by_id.get(id(p))
+        if hit is None:
+            raise ReplicaPrecisionError(
+                "replica_param_lists: a listed parameter is not a "
+                "canonical parameter of this plan's registered "
+                "components — replica 0 computes on the canonical "
+                "parameters; register the owning component first"
+            )
+        component, i = hit
+        result[0].append(p)
+        for replica in range(1, n):
+            result[replica].append(component.mirror_params[replica][i])
+    return result
+
+
+def run_replica_precision_step(plan, precision_plan, scaler, optimizer,
+                               replica_grad_lists, active_weights=None,
+                               unscale_hook=None, step_hook=None,
+                               update_hook=None):
+    """The canonical-side §6.1 precision step of ONE attempt (Phase 12
+    Commit 3 foundation; the per-replica compute — per-replica
+    forward under the run-wide plan's per-replica autocast, the Class
+    A nonfinite forward/loss check, and the per-replica SCALED
+    backward through the model layer's ``ModelBase._mp_backward`` —
+    is owned by the caller's attempt closure).
+
+    Pipeline (the ordering is the §6.1 contract):
+
+    1. Commit-2 ``canonicalize_grads``: validate replica 0 against
+       the CANONICAL parameters and each secondary replica against
+       the MIRROR counterpart of the same canonical parameter
+       (association), and transfer the secondary MIRROR grads to the
+       canonical device (replica 0's grads are already canonical);
+    2. STRUCTURAL validation before any value-level policy: N > 1
+       through Commit-1 ``average_gv_list`` (pair structure, DENSE
+       STRIDED layout — sparse/compressed-sparse rejected, shape,
+       dtype, None rejection); N == 1 entry-by-entry (pair
+       structure, tensor, strided layout, grad/param shape) — a
+       malformed or sparse gradient ALWAYS fails through the
+       deliberate Commit-1 ``ReplicaGradientError`` contract, never
+       through a backend-specific value error;
+    3. mode-aware PRE-unscale nonfinite policy over the
+       STRUCTURALLY VALID per-replica gradients: fp16 — nonfinite
+       SCALED grad values are NOT rejected (a numeric overflow is
+       not a layout / structure defect: they deliberately pass
+       through canonical ``.grad`` installation so the GradScaler
+       records ``found_inf`` and owns overflow detection; §10.1.3
+       PRE/POST split); off/bf16 — a nonfinite dense replica
+       gradient is a hard :class:`ReplicaPrecisionError` (no scaler
+       exists to classify it; parity with the single-device
+       behavior);
+    4. Commit-1 ``average_gv_list``: per-variable MEAN over the
+       replicas (identity at N==1) — under fp16 this is the MEAN OF
+       THE SCALED GRADIENTS;
+    5. the averaged grads are installed on the canonical
+       ``parameter.grad`` (the canonical parameters are the
+       optimizer's variables — mirror params never enter optimizer
+       state);
+    6. exactly ONE canonical precision sequence per attempt,
+       executed through the injected MODEL-LAYER hooks:
+       ``unscale_hook(optimizer, active_weights)`` → the existing
+       ``ModelBase._mp_unscale_opt`` (exposes the true/unscaled
+       grads before the update op; no-op for off/bf16),
+       ``step_hook(optimizer, grads_vars) -> bool`` → the existing
+       ``ModelBase._mp_opt_step`` (the native GradScaler SKIPS the
+       update op when its overflow check fired; off/bf16 run the
+       direct ``get_update_op``), ``update_hook()`` → the existing
+       ``ModelBase._mp_scaler_update`` (overflow backoff / growth
+       bookkeeping; no-op for off/bf16) — exactly ONE call to each
+       per attempt (never once per replica).
+
+    The hooks are the bound ``ModelBase`` mixed-precision methods,
+    supplied by the model (production) or the test harness; this
+    module NEVER calls native scaler methods itself and NEVER
+    imports ``models/`` (no dependency, no duplicated ModelBase hook
+    logic — the same hooks the single-device production path
+    uses), and the ``_mp_run_generator`` retry authority stays in
+    ``ModelBase``. ``scaler`` is the one global ``GradScaler`` of
+    the run (``None`` for off/bf16); it is inspected here ONLY for
+    the one-global-scaler contract check (an fp16 plan without its
+    scaler, or an off/bf16 plan carrying one, is refused) — all
+    scaler OPERATION happens inside the injected hooks.
+
+    Returns:
+        bool: ``True`` — the canonical optimizer stepped (a
+        successful canonical step; the caller then syncs the
+        mirrors, §10.1.5). ``False`` — the canonical step was
+        SKIPPED by the GradScaler overflow check (Class B): ALL
+        canonical + secondary mirror grads were already cleared
+        here, no mirror sync may follow (no update to sync), no
+        optimizer-iteration increment occurred; the caller (the
+        model-layer attempt closure) raises ``SkippedGeneratorStep``
+        so the EXISTING ``_mp_run_generator`` retry policy applies
+        (16 bounded attempts under fp16, 1 under off/bf16).
+
+    Raises:
+        ReplicaPrecisionError: the plan is disposed; a
+            plan/scaler/precision-plan combination violates the
+            ONE-global-scaler rule (an fp16 plan with no scaler, or
+            an off/bf16 plan with a scaler); a replica-count
+            mismatch; a hook is missing or not callable; a
+            nonfinite dense replica gradient under an off/bf16 plan.
+        ReplicaPlanError: the Commit-2 ``canonicalize_grads``
+            ownership/transfer contract is violated.
+        ReplicaGradientError: the Commit-1 structural contract
+            (pair structure, dense strided layout, shape, dtype,
+            None) is violated.
+    """
+    if not isinstance(plan, ReplicaPlan):
+        raise TypeError(
+            f"run_replica_precision_step: plan must be a ReplicaPlan (got "
+            f"{type(plan).__name__})"
+        )
+    plan._check_alive("run_replica_precision_step")
+    if not isinstance(precision_plan, _PrecisionPlan):
+        raise TypeError(
+            "run_replica_precision_step: precision_plan must be a "
+            "mixed_precision.PrecisionPlan (the one global plan of the "
+            f"run, resolved across ALL selected devices; got "
+            f"{type(precision_plan).__name__})"
+        )
+    # The ONE-global-scaler rule (§6) — CONTRACT CHECK ONLY: exactly
+    # one model-level GradScaler per run, never one per replica /
+    # mirror / device. fp16 plans REQUIRE it; off/bf16 plans must NOT
+    # carry it. The scaler itself is operated only by the injected
+    # model-layer hooks (below).
+    if precision_plan.scaler_required and scaler is None:
+        raise ReplicaPrecisionError(
+            "run_replica_precision_step: an fp16 plan REQUIRES the one "
+            "global GradScaler (exactly one model-level scaler per run; "
+            "never one scaler per replica or per device)"
+        )
+    if not precision_plan.scaler_required and scaler is not None:
+        raise ReplicaPrecisionError(
+            "run_replica_precision_step: off/bf16 plans carry NO "
+            "GradScaler (bf16 forbids a scaler; passing one makes the "
+            "step depend on FP16 machinery that does not apply)"
+        )
+    if len(replica_grad_lists) != plan.num_replicas:
+        raise ReplicaPrecisionError(
+            f"run_replica_precision_step: expected exactly "
+            f"{plan.num_replicas} per-replica gradient list(s) (one per "
+            f"replica), got {len(replica_grad_lists)}"
+        )
+    # The injected MODEL-LAYER hooks (the dependency-injected
+    # interface): the canonical unscale/step/update sequence is owned
+    # by the EXISTING ModelBase mixed-precision hooks (the bound
+    # methods the model supplies — ModelBase._mp_unscale_opt /
+    # ModelBase._mp_opt_step / ModelBase._mp_scaler_update). This
+    # module never calls native scaler methods itself and never
+    # duplicates ModelBase hook logic.
+    for name, hook in (("unscale_hook", unscale_hook),
+                       ("step_hook", step_hook),
+                       ("update_hook", update_hook)):
+        if not callable(hook):
+            raise ReplicaPrecisionError(
+                f"run_replica_precision_step: {name} must be a callable "
+                "model-layer hook — the canonical precision sequence is "
+                "owned by the existing ModelBase mixed-precision hooks "
+                "(ModelBase._mp_unscale_opt / _mp_opt_step / "
+                f"_mp_scaler_update, bound and supplied by the model); "
+                f"got {type(hook).__name__}"
+            )
+
+    # 1: Commit-2 association + transfer (secondary MIRROR grads to
+    # the canonical device, rebound to the CANONICAL parameters);
+    # N == 1 is the official identity.
+    canonical_lists = plan.canonicalize_grads(replica_grad_lists)
+    # 2: STRUCTURAL validation (+ N > 1 aggregation) BEFORE any
+    # value-level policy, so a malformed / sparse / compressed-
+    # sparse gradient fails through the deliberate Commit-1
+    # contract.
+    if plan.num_replicas == 1:
+        for i, entry in enumerate(canonical_lists):
+            g, p = _validate_entry(0, i, entry)
+            if g.shape != p.shape:
+                raise ReplicaGradientError(
+                    f"run_replica_precision_step: variable {i} gradient "
+                    f"shape {tuple(g.shape)} does not match the "
+                    f"parameter shape {tuple(p.shape)}"
+                )
+        averaged = canonical_lists
+    else:
+        averaged = average_gv_list(canonical_lists)
+    # 3: mode-aware PRE-unscale nonfinite policy over the
+    # structurally valid per-replica gradients (the §10.1.3
+    # PRE/POST split): off/bf16 reject nonfinite grads immediately
+    # (hard error — no scaler exists to detect them); fp16
+    # deliberately lets nonfinite SCALED values through so the
+    # GradScaler owns overflow detection (Class B) — a numeric
+    # overflow, never a layout defect.
+    if not precision_plan.scaler_required:
+        lists = (canonical_lists if plan.num_replicas > 1
+                 else [canonical_lists])
+        for replica in range(plan.num_replicas):
+            for i, (g, _p) in enumerate(lists[replica]):
+                if not torch.isfinite(g).all():
+                    raise ReplicaPrecisionError(
+                        f"run_replica_precision_step: replica {replica} "
+                        f"variable {i} has a NONFINITE gradient under "
+                        f"precision '{precision_plan.mode}' — no "
+                        f"GradScaler exists in off/bf16 to classify "
+                        f"overflow, so nonfinite optimizer input is a "
+                        f"hard error (the single-device behavior)"
+                    )
+    # 5: install on the canonical parameters (the optimizer's
+    # variables).
+    for g, p in averaged:
+        p.grad = g
+    # 6: exactly ONE canonical unscale / step / update per attempt,
+    # through the injected model-layer hooks (the one global scaler
+    # is operated exclusively by those hooks; the off/bf16 hooks are
+    # ModelBase's no-op / direct-get_update_op semantics).
+    unscale_hook(optimizer, active_weights)
+    stepped = step_hook(optimizer, averaged)
+    update_hook()
+    if not stepped:
+        # Class B: the GradScaler rejected the attempt (found_inf
+        # — a secondary replica's overflow reached the canonical
+        # grads THROUGH the averaging step). Complete cleanup:
+        # ALL canonical + secondary mirror grads (a later
+        # replica's overflow discards every earlier replica's
+        # grads; none may survive into the retry). No mirror sync
+        # (no update to sync); the caller raises
+        # SkippedGeneratorStep → the existing bounded retry.
+        clear_replica_grads(plan)
+    return stepped
