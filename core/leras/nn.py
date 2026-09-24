@@ -33,7 +33,13 @@ Phase 3A: torch-only foundation.
   nn.gradients is not stubbed (native torch autograd drives
   single-device training); the torch nn.average_gv_list (Phase 12
   multi-GPU replica gradient aggregation, core.leras.multidevice)
-  is available
+  is available; Phase 12 Commit 2 adds the device-independent
+  replica mirror management (core.leras.multidevice.ReplicaPlan /
+  nn.ReplicaPlan: replica plan, mirror construction, alias-aware
+  canonical<->mirror parameter mapping, buffer policy, initial +
+  post-step sync, gradient-installation foundation, disposable
+  mirrors — exposed as nn.ReplicaPlan, nn.ReplicaPlanError and
+  nn.build_replica_mirrors)
 
 Remaining TensorFlow-dependent leras areas (later Phase 3 subphases /
 model phases): ops/* (Phase 3C migrated depth_to_space; Phase 3D
@@ -66,7 +72,12 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import numpy as np
 
 from .device import Devices, DeviceConfig, ask_choose_device_idxs  # noqa: F401  (device layer owns selection semantics; nn.DeviceConfig / nn.ask_choose_device_idxs stay aliases for existing call sites)
-from .multidevice import average_gv_list  # noqa: F401  (Phase 12 Commit 1: torch port of the official nn.average_gv_list replica gradient aggregation)
+from .multidevice import (  # noqa: F401  (Phase 12: torch port of the official nn.average_gv_list replica gradient aggregation (Commit 1); device-independent replica mirror management (Commit 2))
+    average_gv_list,
+    ReplicaPlan,
+    ReplicaPlanError,
+    build_replica_mirrors,
+)
 
 
 class nn():
@@ -81,6 +92,15 @@ class nn():
     # (replica gradient aggregation, core.leras.multidevice) is exposed here
     # so `nn.average_gv_list` keeps working like the official call sites.
     average_gv_list = staticmethod(average_gv_list)
+    # Phase 12 Commit 2: device-independent replica mirror management
+    # (core.leras.multidevice) — the ordered replica plan with its
+    # per-component mirror sets (disposable runtime state, never
+    # checkpoint-owned), the alias-aware canonical<->mirror parameter
+    # mapping, the buffer policy, the initial/post-step sync, the
+    # gradient-installation foundation and the plan lifecycle.
+    ReplicaPlan = ReplicaPlan
+    ReplicaPlanError = ReplicaPlanError
+    build_replica_mirrors = staticmethod(build_replica_mirrors)
 
     torch = None
     device = None

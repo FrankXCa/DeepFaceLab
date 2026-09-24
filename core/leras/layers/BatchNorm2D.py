@@ -29,6 +29,16 @@ class BatchNorm2D(LayerBase):
     currently not for training
     """
 
+    # Phase 12 mirror buffer declaration (docs/PHASE12_STATE.md §10.1.4):
+    # this layer is inference-only by the official contract — its forward
+    # applies the SAVED running statistics and never updates them during
+    # training. The registered buffers are therefore CLASS A (immutable
+    # during training: copied canonical -> mirror at the initial sync and
+    # re-synced by the same canonical -> mirror sync). The declaration is
+    # explicit and lives with the component, per the buffer policy (the
+    # mirror factory never infers A/B from buffer names or heuristics).
+    _dfl_buffer_classes = {"running_mean": "A", "running_var": "A"}
+
     def __init__(self, dim, eps=1e-05, momentum=0.1, dtype=None, name=None, **kwargs):
         self.dim = dim
         self.eps = eps
