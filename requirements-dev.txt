@@ -7,9 +7,8 @@
 # The Phase 2 device test suite imports `core.leras` (nn.py pulls in
 # core.interact), so the test environment also needs the app-level
 # modules below. These are test-environment dependencies only: the
-# runtime requirements (requirements-cuda.txt / requirements-cpu.txt)
-# remain minimal, and OpenCV/Matplotlib/IPython become runtime
-# dependencies only when later phases (models, extractors) require them.
+# packaged-runtime inputs remain separate. OpenCV is now a required runtime
+# dependency; Matplotlib and IPython remain development/test-only.
 
 # test runner
 pytest==9.1.1

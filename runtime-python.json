@@ -1,0 +1,17 @@
+{
+  "archive": {
+    "cpu_baseline": "x86_64",
+    "filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "flavor": "install_only_stripped",
+    "release": "20250828",
+    "sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f",
+    "source_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250828/cpython-3.12.11%2B20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "target_triple": "x86_64-pc-windows-msvc"
+  },
+  "implementation": "CPython",
+  "license_inventory": "runtime-python-licenses.json",
+  "platform": "Windows x64 / AMD64",
+  "project": "astral-sh/python-build-standalone",
+  "schema_version": 1,
+  "version": "3.12.11"
+}

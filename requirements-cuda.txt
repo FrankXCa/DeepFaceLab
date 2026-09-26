@@ -1,58 +1,22 @@
-# DeepFaceLab modernization — CUDA runtime baseline (Phase 1)
+# DeepFaceLab modernization — CUDA packaged-runtime input (Phase 13)
 #
-# Windows 11. Tested with Python 3.12.11 (3.11 also supported).
+# Windows 11. Packaged target: CPython 3.12.11, Windows x64 / AMD64.
 # Tested machine: NVIDIA GeForce RTX 4090, driver 591.86 (CUDA 13.1).
 #
 #   - RTX 4090 (Ada, sm_89):  TESTED in Phase 1
 #   - RTX 50 series (Blackwell, sm_120): TARGET — cu130 wheels are
 #     dependency-level compatible; no Blackwell hardware was tested.
 #
-# Install:
-#   uv venv .venv --python 3.12
-#   uv pip install --index-strategy unsafe-best-match \
-#       -r requirements-cuda.txt -r requirements-dev.txt
-# (pip users: plain `pip install -r` is fine; the uv flag is needed
-# because the PyTorch index mirrors a few numpy versions and uv's
-# default first-index-wins strategy would otherwise miss numpy on PyPI.)
-#
-# CPU-only variant (import/fallback path): see requirements-cpu.txt
+# This is a curated direct input, not an install lock. Commit-1 artifact locks
+# select one exact Windows cp312 wheel for every direct and transitive package.
+# Development/test dependencies are deliberately separate.
+# The former generic requirements-lock.txt freeze snapshot is retired because it
+# mixed CUDA, CPU, runtime, and development state without artifact identities.
 
 --extra-index-url https://download.pytorch.org/whl/cu130
+-r requirements-runtime-common.txt
 
 # --- required runtime ---
 # torch is pinned to the Blackwell-capable cu130 build, fetched from the
 # PyTorch index above (the local version tag only exists on that index).
-# Driver-restricted systems (cu128 line only) can use the last cu128-line
-# release, torch==2.11.0+cu128, from https://download.pytorch.org/whl/cu128.
 torch==2.14.0+cu130
-numpy==2.5.3
-
-# Phase 5: the official model lifecycle (models/ModelBase.py) imports
-# core.imagelib, whose morph module requires scipy and whose
-# color_transfer module requires numexpr (official baseline pinned
-# scipy==1.4.1 and left numexpr unpinned for the TF era; the pinned
-# versions here are the py3.12/NumPy-2.x lines) — runtime dependencies
-# of the model/training phases.
-scipy==1.18.1
-numexpr==2.14.2
-
-# Phase 9: the extractors (facelib/S3FDExtractor.py, facelib/
-# FANExtractor.py) import cv2 at module import time (BGR->RGB flip +
-# INTER_LINEAR resize preprocessing); Phase 8 deliberately left it
-# out. The version matches the frozen official-TF reference env.
-opencv-python==5.0.0.93
-
-# Phase 10E: XSeg ONNX export (models/Model_XSeg/Model.py export_dfm —
-# the legacy torch TorchScript ONNX exporter serializes through the
-# onnx package) and the export/parity validation (onnxruntime CPU).
-# Both pins verified in the exact project venv (Python 3.12.11,
-# numpy 2.5.3, torch 2.14.0+cu130). onnxscript is NOT required: the
-# exporter uses the legacy path, not torch's dynamo ONNX path.
-onnx==1.23.0
-onnxruntime==1.30.0
-
-# --- optional (not part of the Phase 1 baseline) ---
-# torchvision — revisit in Phase 9 (extractors) if needed
-#
-# Deliberately excluded from this phase (IMPLEMENTATION_PLAN.md section 12):
-# FP8, INT4, NVFP4, TorchAO, TensorRT

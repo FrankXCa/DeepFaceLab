@@ -1,0 +1,4 @@
+# DeepFaceLab packaged-runtime GUI direct input (Phase 13)
+# Included only by cuda-gui and cpu-gui.
+
+PyQt5==5.15.11

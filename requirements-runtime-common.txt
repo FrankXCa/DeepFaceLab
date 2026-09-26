@@ -1,0 +1,12 @@
+# DeepFaceLab packaged-runtime common direct inputs (Phase 13)
+#
+# Curated pins only. This file is not an install lock; use one of the four
+# requirements-lock-<variant>.txt artifact locks for future assembly.
+
+numpy==2.5.3
+scipy==1.18.1
+numexpr==2.14.2
+opencv-python==5.0.0.93
+onnx==1.23.0
+onnxruntime==1.30.0
+ffmpeg-python==0.2.0

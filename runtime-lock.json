@@ -1,0 +1,85 @@
+{
+  "indexes": {
+    "default": "https://pypi.org/simple",
+    "torch": {
+      "cpu": "https://download.pytorch.org/whl/cpu",
+      "cuda": "https://download.pytorch.org/whl/cu130"
+    }
+  },
+  "resolver": {
+    "index_strategy": "unsafe-best-match",
+    "name": "uv",
+    "only_binary": ":all:",
+    "resolution": "highest",
+    "version": "0.12.18"
+  },
+  "resolved_versions": {
+    "common": {
+      "ffmpeg-python": "0.2.0",
+      "filelock": "4.0.3",
+      "flatbuffers": "25.12.19",
+      "fsspec": "2026.9.0",
+      "future": "1.0.0",
+      "jinja2": "3.1.6",
+      "markupsafe": "3.0.3",
+      "ml-dtypes": "0.6.0",
+      "mpmath": "1.3.0",
+      "networkx": "3.7",
+      "numexpr": "2.14.2",
+      "numpy": "2.5.3",
+      "onnx": "1.23.0",
+      "onnxruntime": "1.30.0",
+      "opencv-python": "5.0.0.93",
+      "packaging": "26.3",
+      "protobuf": "7.36.2",
+      "scipy": "1.18.1",
+      "setuptools": "84.0.0",
+      "sympy": "1.14.0",
+      "typing-extensions": "4.16.0"
+    },
+    "gui": {
+      "pyqt5": "5.15.11",
+      "pyqt5-qt5": "5.15.2",
+      "pyqt5-sip": "12.19.0"
+    },
+    "torch": {
+      "cpu": "2.14.0+cpu",
+      "cu130": "2.14.0+cu130"
+    }
+  },
+  "schema_version": 1,
+  "target": {
+    "implementation": "CPython",
+    "platform": "x86_64-pc-windows-msvc",
+    "python": "3.12.11",
+    "wheel_platform": "win_amd64"
+  },
+  "variants": {
+    "cpu-gui": {
+      "inputs": [
+        "requirements-cpu.txt",
+        "requirements-runtime-gui.txt"
+      ],
+      "torch_backend": "cpu"
+    },
+    "cpu-nogui": {
+      "inputs": [
+        "requirements-cpu.txt"
+      ],
+      "torch_backend": "cpu"
+    },
+    "cuda-gui": {
+      "inputs": [
+        "requirements-cuda.txt",
+        "requirements-runtime-gui.txt"
+      ],
+      "torch_backend": "cu130"
+    },
+    "cuda-nogui": {
+      "inputs": [
+        "requirements-cuda.txt"
+      ],
+      "torch_backend": "cu130"
+    }
+  }
+}

@@ -1,42 +1,14 @@
-# DeepFaceLab modernization — CPU-only runtime baseline (Phase 1)
+# DeepFaceLab modernization — CPU packaged-runtime input (Phase 13)
 #
 # Validates the CPU import/fallback path: a torch build without CUDA
 # libraries, so the baseline must import and run basic tensor work on
-# CPU alone. Same Python baseline as requirements-cuda.txt.
-#
-# Install:
-#   uv venv .venv-cpu --python 3.12
-#   uv pip install --index-strategy unsafe-best-match \
-#       -r requirements-cpu.txt -r requirements-dev.txt
-# (pip users: plain `pip install -r` is fine; see requirements-cuda.txt
-# for why the uv flag is needed.)
+# CPU alone. Packaged target: CPython 3.12.11, Windows x64 / AMD64.
+# This is a curated direct input, not an install lock.
+# The former generic requirements-lock.txt freeze snapshot is retired in favor
+# of the four explicit requirements-lock-<variant>.txt artifact locks.
 
 --extra-index-url https://download.pytorch.org/whl/cpu
+-r requirements-runtime-common.txt
 
 # --- required runtime (CPU variant) ---
 torch==2.14.0+cpu
-numpy==2.5.3
-
-# Phase 5: the official model lifecycle (models/ModelBase.py) imports
-# core.imagelib, whose morph module requires scipy and whose
-# color_transfer module requires numexpr (official baseline pinned
-# scipy==1.4.1 and left numexpr unpinned for the TF era; the pinned
-# versions here are the py3.12/NumPy-2.x lines) — runtime dependencies
-# of the model/training phases.
-scipy==1.18.1
-numexpr==2.14.2
-
-# Phase 9: the extractors (facelib/S3FDExtractor.py, facelib/
-# FANExtractor.py) import cv2 at module import time (BGR->RGB flip +
-# INTER_LINEAR resize preprocessing); Phase 8 deliberately left it
-# out. The version matches the frozen official-TF reference env.
-opencv-python==5.0.0.93
-
-# Phase 10E: XSeg ONNX export (models/Model_XSeg/Model.py export_dfm —
-# the legacy torch TorchScript ONNX exporter serializes through the
-# onnx package) and the export/parity validation (onnxruntime CPU).
-# Both pins verified in the exact project venv (Python 3.12.11,
-# numpy 2.5.3, torch 2.14.0+cpu). onnxscript is NOT required: the
-# exporter uses the legacy path, not torch's dynamo ONNX path.
-onnx==1.23.0
-onnxruntime==1.30.0

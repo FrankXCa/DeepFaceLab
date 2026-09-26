@@ -1,0 +1,51 @@
+{
+  "discovery": {
+    "case_sensitive": false,
+    "recursive": true,
+    "rules": [
+      "LICENSE*",
+      "COPYING",
+      "COPYING.*",
+      "NOTICE",
+      "NOTICE.*",
+      "licenses/"
+    ]
+  },
+  "entries": [
+    {
+      "path": "python/Lib/site-packages/pip-24.3.1.dist-info/LICENSE.txt",
+      "sha256": "634300a669d49aeae65b12c6c48c924c51a4cdf3d1ff086dc3456dc8bcaa2104",
+      "source_archive_filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "source_archive_sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f"
+    },
+    {
+      "path": "python/LICENSE.txt",
+      "sha256": "886a0ead2d89030ee62dbff52b04e47ab91998341295bb9c56fb952b4e081c7a",
+      "source_archive_filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "source_archive_sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f"
+    },
+    {
+      "path": "python/tcl/tk8.6/demos/license.terms",
+      "sha256": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
+      "source_archive_filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "source_archive_sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f"
+    },
+    {
+      "path": "python/tcl/tk8.6/license.terms",
+      "sha256": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
+      "source_archive_filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "source_archive_sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f"
+    }
+  ],
+  "inventory_sha256": "cc861b73e1a0545b5eaa73cd6c812c8636ed3e48731247815b43c5bc77517ef8",
+  "schema": "dfl-python-license-inventory-v1",
+  "source_archive": {
+    "cpu_baseline": "x86_64",
+    "filename": "cpython-3.12.11+20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "flavor": "install_only_stripped",
+    "release": "20250828",
+    "sha256": "0b8fab064f852d3ccb7cf30f58195452c1d70f494a556b4c003889aa2f93038f",
+    "source_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250828/cpython-3.12.11%2B20250828-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "target_triple": "x86_64-pc-windows-msvc"
+  }
+}
