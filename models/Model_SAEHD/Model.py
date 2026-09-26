@@ -107,6 +107,61 @@ Documented torch adaptations (Phase 6A):
   order (src_dst step first, then the D steps on the post-update
   weights) is preserved.
 
+Phase 12 Commit 4 — official multi-GPU (multi-replica) training
+semantics, restored for both SAEHD architecture families (df +
+liae):
+
+- Official semantics (the official ``Model_tf.py`` multi-GPU graph
+  is the semantic authority; INDEPENDENT_REIMPLEMENTATION — no code
+  copied from the dead TF reference or any external port): the
+  official global-batch rounding already present in
+  ``on_initialize`` (``b = max(1, floor(B/N))``,
+  ``effective = N*b`` — the sample generators are constructed after
+  it and see the adjusted global batch); equal contiguous CPU shards
+  ``[r*b, (r+1)*b)`` of EVERY per-sample input tensor (the official
+  "slice on CPU" semantics — no reordering); replica 0 (the primary
+  ``nn.device`` replica) computes on the CANONICAL modules while
+  replicas r > 0 compute on the Commit-2 disposable mirrors (built
+  after the checkpoint load/init loop, initial-synced before the
+  first replica forward); per-replica per-sample loss vectors are
+  CONCATENATED in shard/replica order into the adjusted global
+  vector (the official per-GPU ``concat`` display contract — the
+  history mean is the mean of the concatenated vector, never a mean
+  of per-replica means); per-replica batch-SUM gradients are
+  reduced by the official per-variable MEAN across replicas
+  (``nn.average_gv_list``, identity at N == 1) and installed on the
+  canonical parameters; exactly ONE canonical ``src_dst_opt`` step
+  per global iteration through the Commit-3 one-global-
+  precision-plan / one-global-GradScaler lifecycle (Class A
+  nonfinite forward/loss = hard ``FloatingPointError`` per replica,
+  never retried; Class B scaled-grad overflow = skipped step +
+  bounded clean retry on the SAME fetched samples); the true-face
+  code-D step and the GAN D_src step run AFTER the generator update
+  (the official order — the D steps see the post-G weights, the
+  mirrors having been synced after the successful G step), each per
+  replica, entirely in FP32 (no autocast, no GradScaler), with the
+  same official masked-tensor/loss structure, per-replica batch-SUM
+  grads, the Commit-1 replica mean, exactly ONE canonical
+  ``D_code_opt`` / ``D_src_dst_opt`` step on the single shared
+  optimizer state, and a mirror sync after the successful step;
+  mirrors are runtime-only state: preview / merge / DFM+ONNX export
+  / checkpoints stay canonical / primary-device only (the mirrors
+  never enter ``model_filename_list``, Saveable naming or
+  checkpoint keys), and the replica plan is disposed in
+  ``finalize`` (canonical modules intact, no stale references).
+- N == 1 invariance: with one replica the plan carries NO
+  components and NO mirrors, and every training closure takes the
+  byte-identical Phase 6B/7/8 single-device body (the official
+  single-tower path — ``average_gv_list`` over one replica is the
+  identity), so single-GPU runs are unchanged.
+- Local validation status: on the single-GPU (1x RTX 4090) machine
+  the multi-replica rows are SIMULATED_MULTI_REPLICA (two or three
+  LOGICAL replicas on the one physical ``cuda:0`` through the
+  tested ``ReplicaPlan.from_torch_devices`` Level-B abstraction);
+  physical 2-GPU acceptance is PENDING_ENVIRONMENTALLY /
+  NOT_VERIFIED and FP16 physical multi-GPU is EXPERIMENTAL /
+  NOT_VERIFIED.
+
 No TensorFlow import appears on this path; no direct CUDA-backend
 calls or CUDA device-string literals (device handling through the
 Phase 2 abstraction); components/discriminators/optimizers come from
@@ -586,15 +641,25 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
         # --- inference closures (official AE_view / AE_merge) ---------
 
-        def _to_tensor(x):
-            # official feed_dict placement semantics: to the current
-            # nn.device in the declared floatx (NumPy or tensor in)
+        def _to_tensor_device(x, device):
+            # official feed_dict placement semantics: to the GIVEN
+            # device in the declared floatx (NumPy or tensor in).
+            # Phase 12 Commit 4: the replica closures place each
+            # replica's CPU shard on ITS replica device (the official
+            # per-GPU placement contexts, torch flavor).
             if not isinstance(x, torch.Tensor):
                 x = torch.from_numpy(np.ascontiguousarray(x))
-            x = x.to(device=nn.device, dtype=nn.floatx)
+            x = x.to(device=device, dtype=nn.floatx)
             if x.dim() == 3:
                 x = x[None, ...]
             return x
+
+        def _to_tensor(x):
+            # the single-device placement (Phase 6B): the primary
+            # nn.device — replica 0 of every replica plan is the
+            # primary, so the N == 1 / replica-0 behavior is
+            # unchanged
+            return _to_tensor_device(x, nn.device)
 
         def _to_numpy(x):
             # official caller contract: TF session outputs were NumPy
@@ -675,13 +740,94 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
         # official ops_tf.py L76-77).
 
         if self.is_training:
-            def AE_forward(warped_src, warped_dst):
+            def AE_forward(warped_src, warped_dst, replica=None):
                 # the official per-tower forward (L405-427), grad-
                 # capable: returns the code tensors (code-D inputs),
                 # the decoder-input codes and the five prediction
                 # tensors. Callers wrap it in torch.no_grad() where
                 # the official D closures re-feed the placeholders
                 # (post-update recompute).
+                # Phase 12 Commit 4: ``replica=None`` (the default,
+                # the N == 1 / single-device path) runs the EXACT
+                # Phase 6B body below on the canonical modules on
+                # nn.device; ``replica=r`` runs the same chain on
+                # replica r's modules (canonical for r == 0, the
+                # Commit-2 mirror for r > 0) with the inputs placed
+                # on replica r's device.
+                if replica is not None:
+                    device = self.replica_plan.replica_devices[replica]
+                    warped_src = _to_tensor_device(warped_src, device)
+                    warped_dst = _to_tensor_device(warped_dst, device)
+                    if replica > 0:
+                        # the official per-GPU graph shares the
+                        # canonical variables; the torch flavor
+                        # computes replicas r > 0 on the disposable
+                        # mirrors (bit-exact with the canonical
+                        # between syncs)
+                        enc = _replica_module(self.encoder, replica)
+                        if 'df' in archi_type:
+                            it = _replica_module(self.inter, replica)
+                            dec_src = _replica_module(self.decoder_src, replica)
+                            dec_dst = _replica_module(self.decoder_dst, replica)
+                            src_code = it(enc(warped_src))
+                            dst_code = it(enc(warped_dst))
+                            pred_src_src, pred_src_srcm = dec_src(src_code)
+                            pred_dst_dst, pred_dst_dstm = dec_dst(dst_code)
+                            pred_src_dst, pred_src_dstm = dec_src(dst_code)
+                            pred_src_dst_no_code_grad, _ = dec_src(dst_code.detach())
+                        else:
+                            enc = _replica_module(self.encoder, replica)
+                            it_ab = _replica_module(self.inter_AB, replica)
+                            it_b = _replica_module(self.inter_B, replica)
+                            dec = _replica_module(self.decoder, replica)
+                            src_code = enc(warped_src)
+                            src_inter_AB_code = it_ab(src_code)
+                            src_code_dec = torch.concat([src_inter_AB_code, src_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            dst_code = enc(warped_dst)
+                            dst_inter_B_code = it_b(dst_code)
+                            dst_inter_AB_code = it_ab(dst_code)
+                            dst_code_dec = torch.concat([dst_inter_B_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            src_dst_code = torch.concat([dst_inter_AB_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            pred_src_src, pred_src_srcm = dec(src_code_dec)
+                            pred_dst_dst, pred_dst_dstm = dec(dst_code_dec)
+                            pred_src_dst, pred_src_dstm = dec(src_dst_code)
+                            pred_src_dst_no_code_grad, _ = dec(src_dst_code.detach())
+                    else:
+                        # replica 0: the canonical modules on the
+                        # primary device — the same chain as the
+                        # single-device body, with the inputs on
+                        # replica r's device
+                        if 'df' in archi_type:
+                            src_code = self.inter(self.encoder(warped_src))
+                            dst_code = self.inter(self.encoder(warped_dst))
+                            pred_src_src, pred_src_srcm = self.decoder_src(src_code)
+                            pred_dst_dst, pred_dst_dstm = self.decoder_dst(dst_code)
+                            pred_src_dst, pred_src_dstm = self.decoder_src(dst_code)
+                            pred_src_dst_no_code_grad, _ = self.decoder_src(dst_code.detach())
+                        else:
+                            src_code = self.encoder(warped_src)
+                            src_inter_AB_code = self.inter_AB(src_code)
+                            src_code_dec = torch.concat([src_inter_AB_code, src_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            dst_code = self.encoder(warped_dst)
+                            dst_inter_B_code = self.inter_B(dst_code)
+                            dst_inter_AB_code = self.inter_AB(dst_code)
+                            dst_code_dec = torch.concat([dst_inter_B_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            src_dst_code = torch.concat([dst_inter_AB_code, dst_inter_AB_code], dim=nn.conv2d_ch_axis)
+                            pred_src_src, pred_src_srcm = self.decoder(src_code_dec)
+                            pred_dst_dst, pred_dst_dstm = self.decoder(dst_code_dec)
+                            pred_src_dst, pred_src_dstm = self.decoder(src_dst_code)
+                            pred_src_dst_no_code_grad, _ = self.decoder(src_dst_code.detach())
+                    return {
+                        'src_code': src_code,
+                        'dst_code': dst_code,
+                        'pred_src_src': pred_src_src,
+                        'pred_src_srcm': pred_src_srcm,
+                        'pred_dst_dst': pred_dst_dst,
+                        'pred_dst_dstm': pred_dst_dstm,
+                        'pred_src_dst': pred_src_dst,
+                        'pred_src_dstm': pred_src_dstm,
+                        'pred_src_dst_no_code_grad': pred_src_dst_no_code_grad,
+                    }
                 warped_src = _to_tensor(warped_src)
                 warped_dst = _to_tensor(warped_dst)
                 if 'df' in archi_type:
@@ -749,20 +895,28 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 return nn.sigmoid_cross_entropy(labels, logits)
 
             def _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
-                                 warped_dst, target_dst, target_dstm, target_dstm_em):
+                                 warped_dst, target_dst, target_dstm, target_dstm_em,
+                                 device=None):
                 # the official per-tower input preparation (L374-451):
                 # the blur_out_mask target rewrite (L391-402), the
                 # softened loss masks (L437-446, incl. the dead-code
                 # style-mask override) and the masked/anti-masked
                 # tensor set (L448-456).
-                warped_src = _to_tensor(warped_src)
-                target_src = _to_tensor(target_src)
-                target_srcm = _to_tensor(target_srcm)
-                target_srcm_em = _to_tensor(target_srcm_em)
-                warped_dst = _to_tensor(warped_dst)
-                target_dst = _to_tensor(target_dst)
-                target_dstm = _to_tensor(target_dstm)
-                target_dstm_em = _to_tensor(target_dstm_em)
+                # Phase 12 Commit 4: ``device=None`` (the default, the
+                # N == 1 path) places on the primary nn.device exactly
+                # like the Phase 6B code; a replica closure passes its
+                # replica's device (the input shards are already the
+                # CPU-side per-replica slices).
+                if device is None:
+                    device = nn.device
+                warped_src = _to_tensor_device(warped_src, device)
+                target_src = _to_tensor_device(target_src, device)
+                target_srcm = _to_tensor_device(target_srcm, device)
+                target_srcm_em = _to_tensor_device(target_srcm_em, device)
+                warped_dst = _to_tensor_device(warped_dst, device)
+                target_dst = _to_tensor_device(target_dst, device)
+                target_dstm = _to_tensor_device(target_dstm, device)
+                target_dstm_em = _to_tensor_device(target_dstm_em, device)
 
                 target_srcm_anti = 1-target_srcm
                 target_dstm_anti = 1-target_dstm
@@ -833,6 +987,13 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # L564; the single tower makes average_gv_list the
                 # identity). Returns the per-sample (src, dst) loss
                 # vectors — the only closure returning values.
+                # Phase 12 Commit 4: the multi-replica plan (N > 1)
+                # routes to the official per-GPU attempt lifecycle;
+                # N == 1 falls through to the single-device body
+                # below (byte-identical Phase 6B/7/8 path).
+                if self.replica_plan is not None and self.replica_plan.is_multi:
+                    return _src_dst_train_multi(warped_src, target_src, target_srcm, target_srcm_em,
+                                                warped_dst, target_dst, target_dstm, target_dstm_em)
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
@@ -957,6 +1118,325 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
                 return src_loss, dst_loss
 
+            # ------------------------------------------------------------------
+            # Phase 12 Commit 4 — the multi-replica (N > 1) attempt
+            # closures: the official per-GPU loop structure (equal
+            # contiguous CPU shards, per-GPU forward/loss, per-GPU
+            # batch-SUM gradients, average_gv_list, ONE canonical
+            # update op, D steps after the G step) through the
+            # Commit-1/2/3 foundation. Every closure here runs only
+            # when the active plan is multi-replica; the N == 1 runs
+            # use the single-device closures above, byte-identical.
+            # ------------------------------------------------------------------
+
+            def _replica_module(module, replica):
+                # replica 0 -> the canonical module itself; replica > 0
+                # -> its Commit-2 mirror (disposable runtime state,
+                # bit-exact with the canonical between the plan's
+                # syncs)
+                if replica == 0:
+                    return module
+                for cset in self.replica_plan.components:
+                    if cset.canonical is module:
+                        return cset.mirrors[replica - 1]
+                raise ValueError(
+                    f"replica {replica} references the unregistered "
+                    f"component {getattr(module, 'name', repr(module))} — "
+                    "every active SAEHD component is registered in the "
+                    "replica plan in on_initialize")
+
+            def _mp_autocast_replica(replica):
+                # the ONE run-wide PrecisionPlan's per-replica autocast
+                # region (Commit-3 contract: the plan's device_type is
+                # the primary's; each replica's safe-forward region
+                # pins ITS OWN device type; 'off' mode -> nullcontext)
+                self._mp_ensure_resolved()
+                device_type = self.replica_plan.replica_devices[replica].type
+                return self._mp_plan.autocast_context(device_type=device_type)
+
+            def _src_dst_train_multi(warped_src, target_src, target_srcm, target_srcm_em,
+                                     warped_dst, target_dst, target_dstm, target_dstm_em):
+                # Phase 12 Commit 4 — the official multi-GPU generator
+                # step (official per-GPU loop + CPU-side slicing +
+                # per-GPU nn.gradients + average_gv_list + ONE
+                # get_update_op, Model_tf.py L374-564): per replica,
+                # an equal contiguous CPU shard [r*b, (r+1)*b) of EVERY
+                # per-sample input tensor -> per-replica forward/loss
+                # on replica r's modules (canonical for r == 0,
+                # Commit-2 mirror for r > 0) -> per-replica batch-SUM
+                # backward through the ONE global precision plan/
+                # scaler (the model layer's _mp_backward) ->
+                # canonicalization + the official per-variable replica
+                # MEAN (nn.average_gv_list) -> canonical .grad install
+                # -> exactly ONE canonical src_dst_opt step through the
+                # Commit-3 precision lifecycle (exactly one
+                # unscale/step/update per attempt; Class A nonfinite
+                # forward/loss on ANY replica = the hard
+                # FloatingPointError, never retried / never
+                # scaler-recorded; Class B scaled-grad overflow =
+                # skipped step + one scaler update + bounded clean
+                # retry on the SAME fetched samples) -> mirror sync
+                # after the successful step ONLY. Returns the
+                # per-replica per-sample (src, dst) loss vectors
+                # CONCATENATED in shard/replica order — the official
+                # per-GPU concat display contract (history mean = the
+                # mean of the concatenated vector).
+                plan = self.replica_plan
+                n = plan.num_replicas
+                # the official per-replica size b = max(1, floor(B/N))
+                # with B = the batch the generators actually produced
+                # (in production the on_initialize adjustment makes the
+                # fetched batch exactly N*b; deriving it from the
+                # fetched batch keeps the shards exact in both cases)
+                bs_per_gpu = max(1, len(warped_src) // n)
+                self._mp_ensure_resolved()
+                nn.clear_replica_grads(plan)   # attempt start (every retry too)
+                src_vecs, dst_vecs = [], []
+                per_replica_gvs = []
+                param_lists = nn.replica_param_lists(plan, self.src_dst_trainable_weights)
+                # the per-replica shard sources are sliced from the
+                # ORIGINAL fetched arrays BEFORE the loop: the loop
+                # body below rebinds the target_* parameter names to
+                # each replica's prepared tensors (the official
+                # variable-reuse style, harmless in the official
+                # per-GPU-queue fetch but fatal here where ONE fetched
+                # batch is re-sliced per replica) — slicing inside
+                # the loop would feed replica r > 0 replica r-1's
+                # prepared tensors instead of the fetched batch
+                # (silent shard misalignment: dropped samples /
+                # empty shards)
+                shard_sources = [
+                    (warped_src[sl], target_src[sl], target_srcm[sl], target_srcm_em[sl],
+                     warped_dst[sl], target_dst[sl], target_dstm[sl], target_dstm_em[sl])
+                    for sl in (slice(r * bs_per_gpu, (r + 1) * bs_per_gpu)
+                               for r in range(n))
+                ]
+                for r in range(n):
+                    (ws, ts, tsm, tsme, wd, td, tdm, tdme) = shard_sources[r]
+                    t = _prepare_targets(ws, ts, tsm, tsme, wd, td, tdm, tdme,
+                                         device=plan.replica_devices[r])
+                    with _mp_autocast_replica(r):
+                        f = AE_forward(t['warped_src'], t['warped_dst'], replica=r)
+                    f = { k: v.to(nn.floatx) for k, v in f.items() }
+                    if self._mp_scaler is not None and any(
+                            not bool(torch.isfinite(v).all()) for v in f.values()):
+                        nn.clear_replica_grads(plan)
+                        raise FloatingPointError('nonfinite SAEHD FP16 generator forward')
+                    pred_src_src = f['pred_src_src']
+                    pred_src_srcm = f['pred_src_srcm']
+                    pred_dst_dst = f['pred_dst_dst']
+                    pred_dst_dstm = f['pred_dst_dstm']
+                    pred_src_dst = f['pred_src_dst']
+                    pred_src_dstm = f['pred_src_dstm']
+                    pred_src_dst_no_code_grad = f['pred_src_dst_no_code_grad']
+
+                    pred_src_src_masked_opt = pred_src_src*t['target_srcm_blur'] if masked_training else pred_src_src
+                    pred_dst_dst_masked_opt = pred_dst_dst*t['target_dstm_blur'] if masked_training else pred_dst_dst
+                    pred_src_src_anti_masked = pred_src_src*t['target_srcm_anti_blur']
+
+                    target_src = t['target_src']
+                    target_dst = t['target_dst']
+                    target_srcm = t['target_srcm']
+                    target_srcm_em = t['target_srcm_em']
+                    target_dstm = t['target_dstm']
+                    target_dstm_em = t['target_dstm_em']
+
+                    # --- src loss (official L458-480, replica shard) ---
+                    src_loss = _dssim_term(t['target_src_masked_opt'], pred_src_src_masked_opt)
+                    src_loss = src_loss + torch.mean( 10*torch.square( t['target_src_masked_opt'] - pred_src_src_masked_opt ), dim=(1,2,3))
+
+                    if eyes_mouth_prio:
+                        src_loss = src_loss + torch.mean( 300*torch.abs( target_src*target_srcm_em - pred_src_src*target_srcm_em ), dim=(1,2,3))
+
+                    src_loss = src_loss + torch.mean( 10*torch.square( target_srcm - pred_src_srcm ), dim=(1,2,3) )
+
+                    face_style_power = self.options['face_style_power'] / 100.0
+                    if face_style_power != 0 and not self.pretrain:
+                        src_loss = src_loss + nn.style_loss(
+                            pred_src_dst_no_code_grad*pred_src_dstm.detach(),
+                            (pred_dst_dst*pred_dst_dstm).detach(),
+                            gaussian_blur_radius=resolution//8,
+                            loss_weight=10000*face_style_power)
+
+                    bg_style_power = self.options['bg_style_power'] / 100.0
+                    if bg_style_power != 0 and not self.pretrain:
+                        target_dst_style_anti_masked = target_dst*t['style_mask_anti_blur']
+                        psd_style_anti_masked = pred_src_dst*t['style_mask_anti_blur']
+
+                        src_loss = src_loss + torch.mean( (10*bg_style_power)*nn.dssim( psd_style_anti_masked, target_dst_style_anti_masked, max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                        src_loss = src_loss + torch.mean( (10*bg_style_power)*torch.square(psd_style_anti_masked - target_dst_style_anti_masked), dim=(1,2,3) )
+
+                    # --- dst loss (official L482-492, replica shard) ---
+                    dst_loss = _dssim_term(t['target_dst_masked_opt'], pred_dst_dst_masked_opt)
+                    dst_loss = dst_loss + torch.mean( 10*torch.square( t['target_dst_masked_opt']-pred_dst_dst_masked_opt ), dim=(1,2,3))
+
+                    if eyes_mouth_prio:
+                        dst_loss = dst_loss + torch.mean( 300*torch.abs( target_dst*target_dstm_em - pred_dst_dst*target_dstm_em ), dim=(1,2,3))
+
+                    dst_loss = dst_loss + torch.mean( 10*torch.square( target_dstm - pred_dst_dstm ), dim=(1,2,3) )
+
+                    # --- the combined generator loss (official L497-545,
+                    #     replica shard; the D-side modules are this
+                    #     replica's own (canonical r == 0 / mirror r > 0))
+                    G_loss = src_loss + dst_loss
+
+                    if self.options['true_face_power'] != 0:
+                        code_d = _replica_module(self.code_discriminator, r)
+                        src_code_d = code_d(f['src_code'])
+                        G_loss = G_loss + self.options['true_face_power']*_DLoss(torch.ones_like(src_code_d), src_code_d)
+
+                    if gan_power != 0:
+                        d_src = _replica_module(self.D_src, r)
+                        pred_src_src_d, pred_src_src_d2 = d_src(pred_src_src_masked_opt)
+                        G_loss = G_loss + gan_power*(_DLoss(torch.ones_like(pred_src_src_d), pred_src_src_d)  + \
+                                                     _DLoss(torch.ones_like(pred_src_src_d2), pred_src_src_d2))
+
+                        if masked_training:
+                            G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_src_src)
+                            G_loss = G_loss + 0.02*torch.mean(torch.square(pred_src_src_anti_masked-t['target_src_anti_masked']), dim=(1,2,3) )
+
+                    # official nn.gradients(gpu_G_loss,
+                    # src_dst_trainable_weights) = the per-replica batch
+                    # SUM over the shard's per-sample (b,) loss vector —
+                    # the per-replica (scaled, under fp16) backward on
+                    # this replica's own parameter set (canonical for
+                    # r == 0, the Commit-2 mirror for r > 0)
+                    if self._mp_scaler is not None and not bool(torch.isfinite(G_loss).all()):
+                        nn.clear_replica_grads(plan)
+                        raise FloatingPointError('nonfinite SAEHD FP16 generator loss')
+                    self._mp_backward(G_loss)
+                    params_r = param_lists[r]
+                    per_replica_gvs.append([(p.grad, p) for p in params_r])
+                    src_vecs.append(src_loss.to(plan.primary_device, copy=False))
+                    dst_vecs.append(dst_loss.to(plan.primary_device, copy=False))
+
+                # the official CPU-side reduce: canonicalize (mirror
+                # grads -> canonical association + device), the official
+                # per-variable replica MEAN, canonical install, and
+                # exactly ONE canonical precision step per attempt
+                # (Commit-3 foundation through the model-layer _mp_*
+                # hooks; Class B cleanup is owned by the foundation)
+                stepped = nn.run_replica_precision_step(
+                    plan, self._mp_plan, self._mp_scaler, self.src_dst_opt,
+                    per_replica_gvs, self.src_dst_trainable_weights,
+                    self._mp_unscale_opt, self._mp_opt_step, self._mp_scaler_update)
+                if not stepped:
+                    raise SkippedGeneratorStep('SAEHD FP16 G gradients overflowed')
+                plan.sync_from_canonical()   # mirrors AFTER the successful step only
+                return torch.cat(src_vecs, dim=0), torch.cat(dst_vecs, dim=0)
+
+            def _D_train_multi(warped_src, warped_dst):
+                # Phase 12 Commit 4 — the official multi-GPU code-D
+                # step (Model_tf.py L590-592 per-GPU flavor): the D
+                # step runs AFTER the generator update, per replica,
+                # re-feeding THIS replica's shard and recomputing the
+                # codes with the post-G weights (canonical generator
+                # updated, mirrors synced by the successful G step) —
+                # entirely FP32 (the official D steps never receive an
+                # fp16 treatment; no autocast, no GradScaler);
+                # per-replica batch-SUM grads over the code-D weights
+                # (this replica's own code-D module) -> canonicalize +
+                # the Commit-1 replica mean -> canonical install ->
+                # exactly ONE canonical D_code_opt step on the single
+                # shared optimizer state -> mirror sync after the
+                # successful step.
+                plan = self.replica_plan
+                n = plan.num_replicas
+                # the official per-replica size b = max(1, floor(B/N))
+                # with B = the batch the generators actually produced
+                # (in production the on_initialize adjustment makes the
+                # fetched batch exactly N*b; deriving it from the
+                # fetched batch keeps the shards exact in both cases)
+                bs_per_gpu = max(1, len(warped_src) // n)
+                per_replica_gvs = []
+                param_lists = nn.replica_param_lists(plan, self.code_discriminator.get_weights())
+                for r in range(n):
+                    sl = slice(r*bs_per_gpu, (r+1)*bs_per_gpu)
+                    with torch.no_grad():
+                        f = AE_forward(warped_src[sl], warped_dst[sl], replica=r)
+                    code_d = _replica_module(self.code_discriminator, r)
+                    dst_code_d = code_d(f['dst_code'])
+                    src_code_d = code_d(f['src_code'])
+                    D_code_loss = (_DLoss(torch.ones_like(dst_code_d), dst_code_d) + \
+                                   _DLoss(torch.zeros_like(src_code_d), src_code_d) ) * 0.5
+                    # the G step left stale code-D grads on this
+                    # replica's code-D parameters (the G-loss backward
+                    # flows through the true-face term) — drop them
+                    # before this replica's D-code backward, exactly
+                    # like the single-device closure's group zeroing
+                    for p in param_lists[r]:
+                        p.grad = None
+                    # official nn.gradients(D_code_loss, code-D vars) =
+                    # the per-replica batch SUM over the shard's
+                    # per-sample (b,) vector
+                    torch.autograd.backward(D_code_loss, torch.ones_like(D_code_loss))
+                    per_replica_gvs.append([(p.grad, p) for p in param_lists[r]])
+                canonicalized = plan.canonicalize_grads(per_replica_gvs)
+                agged = nn.average_gv_list(canonicalized)
+                for g, p in agged:
+                    p.grad = g
+                self.D_code_opt.get_update_op(agged)()
+                plan.sync_from_canonical()   # after the successful D-code step
+
+            def _D_src_dst_train_multi(warped_src, target_src, target_srcm, target_srcm_em,
+                                       warped_dst, target_dst, target_dstm, target_dstm_em):
+                # Phase 12 Commit 4 — the official multi-GPU D_src
+                # (GAN) step (Model_tf.py L595-605 per-GPU flavor):
+                # runs AFTER the generator update (and after the
+                # code-D step when applicable), per replica, with the
+                # SAME official masked tensors/loss structure (real =
+                # the prepared target, fake = the pred, both the
+                # masked_opt tensors) recomputed with the post-G
+                # weights; per-replica batch-SUM grads over the D_src
+                # weights (this replica's own D_src module) ->
+                # canonicalize + the Commit-1 replica mean ->
+                # canonical install -> exactly ONE canonical
+                # D_src_dst_opt step on the single shared optimizer
+                # state (entirely FP32 — no autocast, no GradScaler)
+                # -> mirror sync after the successful step.
+                plan = self.replica_plan
+                n = plan.num_replicas
+                # the official per-replica size b = max(1, floor(B/N))
+                # with B = the batch the generators actually produced
+                # (in production the on_initialize adjustment makes the
+                # fetched batch exactly N*b; deriving it from the
+                # fetched batch keeps the shards exact in both cases)
+                bs_per_gpu = max(1, len(warped_src) // n)
+                per_replica_gvs = []
+                param_lists = nn.replica_param_lists(plan, self.D_src.get_weights())
+                for r in range(n):
+                    sl = slice(r*bs_per_gpu, (r+1)*bs_per_gpu)
+                    t = _prepare_targets(warped_src[sl], target_src[sl], target_srcm[sl], target_srcm_em[sl],
+                                         warped_dst[sl], target_dst[sl], target_dstm[sl], target_dstm_em[sl],
+                                         device=plan.replica_devices[r])
+                    with torch.no_grad():
+                        f = AE_forward(t['warped_src'], t['warped_dst'], replica=r)
+                    pred_src_src = f['pred_src_src']
+                    pred_src_src_masked_opt = pred_src_src*t['target_srcm_blur'] if masked_training else pred_src_src
+                    d_src = _replica_module(self.D_src, r)
+                    pred_src_src_d, pred_src_src_d2 = d_src(pred_src_src_masked_opt)
+                    target_src_d, target_src_d2 = d_src(t['target_src_masked_opt'])
+                    D_src_dst_loss = (_DLoss(torch.ones_like(target_src_d), target_src_d) + \
+                                      _DLoss(torch.zeros_like(pred_src_src_d), pred_src_src_d) ) * 0.5 + \
+                                     (_DLoss(torch.ones_like(target_src_d2), target_src_d2) + \
+                                      _DLoss(torch.zeros_like(pred_src_src_d2), pred_src_src_d2) ) * 0.5
+                    # the G step left stale D_src grads on this
+                    # replica's D_src parameters (the G-loss GAN term)
+                    # — drop them before this replica's D_src backward
+                    for p in param_lists[r]:
+                        p.grad = None
+                    # official nn.gradients(D_src_dst_loss, D_src
+                    # vars) = the per-replica batch SUM over the
+                    # shard's per-sample (b,) vector
+                    torch.autograd.backward(D_src_dst_loss, torch.ones_like(D_src_dst_loss))
+                    per_replica_gvs.append([(p.grad, p) for p in param_lists[r]])
+                canonicalized = plan.canonicalize_grads(per_replica_gvs)
+                agged = nn.average_gv_list(canonicalized)
+                for g, p in agged:
+                    p.grad = g
+                self.D_src_dst_opt.get_update_op(agged)()
+                plan.sync_from_canonical()   # after the successful D_src step
+
             def _D_train(warped_src, warped_dst):
                 # official D_train (L590-592): the code-D loss
                 # 0.5*(DLoss(ones, D(dst_code)) + DLoss(zeros,
@@ -972,6 +1452,13 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # an fp16 treatment) — no autocast region here and
                 # its backward/update never touch the shared fp16
                 # scaler.
+                # Phase 12 Commit 4: the multi-replica plan (N > 1)
+                # routes to the per-replica code-D step (post-G
+                # weights, official replica mean, ONE canonical
+                # D_code_opt step); N == 1 keeps the single-device
+                # body below.
+                if self.replica_plan is not None and self.replica_plan.is_multi:
+                    return _D_train_multi(warped_src, warped_dst)
                 with torch.no_grad():
                     f = AE_forward(warped_src, warped_dst)
 
@@ -1003,6 +1490,15 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                 # an fp16 treatment) — no autocast region here and
                 # its backward/update never touch the shared fp16
                 # scaler.
+                # Phase 12 Commit 4: the multi-replica plan (N > 1)
+                # routes to the per-replica D_src step (post-G
+                # weights, the same official masked-tensor/loss
+                # structure, official replica mean, ONE canonical
+                # D_src_dst_opt step); N == 1 keeps the single-device
+                # body below.
+                if self.replica_plan is not None and self.replica_plan.is_multi:
+                    return _D_src_dst_train_multi(warped_src, target_src, target_srcm, target_srcm_em,
+                                                  warped_dst, target_dst, target_dstm, target_dstm_em)
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
@@ -1080,6 +1576,47 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
 
         ###############
 
+        # Phase 12 Commit 4: the ordered replica device plan (replica
+        # 0 = the primary nn.device replica; replicas r > 0 own the
+        # disposable Commit-2 mirrors). The plan OBJECT created here
+        # is the device TOPOLOGY only — it carries no mirrors until
+        # add_component (independent-review round 1: the §10.1.1
+        # binding order). It is created AFTER the checkpoint
+        # load/init loop above; the MIRROR phase (add_component +
+        # initial_sync) is DEFERRED to the end of on_initialize,
+        # below the sample-generator block (the §10.1.1 sequence:
+        # canonical modules -> checkpoint load -> ALL canonical
+        # init — sample generators and, for N > 1, the Commit-3
+        # all-device precision resolution triggered right here ->
+        # mirrors built from the FINAL canonical weights -> initial
+        # sync -> first replica forward). For N > 1 the ONE global
+        # precision plan/scaler (Commit-3 all-device resolution) is
+        # resolved HERE — before any mirror is constructed — by
+        # calling the SAME one-shot _mp_ensure_resolved the lazy
+        # lifecycle would call later (its guard makes those later
+        # calls no-ops: exactly one plan + one scaler per run, never
+        # a second scaler, no duplicated PrecisionPlan logic). N ==
+        # 1 gets NO early call — the exact Phase 8 lazy
+        # primary-device resolution is preserved. Only the ACTIVE
+        # components are mirrored (the optional code-D / D_src
+        # components exist only when their powers are non-zero);
+        # mirrors are runtime-only state — they never enter the
+        # checkpoint / Saveable / optimizer state built above. With
+        # one replica the plan carries NO components and NO mirrors
+        # — the training closures (call-time is_multi dispatch)
+        # take the byte-identical single-device path, so N == 1
+        # runs are unchanged.
+        if self.is_training:
+            self.replica_plan = nn.ReplicaPlan.from_device_config(device_config)
+            if self.replica_plan.is_multi:
+                # §10.1.1: the multi-device precision resolution
+                # completes BEFORE any mirror is constructed
+                # (one-shot; the deferred mirror phase below runs
+                # after the sample generators)
+                self._mp_ensure_resolved()
+        else:
+            self.replica_plan = None
+
         # initializing sample generators
         if self.is_training:
             training_data_src_path = self.training_data_src_path if not self.pretrain else self.get_pretraining_data_path()
@@ -1115,7 +1652,70 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
                         generators_count=dst_generators_count ),
                 ])
 
+            # Phase 12 Commit 4 (independent-review round 1): the
+            # §10.1.1 MIRROR phase — executed ONLY now, after the
+            # checkpoint load/init, the sample generators above,
+            # and (N > 1) the all-device precision resolution at
+            # plan creation: mirrors are built from the FINAL
+            # canonical weights and initial-synced before the first
+            # replica forward. N == 1: the plan holds no components
+            # and no mirrors — this block is skipped.
+            if self.replica_plan is not None and self.replica_plan.is_multi:
+                if 'df' in archi_type:
+                    mirror_components = [self.encoder, self.inter,
+                                         self.decoder_src, self.decoder_dst]
+                else:
+                    mirror_components = [self.encoder, self.inter_AB,
+                                         self.inter_B, self.decoder]
+                if self.options['true_face_power'] != 0:
+                    mirror_components.append(self.code_discriminator)
+                if gan_power != 0:
+                    mirror_components.append(self.D_src)
+                for comp in mirror_components:
+                    self.replica_plan.add_component(comp)
+                self.replica_plan.initial_sync()
+
         ###############
+
+    #override
+    def _mp_ensure_resolved(self):
+        # Phase 12 Commit 4: the multi-replica run resolves the ONE
+        # global PrecisionPlan against EVERY selected replica device
+        # (the Commit-3 all-device capability check — Milestone E:
+        # an unsupported mode on ANY selected device fails training
+        # start explicitly, never a silent per-device downgrade);
+        # the returned plan/scaler remain the ONE global pair of the
+        # run (each replica's autocast region pins its own device
+        # type through PrecisionPlan.autocast_context). The
+        # single-replica (N == 1) run keeps the EXACT Phase 8
+        # primary-device resolution (the unchanged official
+        # single-device path).
+        if self._mp_plan is not None:
+            return
+        plan = self.replica_plan
+        if plan is not None and plan.is_multi:
+            from core.leras import mixed_precision as mp
+            self._mp_plan = mp.resolve_precision_devices(self.precision, plan.replica_devices)
+            self._mp_scaler = self._mp_plan.make_scaler()
+            if self.is_training:
+                io.log_info (f"Training precision: {self._mp_plan.describe()}")
+        else:
+            super()._mp_ensure_resolved()
+
+    #override
+    def finalize(self):
+        # Phase 12 Commit 4: dispose the disposable replica mirrors
+        # (Commit-2 plan lifecycle: the mirror module references and
+        # the plan's bookkeeping are released; the canonical
+        # modules/parameters/buffers and ALL checkpoint-owned state
+        # stay intact, and no stale mirror reference survives into a
+        # later model lifecycle) before the official ModelBase
+        # teardown.
+        plan = getattr(self, 'replica_plan', None)
+        if plan is not None:
+            plan.dispose()
+            self.replica_plan = None
+        super().finalize()
 
     #override
     def onTrainOneIter(self):
@@ -1139,15 +1739,23 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
         # iteration — zero every optimizer group before the first
         # backward (the D closures additionally zero their own
         # groups before their backdrops, discarding the stale
-        # code-D / D_src grads accumulated by the G-loss backward)
-        grad_groups = [self.src_dst_saveable_weights]
-        if self.options['true_face_power'] != 0:
-            grad_groups.append(self.code_discriminator.get_weights())
-        if self.gan_power != 0:
-            grad_groups.append(self.D_src.get_weights())
-        for group in grad_groups:
-            for p in group:
-                p.grad = None
+        # code-D / D_src grads accumulated by the G-loss backward).
+        # Phase 12 Commit 4: the multi-replica plan extends the
+        # cleanup to the disposable MIRROR parameters as well
+        # (complete canonical + all-mirror grad cleanup — the
+        # Commit-3 §6.1 attempt-start hygiene); N == 1 keeps the
+        # canonical-only zeroing above.
+        if self.replica_plan is not None and self.replica_plan.is_multi:
+            nn.clear_replica_grads(self.replica_plan)
+        else:
+            grad_groups = [self.src_dst_saveable_weights]
+            if self.options['true_face_power'] != 0:
+                grad_groups.append(self.code_discriminator.get_weights())
+            if self.gan_power != 0:
+                grad_groups.append(self.D_src.get_weights())
+            for group in grad_groups:
+                for p in group:
+                    p.grad = None
 
         src_loss, dst_loss = self._mp_run_generator(
             self._src_dst_train, warped_src, target_src, target_srcm, target_srcm_em,
