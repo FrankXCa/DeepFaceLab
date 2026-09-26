@@ -111,14 +111,21 @@ Official behavior preserved:
   the stale ModelBase docstring claim is corrected comment-only in
   Phase 7).
 
+Phase 12 Commit 5 restores the official multi-GPU training semantics:
+the official global batch adjustment (including the intentional
+``B=0,N=1 -> 1`` compatibility correction); equal contiguous CPU
+shards; canonical replica 0 plus disposable mirrors of every active
+forward component; per-replica per-sample loss vectors concatenated in
+shard order; per-replica batch-SUM gradients followed by exactly one
+replica MEAN and one canonical optimizer step; one global precision
+plan/scaler with the established Class-A/Class-B lifecycle; and the
+post-G, entirely-fp32 GAN step.  ``inter_src`` / ``inter_dst`` are
+mirrored for forward execution but remain frozen and excluded from
+``src_dst_opt``.  Mirrors are runtime-only and never enter checkpoint,
+preview, merge, or export state.  N == 1 uses the existing Phase-7/8
+closures unchanged (apart from the documented B=0 correction).
+
 Torch deviations (documented, numerics unchanged):
-- the official multi-GPU graph (the per-GPU batch slices and the
-  ``average_gv_list`` averaging, Model_tf.py L314-331 /
-  L466-477) collapses to the single-device torch foundation
-  (Phase 2): one forward, one loss stack, one optimizer step per
-  closure; on one device the official
-  ``gpu_count * bs_per_gpu`` batch-size reconstruction is the
-  identity (omitted, like the Phase 6A/6B ports);
 - the official ``tf.device`` placement (the CPU placeholders, the
   /CPU:0 mask-shuffle draw, the ``models_opt_on_gpu`` /
   ``'/CPU:0'`` optimizer-vars branch) is expressed through the
@@ -337,15 +344,27 @@ class AMPModel(ModelBase):
         bgr_shape = self.bgr_shape = nn.get4Dshape(resolution,resolution,input_ch)
         mask_shape = nn.get4Dshape(resolution,resolution,1)
 
+        if self.is_training:
+            # Phase 12 Commit 5: restore the official AMP global-batch
+            # adjustment (Model_tf.py L314-318).  The configured batch
+            # is global; every replica receives the same contiguous
+            # per-replica size b = max(1, floor(B/N)).  In particular,
+            # B == 0 is intentionally corrected to N (and to 1 at
+            # N == 1), matching the official implementation.  The
+            # sample generators below are constructed only after this
+            # adjusted value has been written back.
+            gpu_count = max(1, len(devices))
+            bs_per_gpu = max(1, self.get_batch_size() // gpu_count)
+            self.set_batch_size(gpu_count * bs_per_gpu)
+
         # torch (Phase 7): the official nine CPU placeholders
         # (warped_src/dst, target_src/dst, target_srcm/dstm, _em,
         # morph_value_t — Model_tf.py L265-278) are removed — the
         # torch foundation passes tensors directly to the eager
         # forward paths (training: the closures below; inference:
         # the no-grad AE_view/AE_merge); the official
-        # gpu_count * bs_per_gpu batch-size reconstruction
-        # (L314-318) is the identity on the single-device
-        # foundation (omitted, like the Phase 6A/6B ports).
+        # gpu_count * bs_per_gpu batch-size reconstruction is restored
+        # immediately above; eager torch still removes the placeholders.
 
         self.model_filename_list = []
 
@@ -449,15 +468,20 @@ class AMPModel(ModelBase):
                 self.model_filename_list += [ [self.GAN, 'GAN.npy'],
                                               [self.GAN_opt, 'GAN_opt.npy'] ]
 
-        def _to_tensor(x):
-            # official feed_dict placement semantics: to the current
-            # nn.device in the declared floatx (NumPy or tensor in)
+        def _to_tensor_device(x, device):
+            # official feed_dict placement semantics: to the given
+            # replica device in the declared floatx (NumPy or tensor
+            # in).  CPU slicing happens before this transfer.
             if not isinstance(x, torch.Tensor):
                 x = torch.from_numpy(np.ascontiguousarray(x))
-            x = x.to(device=nn.device, dtype=nn.floatx)
+            x = x.to(device=device, dtype=nn.floatx)
             if x.dim() == 3:
                 x = x[None, ...]
             return x
+
+        def _to_tensor(x):
+            # Keep the verified Phase-7/8 single-device placement.
+            return _to_tensor_device(x, nn.device)
 
         def _to_numpy(x):
             # official caller contract: TF session outputs were NumPy
@@ -477,7 +501,7 @@ class AMPModel(ModelBase):
                 # the zeros labels
                 return nn.sigmoid_cross_entropy(torch.zeros_like(logits), logits)
 
-            def AE_forward(warped_src, warped_dst):
+            def AE_forward(warped_src, warped_dst, replica=None):
                 # the official forward graph (Model_tf.py L354-376),
                 # grad-capable: both inter heads on the src code
                 # (L357), the dst code = inter_dst of the dst code
@@ -494,6 +518,36 @@ class AMPModel(ModelBase):
                 # fetched tensors never depend on it — the dst stack
                 # consumes pred_dst_dst, not pred_src_dst); it lives
                 # in AE_view / AE_merge below.
+                if replica is not None:
+                    device = self.replica_plan.replica_devices[replica]
+                    warped_src = _to_tensor_device(warped_src, device)
+                    warped_dst = _to_tensor_device(warped_dst, device)
+                    encoder = _replica_module(self.encoder, replica)
+                    inter_src = _replica_module(self.inter_src, replica)
+                    inter_dst = _replica_module(self.inter_dst, replica)
+                    decoder = _replica_module(self.decoder, replica)
+
+                    src_code = encoder(warped_src)
+                    dst_code = encoder(warped_dst)
+                    src_inter_src_code = inter_src(src_code)
+                    src_inter_dst_code = inter_dst(src_code)
+                    dst_inter_dst_code = inter_dst(dst_code)
+                    inter_rnd_binomial = exact_k_morph_mask(
+                        src_code.shape[0], inter_dims, morph_factor,
+                        device=device, dtype=nn.floatx)
+                    morph_src_code = (
+                        src_inter_src_code * inter_rnd_binomial
+                        + src_inter_dst_code * (1-inter_rnd_binomial))
+                    pred_src_src, pred_src_srcm = decoder(morph_src_code)
+                    pred_dst_dst, pred_dst_dstm = decoder(dst_inter_dst_code)
+                    return {
+                        'dst_code': dst_code,
+                        'pred_src_src': pred_src_src,
+                        'pred_src_srcm': pred_src_srcm,
+                        'pred_dst_dst': pred_dst_dst,
+                        'pred_dst_dstm': pred_dst_dstm,
+                    }
+
                 warped_src = _to_tensor(warped_src)
                 warped_dst = _to_tensor(warped_dst)
                 src_code = self.encoder(warped_src)
@@ -606,20 +660,23 @@ class AMPModel(ModelBase):
                         p.grad = None
 
             def _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
-                                 warped_dst, target_dst, target_dstm, target_dstm_em):
+                                 warped_dst, target_dst, target_dstm, target_dstm_em,
+                                 device=None):
                 # the official per-tower input preparation (L382-
                 # 414): the anti masks, the blur_out_mask target
                 # rewrite (sigma = resolution/128, the element-wise
                 # div-zero guard) and the softened loss-mask
                 # products (L385-391, L406-409)
-                warped_src = _to_tensor(warped_src)
-                target_src = _to_tensor(target_src)
-                target_srcm = _to_tensor(target_srcm)
-                target_srcm_em = _to_tensor(target_srcm_em)
-                warped_dst = _to_tensor(warped_dst)
-                target_dst = _to_tensor(target_dst)
-                target_dstm = _to_tensor(target_dstm)
-                target_dstm_em = _to_tensor(target_dstm_em)
+                if device is None:
+                    device = nn.device
+                warped_src = _to_tensor_device(warped_src, device)
+                target_src = _to_tensor_device(target_src, device)
+                target_srcm = _to_tensor_device(target_srcm, device)
+                target_srcm_em = _to_tensor_device(target_srcm_em, device)
+                warped_dst = _to_tensor_device(warped_dst, device)
+                target_dst = _to_tensor_device(target_dst, device)
+                target_dstm = _to_tensor_device(target_dstm, device)
+                target_dstm_em = _to_tensor_device(target_dstm_em, device)
 
                 target_srcm_anti = 1-target_srcm
                 target_dstm_anti = 1-target_dstm
@@ -679,6 +736,10 @@ class AMPModel(ModelBase):
                 # BEFORE the background / GAN terms are added to
                 # G_loss (L434-435), as the official
                 # gpu_src_losses / gpu_dst_losses lists hold.
+                if self.replica_plan is not None and self.replica_plan.is_multi:
+                    return _train_multi(
+                        warped_src, target_src, target_srcm, target_srcm_em,
+                        warped_dst, target_dst, target_dstm, target_dstm_em)
                 t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                      warped_dst, target_dst, target_dstm, target_dstm_em)
 
@@ -800,6 +861,10 @@ class AMPModel(ModelBase):
                     # GAN_opt state is the FULL per-parameter state
                     # — iters / ms_ / vs_ — never filtered by a
                     # parameter-name prefix)
+                    if self.replica_plan is not None and self.replica_plan.is_multi:
+                        return _GAN_train_multi(
+                            warped_src, target_src, target_srcm, target_srcm_em,
+                            warped_dst, target_dst, target_dstm, target_dstm_em)
                     t = _prepare_targets(warped_src, target_src, target_srcm, target_srcm_em,
                                          warped_dst, target_dst, target_dstm, target_dstm_em)
 
@@ -841,6 +906,206 @@ class AMPModel(ModelBase):
 
                 self.GAN_train = GAN_train
 
+            # Phase 12 Commit 5 — N > 1 official multi-replica
+            # closures.  The existing closures above remain the exact
+            # N == 1 path.
+            def _replica_module(module, replica):
+                if replica == 0:
+                    return module
+                for cset in self.replica_plan.components:
+                    if cset.canonical is module:
+                        return cset.mirrors[replica - 1]
+                raise ValueError(
+                    f"replica {replica} references the unregistered "
+                    f"AMP component {getattr(module, 'name', repr(module))}")
+
+            def _mp_autocast_replica(replica):
+                self._mp_ensure_resolved()
+                device_type = self.replica_plan.replica_devices[replica].type
+                return self._mp_plan.autocast_context(device_type=device_type)
+
+            def _train_multi(warped_src, target_src, target_srcm, target_srcm_em,
+                             warped_dst, target_dst, target_dstm, target_dstm_em):
+                """Official AMP G step over equal contiguous replicas.
+
+                Loss vectors stay per-sample and are concatenated in
+                shard order; gradients are per-replica batch sums and
+                receive exactly one cross-replica mean before the one
+                canonical optimizer step.
+                """
+                plan = self.replica_plan
+                n = plan.num_replicas
+                bs_per_gpu = max(1, len(warped_src) // n)
+                self._mp_ensure_resolved()
+                nn.clear_replica_grads(plan)
+                src_vecs, dst_vecs, per_replica_gvs = [], [], []
+                param_lists = nn.replica_param_lists(plan, self.G_weights)
+
+                # Immutable sources are sliced from the ORIGINAL fetched
+                # arrays before the loop.  The loss body deliberately
+                # rebinds target_* names below, so slicing in-loop would
+                # make later replicas consume an earlier prepared shard.
+                shard_sources = [
+                    (warped_src[sl], target_src[sl], target_srcm[sl], target_srcm_em[sl],
+                     warped_dst[sl], target_dst[sl], target_dstm[sl], target_dstm_em[sl])
+                    for sl in (slice(r * bs_per_gpu, (r + 1) * bs_per_gpu)
+                               for r in range(n))
+                ]
+
+                for r, shard in enumerate(shard_sources):
+                    ws, ts, tsm, tsme, wd, td, tdm, tdme = shard
+                    t = _prepare_targets(
+                        ws, ts, tsm, tsme, wd, td, tdm, tdme,
+                        device=plan.replica_devices[r])
+                    with _mp_autocast_replica(r):
+                        f = AE_forward(t['warped_src'], t['warped_dst'], replica=r)
+                    f = {k: v.to(nn.floatx) for k, v in f.items()}
+                    if self._mp_scaler is not None and any(
+                            not bool(torch.isfinite(v).all()) for v in f.values()):
+                        nn.clear_replica_grads(plan)
+                        raise FloatingPointError('nonfinite AMP FP16 generator forward')
+
+                    pred_src_src = f['pred_src_src']
+                    pred_src_srcm = f['pred_src_srcm']
+                    pred_dst_dst = f['pred_dst_dst']
+                    pred_dst_dstm = f['pred_dst_dstm']
+                    pred_src_src_masked = pred_src_src*t['target_srcm_blur']
+                    pred_dst_dst_masked = pred_dst_dst*t['target_dstm_blur']
+                    pred_src_src_anti_masked = pred_src_src*t['target_srcm_anti_blur']
+                    pred_dst_dst_anti_masked = pred_dst_dst*t['target_dstm_anti_blur']
+
+                    target_src = t['target_src']
+                    target_dst = t['target_dst']
+                    target_srcm = t['target_srcm']
+                    target_srcm_em = t['target_srcm_em']
+                    target_dstm = t['target_dstm']
+                    target_dstm_em = t['target_dstm_em']
+
+                    # Exact Phase-7 AMP loss stack, now on this shard.
+                    src_loss = torch.mean(5*nn.dssim(
+                        t['target_src_masked'], pred_src_src_masked,
+                        max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                    src_loss = src_loss + torch.mean(5*nn.dssim(
+                        t['target_src_masked'], pred_src_src_masked,
+                        max_val=1.0, filter_size=int(resolution/23.2)), dim=1)
+                    src_loss = src_loss + torch.mean(
+                        10*torch.square(t['target_src_masked']-pred_src_src_masked),
+                        dim=(1,2,3))
+                    src_loss = src_loss + torch.mean(
+                        300*torch.abs(target_src*target_srcm_em-
+                                      pred_src_src*target_srcm_em), dim=(1,2,3))
+                    src_loss = src_loss + torch.mean(
+                        10*torch.square(target_srcm-pred_src_srcm), dim=(1,2,3))
+
+                    dst_loss = torch.mean(5*nn.dssim(
+                        t['target_dst_masked'], pred_dst_dst_masked,
+                        max_val=1.0, filter_size=int(resolution/11.6)), dim=1)
+                    dst_loss = dst_loss + torch.mean(5*nn.dssim(
+                        t['target_dst_masked'], pred_dst_dst_masked,
+                        max_val=1.0, filter_size=int(resolution/23.2)), dim=1)
+                    dst_loss = dst_loss + torch.mean(
+                        10*torch.square(t['target_dst_masked']-pred_dst_dst_masked),
+                        dim=(1,2,3))
+                    dst_loss = dst_loss + torch.mean(
+                        300*torch.abs(target_dst*target_dstm_em-
+                                      pred_dst_dst*target_dstm_em), dim=(1,2,3))
+                    dst_loss = dst_loss + torch.mean(
+                        10*torch.square(target_dstm-pred_dst_dstm), dim=(1,2,3))
+
+                    G_loss = src_loss + dst_loss
+                    G_loss = G_loss + torch.mean(
+                        0.1*torch.square(pred_dst_dst_anti_masked-
+                                         t['target_dst_anti_masked']), dim=(1,2,3))
+                    G_loss = G_loss + 0.000001*nn.total_variation_mse(
+                        pred_dst_dst_anti_masked)
+
+                    if gan_power != 0:
+                        gan = _replica_module(self.GAN, r)
+                        pred_src_src_d, pred_src_src_d2 = gan(pred_src_src_masked)
+                        pred_dst_dst_d, pred_dst_dst_d2 = gan(pred_dst_dst_masked)
+                        G_loss = G_loss + (
+                            DLossOnes(pred_src_src_d) + DLossOnes(pred_src_src_d2)
+                            + DLossOnes(pred_dst_dst_d) + DLossOnes(pred_dst_dst_d2)
+                        ) * gan_power
+                        G_loss = G_loss + 0.000001*nn.total_variation_mse(pred_src_src)
+                        G_loss = G_loss + 0.02*torch.mean(torch.square(
+                            pred_src_src_anti_masked-t['target_src_anti_masked']),
+                            dim=(1,2,3))
+
+                    if self._mp_scaler is not None and not bool(
+                            torch.isfinite(G_loss).all()):
+                        nn.clear_replica_grads(plan)
+                        raise FloatingPointError('nonfinite AMP FP16 generator loss')
+                    self._mp_backward(G_loss)
+                    params_r = param_lists[r]
+                    per_replica_gvs.append([(p.grad, p) for p in params_r])
+                    src_vecs.append(src_loss.detach().to(plan.primary_device, copy=False))
+                    dst_vecs.append(dst_loss.detach().to(plan.primary_device, copy=False))
+
+                stepped = nn.run_replica_precision_step(
+                    plan, self._mp_plan, self._mp_scaler, self.src_dst_opt,
+                    per_replica_gvs, self.G_weights,
+                    self._mp_unscale_opt, self._mp_opt_step,
+                    self._mp_scaler_update)
+                if not stepped:
+                    raise SkippedGeneratorStep('AMP FP16 G gradients overflowed')
+                plan.sync_from_canonical()
+                return torch.cat(src_vecs, dim=0), torch.cat(dst_vecs, dim=0)
+
+            if gan_power != 0:
+                def _GAN_train_multi(
+                        warped_src, target_src, target_srcm, target_srcm_em,
+                        warped_dst, target_dst, target_dstm, target_dstm_em):
+                    """Official AMP GAN step, entirely FP32, post-G."""
+                    plan = self.replica_plan
+                    n = plan.num_replicas
+                    bs_per_gpu = max(1, len(warped_src) // n)
+                    per_replica_gvs = []
+                    param_lists = nn.replica_param_lists(
+                        plan, self.GAN.get_weights())
+                    shard_sources = [
+                        (warped_src[sl], target_src[sl], target_srcm[sl], target_srcm_em[sl],
+                         warped_dst[sl], target_dst[sl], target_dstm[sl], target_dstm_em[sl])
+                        for sl in (slice(r * bs_per_gpu, (r + 1) * bs_per_gpu)
+                                   for r in range(n))
+                    ]
+                    for r, shard in enumerate(shard_sources):
+                        ws, ts, tsm, tsme, wd, td, tdm, tdme = shard
+                        t = _prepare_targets(
+                            ws, ts, tsm, tsme, wd, td, tdm, tdme,
+                            device=plan.replica_devices[r])
+                        with torch.no_grad():
+                            f = AE_forward(
+                                t['warped_src'], t['warped_dst'], replica=r)
+                        pred_src_src_masked = (
+                            f['pred_src_src']*t['target_srcm_blur'])
+                        pred_dst_dst_masked = (
+                            f['pred_dst_dst']*t['target_dstm_blur'])
+                        gan = _replica_module(self.GAN, r)
+                        pred_src_src_d, pred_src_src_d2 = gan(pred_src_src_masked)
+                        pred_dst_dst_d, pred_dst_dst_d2 = gan(pred_dst_dst_masked)
+                        target_src_d, target_src_d2 = gan(t['target_src_masked'])
+                        target_dst_d, target_dst_d2 = gan(t['target_dst_masked'])
+                        GAN_loss = (
+                            DLossOnes(target_src_d) + DLossOnes(target_src_d2)
+                            + DLossZeros(pred_src_src_d) + DLossZeros(pred_src_src_d2)
+                            + DLossOnes(target_dst_d) + DLossOnes(target_dst_d2)
+                            + DLossZeros(pred_dst_dst_d) + DLossZeros(pred_dst_dst_d2)
+                        ) * (1.0 / 8)
+                        for p in param_lists[r]:
+                            p.grad = None
+                        torch.autograd.backward(
+                            GAN_loss, torch.ones_like(GAN_loss))
+                        per_replica_gvs.append(
+                            [(p.grad, p) for p in param_lists[r]])
+
+                    canonicalized = plan.canonicalize_grads(per_replica_gvs)
+                    agged = nn.average_gv_list(canonicalized)
+                    for grad, param in agged:
+                        param.grad = grad
+                    self.GAN_opt.get_update_op(agged)()
+                    plan.sync_from_canonical()
+
         # Loading/initializing all models/optimizers weights (the
         # official 536-546 loop; Phase 4/5 strict policy: a missing
         # required component file on resume fails explicitly instead
@@ -872,6 +1137,18 @@ class AMPModel(ModelBase):
                 model.init_weights()
 
         ###############
+
+        # Phase 12 Commit 5: the topology-only plan is created after
+        # canonical checkpoint load/init.  For N > 1 the one global
+        # precision plan/scaler is resolved against every replica
+        # device before mirror construction.  N == 1 keeps the Phase-8
+        # lazy primary-device precision path and owns no mirrors.
+        if self.is_training:
+            self.replica_plan = nn.ReplicaPlan.from_device_config(device_config)
+            if self.replica_plan.is_multi:
+                self._mp_ensure_resolved()
+        else:
+            self.replica_plan = None
 
         # initializing sample generators
         if self.is_training:
@@ -907,6 +1184,48 @@ class AMPModel(ModelBase):
                         uniform_yaw_distribution=self.options['uniform_yaw'],
                         generators_count=dst_generators_count )
                          ])
+
+            # Binding order: canonical modules -> checkpoint/load/init
+            # -> multi-device precision -> complete sample generators
+            # -> mirrors -> initial sync -> first replica forward.
+            # Forward-only frozen inter heads are mirrors because they
+            # execute on every secondary replica, but they remain absent
+            # from the generator optimizer's canonical G_weights list.
+            if self.replica_plan is not None and self.replica_plan.is_multi:
+                mirror_components = [
+                    self.encoder, self.inter_src, self.inter_dst, self.decoder]
+                if gan_power != 0:
+                    mirror_components.append(self.GAN)
+                for component in mirror_components:
+                    self.replica_plan.add_component(component)
+                self.replica_plan.initial_sync()
+
+        ###############
+
+    #override
+    def _mp_ensure_resolved(self):
+        # One all-device PrecisionPlan/GradScaler for N > 1; preserve
+        # the inherited lazy single-device policy at N == 1.
+        if self._mp_plan is not None:
+            return
+        plan = getattr(self, 'replica_plan', None)
+        if plan is not None and plan.is_multi:
+            from core.leras import mixed_precision as mp
+            self._mp_plan = mp.resolve_precision_devices(
+                self.precision, plan.replica_devices)
+            self._mp_scaler = self._mp_plan.make_scaler()
+            if self.is_training:
+                io.log_info(f"Training precision: {self._mp_plan.describe()}")
+        else:
+            super()._mp_ensure_resolved()
+
+    #override
+    def finalize(self):
+        plan = getattr(self, 'replica_plan', None)
+        if plan is not None:
+            plan.dispose()
+            self.replica_plan = None
+        super().finalize()
 
     # Phase 11 (DFM/ONNX): the official tf2onnx export
     # (Model_tf.py L585-629 — in_face:0 (None,res,res,3) +
@@ -1064,12 +1383,18 @@ class AMPModel(ModelBase):
         # backward (the GAN closure additionally re-zeros its own
         # group before its backward, discarding the stale GAN grads
         # accumulated by the G-loss backward)
-        grad_groups = [self.G_weights, self.inter_src.get_weights(), self.inter_dst.get_weights()]
-        if self.gan_power != 0:
-            grad_groups.append(self.GAN.get_weights())
-        for group in grad_groups:
-            for p in group:
-                p.grad = None
+        if self.replica_plan is not None and self.replica_plan.is_multi:
+            # Every global attempt starts with clean canonical and
+            # mirror gradients.  The generator retry closure repeats
+            # this cleanup for every Class-B retry.
+            nn.clear_replica_grads(self.replica_plan)
+        else:
+            grad_groups = [self.G_weights, self.inter_src.get_weights(), self.inter_dst.get_weights()]
+            if self.gan_power != 0:
+                grad_groups.append(self.GAN.get_weights())
+            for group in grad_groups:
+                for p in group:
+                    p.grad = None
 
         src_loss, dst_loss = self._mp_run_generator(
             self.train, warped_src, target_src, target_srcm, target_srcm_em,
