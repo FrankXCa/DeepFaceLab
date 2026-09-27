@@ -38,6 +38,17 @@ python-3*/
 Anaconda*/
 Miniconda*/
 
+# --- Phase-13 packaged runtime (Commit 2) ---
+# Versioned immutable runtimes assembled by scripts/build_runtime.py
+# (runtime/versions/<runtime-id>/), their staging candidates
+# (runtime/.staging/), and local offline build inputs laid out per
+# variant under offline-inputs/<variant>/ by fetch-offline-inputs
+# (its default --output). Host-local state: never tracked, never
+# canonical. The developer artifact cache lives under .cache/
+# (ignored below).
+runtime/
+offline-inputs/
+
 # --- Jupyter ---
 .ipynb_checkpoints/
 
