@@ -1,0 +1,6 @@
+# Phase 13 (Commit 3): Windows launcher batch files must be checked out
+# with CRLF line endings on every platform. cmd.exe batch parsing (labels,
+# goto, subroutine calls, for loops) is not reliable on LF-only files, so
+# the launcher contract (docs/PHASE13_STATE.md section 17) requires CRLF
+# at checkout regardless of the local git autocrlf setting.
+*.bat text eol=crlf
