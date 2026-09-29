@@ -517,8 +517,12 @@ def validate_locks(config: dict) -> None:
         fail("ambiguous generic requirements-lock.txt must not exist")
     config_hash = sha256_file_text_canonical(CONFIG_PATH)
     generator_hash = sha256_file_text_canonical(GENERATOR_PATH)
+    # Dev/test-only packages that must never enter a packaged runtime lock.
+    # tqdm is NOT in this set: it is a common production runtime dependency
+    # (imported unconditionally by core/interact/interact.py at application
+    # startup, all variants).
     forbidden = {
-        "ipython", "matplotlib", "pillow", "psutil", "pytest", "tqdm", "ffmpeg"
+        "ipython", "matplotlib", "pillow", "psutil", "pytest", "ffmpeg"
     }
     for variant, variant_config in sorted(config["variants"].items()):
         lock_path = ROOT / f"requirements-lock-{variant}.txt"

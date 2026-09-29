@@ -19,7 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = json.loads((ROOT / "runtime-lock.json").read_text(encoding="utf-8"))
 VARIANTS = tuple(sorted(CONFIG["variants"]))
 GUI_PACKAGES = {"pyqt5", "pyqt5-qt5", "pyqt5-sip"}
-DEV_ONLY = {"ipython", "matplotlib", "pillow", "pytest", "tqdm"}
+# Dev/test-only packages that must never enter a packaged runtime lock.
+# tqdm is NOT in this set: it is a common production runtime dependency
+# (imported unconditionally at module level by core/interact/interact.py)
+# since P13-RUNTIME-DEP-CLOSURE, exactly as in the generator's validator.
+DEV_ONLY = {"ipython", "matplotlib", "pillow", "pytest"}
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 

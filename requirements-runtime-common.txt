@@ -10,3 +10,9 @@ opencv-python==5.0.0.93
 onnx==1.23.0
 onnxruntime==1.30.0
 ffmpeg-python==0.2.0
+
+# console output and progress rendering: core/interact/interact.py imports
+# both unconditionally at module level, so they are required by every variant
+# (GUI and non-GUI) at application startup, before CLI dispatch.
+colorama==0.4.6
+tqdm==4.70.1

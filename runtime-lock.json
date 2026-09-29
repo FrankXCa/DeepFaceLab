@@ -15,6 +15,7 @@
   },
   "resolved_versions": {
     "common": {
+      "colorama": "0.4.6",
       "ffmpeg-python": "0.2.0",
       "filelock": "4.0.3",
       "flatbuffers": "25.12.19",
@@ -35,6 +36,7 @@
       "scipy": "1.18.1",
       "setuptools": "84.0.0",
       "sympy": "1.14.0",
+      "tqdm": "4.70.1",
       "typing-extensions": "4.16.0"
     },
     "gui": {
