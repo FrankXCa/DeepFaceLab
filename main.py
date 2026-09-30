@@ -1,4 +1,20 @@
 if __name__ == "__main__":
+    # P13-ENVREPORT-VERIFY: stdlib-only dispatch, deliberately placed BEFORE
+    # any heavy import (multiprocessing, core.leras). The environment report
+    # must stay reachable even when this interpreter is broken - that
+    # breakage is what the report is for.
+    import sys as _sys
+
+    if _sys.argv[1:2] == ["envreport"]:
+        try:
+            from scripts import envreport as _envreport
+
+            _env_rc = _envreport.run(_sys.argv[1:])
+        except Exception as _env_exc:  # noqa: BLE001
+            print(f"envreport: {type(_env_exc).__name__}", file=_sys.stderr)
+            _env_rc = 1
+        _sys.exit(_env_rc)
+
     # Fix for linux
     import multiprocessing
     multiprocessing.set_start_method("spawn")
