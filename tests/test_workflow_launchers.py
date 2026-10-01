@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Phase 13 - P13-CURATED-WORKFLOW-LAUNCHERS: curated workflow launcher tests.
 #
-# Covers the curated per-workflow launchers shipped in launchers/ (42 thin
+# Covers the curated per-workflow launchers shipped in launchers/ (44 thin
 # wrappers) plus the machine-readable surface manifest
 # launchers/workflow_launchers.json (the machine-readable home of the 56
 # reference-disposition ledger for test purposes; the full ledger with
@@ -18,8 +18,8 @@
 #     (ASCII, LF, @echo off, allowed line shapes only, exactly the shared
 #     dfl.bat call lines, exit-code propagation, no second execution
 #     surface, no absolute paths, no delayed expansion, no forbidden
-#     batch tokens), the manifest/ledger completeness (42 curated +
-#     14 excluded references = the full 56-reference ledger; no launcher
+#     batch tokens), the manifest/ledger completeness (44 curated +
+#     12 excluded references = the full 56-reference ledger; no launcher
 #     for any excluded reference; the launcher directory matches the
 #     manifest exactly), and the exact CLI vocabulary of every mapped
 #     command against the frozen main.py argparse surface.
@@ -222,8 +222,16 @@ def test_full_ledger_covers_fifty_six_references():
     # The complete reference-launcher ledger is 56 root .bat entries
     # (audit doc section 334: 56 root launchers, authoritative); this
     # feature's ledger disposes every one of them.
-    assert len(_curated_entries()) == 42
-    assert len(_excluded_entries()) == 14
+    #
+    # Supersession (P13-GENERIC-XSEG-RESOURCE-POLICY): the two
+    # "5.XSeg Generic) ... apply.bat" references previously excluded as
+    # RESOURCE_GATED are now REPRODUCED by the curated
+    # xseg-apply-generic-masks-src/dst launchers, which forward
+    # --model-dir to the documented user-provided resource location
+    # resources/xseg_generic_model (CONFIGURABLE_USER_SUPPLIED_PATH:
+    # no bundled model bytes, no redistribution, no downloads).
+    assert len(_curated_entries()) == 44
+    assert len(_excluded_entries()) == 12
     assert len(_curated_entries()) + len(_excluded_entries()) == 56
 
     counts = {"REPRODUCE_BEHAVIOR": len(_curated_entries())}
@@ -232,10 +240,10 @@ def test_full_ledger_covers_fifty_six_references():
             x["disposition"] == disposition for x in _excluded_entries()
         )
     assert counts == {
-        "REPRODUCE_BEHAVIOR": 42,
+        "REPRODUCE_BEHAVIOR": 44,
         "REPLACE": 1,
         "DROP": 1,
-        "RESOURCE_GATED": 5,
+        "RESOURCE_GATED": 3,
         "PHASE14_PENDING": 3,
         "POST_BASELINE": 4,
     }
@@ -251,8 +259,13 @@ def test_excluded_reference_rows_are_present():
         "4.1) data_src view aligned result.bat",
         "5.1) data_dst view aligned results.bat",
         "5.1) data_dst view aligned_debug results.bat",
-        "5.XSeg Generic) data_src whole_face mask - apply.bat",
-        "5.XSeg Generic) data_dst whole_face mask - apply.bat",
+        # Supersession (P13-GENERIC-XSEG-RESOURCE-POLICY): the two
+        # "5.XSeg Generic) ... apply.bat" references are no longer
+        # excluded - they are now reproduced by the curated
+        # xseg-apply-generic-masks-src/dst launchers (CONFIGURABLE_
+        # USER_SUPPLIED_PATH at the documented resources/xseg_generic_
+        # model location; no bundled bytes, no redistribution, no
+        # downloads).
         "5.XSeg) data_src mask - edit.bat",
         "5.XSeg) data_dst mask - edit.bat",
         "5.XSeg) train.bat",

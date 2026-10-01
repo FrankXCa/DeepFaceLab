@@ -1,5 +1,6 @@
 import json
 import shutil
+import sys
 import traceback
 from pathlib import Path
 
@@ -9,25 +10,215 @@ from core import pathex
 from core.cv2ex import *
 from core.interact import interact as io
 from core.leras import nn
+from core.leras.checkpoint import CheckpointLoadError
 from DFLIMG import *
 from facelib import XSegNet, LandmarksProcessor, FaceType
 import pickle
 
-def apply_xseg(input_path, model_path):
-    if not input_path.exists():
-        raise ValueError(f'{input_path} not found. Please ensure it exists.')
 
+# --- Generic XSeg model resource contract (P13-GENERIC-XSEG-RESOURCE-POLICY)
+#
+# This distribution bundles no XSeg model bytes of any kind and performs no
+# network downloads. `xseg apply` requires the caller to point --model-dir
+# at a model directory the user has obtained and verified. The documented,
+# curated-launcher location for a *generic* (pretrained, i.e. not the
+# user's own training result) model is:
+#
+#     resources/xseg_generic_model        (relative to the repository root)
+#
+# It is a host-local, untracked, user-managed directory: this repository
+# never tracks, bundles, or redistributes model bytes there. Historical
+# DeepFaceLab distributions shipped a generic pack (e.g. under
+# `_internal\model_generic_xseg`); its provenance is unverified and it is
+# intentionally absent from this repository. See the curated
+# xseg-apply-generic-masks-* launcher headers for the user-facing policy.
+#
+# Directory contract (structural preflight validates the layout; the
+# loader then strictly validates file contents itself):
+#   XSeg_256.npy   required - model weights
+#   XSeg_data.dat  optional - face-type metadata; when absent (or
+#                     unreadable) the CLI asks for the face type
+#                     interactively
+XSEG_MODEL_REQUIRED_FILE = 'XSeg_256.npy'
+XSEG_MODEL_OPTIONAL_FILE = 'XSeg_data.dat'
+XSEG_GENERIC_MODEL_LOCATION = 'resources/xseg_generic_model'
+
+
+def _repo_root():
+    # mainscripts/XSegUtil.py -> repository root
+    return Path(__file__).resolve().parents[1]
+
+
+def _is_documented_generic_location(model_path):
+    """True when --model-dir points at the documented generic-model
+    location, in any relative form or as an absolute path."""
+    try:
+        normalized = str(model_path).replace('\\', '/').strip()
+        while normalized.endswith('/') or normalized.endswith('\\'):
+            normalized = normalized[:-1]
+        if normalized.lower() == XSEG_GENERIC_MODEL_LOCATION:
+            return True
+        try:
+            return Path(model_path).resolve() == (
+                _repo_root() / 'resources' / 'xseg_generic_model')
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _documented_location_note(model_path):
+    """Actionable guidance for the documented generic-model location,
+    shown only when the failed --model-dir is that location."""
+    if not _is_documented_generic_location(model_path):
+        return []
+    return [
+        "",
+        "That path is the documented, host-local location for a USER-PROVIDED",
+        "generic XSeg model (used by the curated xseg-apply-generic-masks-*",
+        "launchers). It is untracked and never shipped by this repository: no",
+        "historical DeepFaceLab pack is bundled or redistributed here, and this",
+        "distribution performs no downloads (provenance of historical packs is",
+        "unverified). Place a compatible model directory you have verified",
+        "yourself at that location, or run the CLI with --model-dir pointing",
+        "at any other compatible model directory (e.g. your own trained XSeg",
+        "model).",
+    ]
+
+
+def _fail_with(lines):
+    """Print every line as an error-log line and exit with code 1.
+
+    The chosen failure style for resource-policy violations: an
+    actionable diagnostic (never a raw FileNotFoundError / NoneType
+    traceback), a nonzero exit code (never a silent success or skip),
+    and no fallback to any other model location.
+    """
+    for line in lines:
+        io.log_err(line)
+    sys.exit(1)
+
+
+def _validate_apply_resources(input_path, model_path):
+    """Structural preflight for `xseg apply`.
+
+    Runs before any interactive prompt, device selection, NN
+    initialization, or model loading, so a missing or structurally
+    invalid resource stops with an actionable diagnostic. The loader
+    still validates file contents afterwards (a corrupt model file ->
+    classified failure, see apply_xseg).
+    """
+    if not input_path.exists():
+        _fail_with([
+            f"ERROR: input directory not found: {input_path}",
+            "",
+            "Pass --input-dir of an existing directory containing aligned",
+            "face images (DFLIMG). Example:",
+            '  dfl.bat xseg apply --input-dir "workspace\\data_src\\aligned" --model-dir <model dir>',
+        ])
+    if not input_path.is_dir():
+        _fail_with([
+            f"ERROR: --input-dir is a file, not a directory: {input_path}",
+            "",
+            "Pass --input-dir of an existing DIRECTORY containing aligned",
+            "face images (DFLIMG).",
+        ])
     if not model_path.exists():
-        raise ValueError(f'{model_path} not found. Please ensure it exists.')
-        
+        _fail_with([
+            f"ERROR: XSeg model directory not found: {model_path}",
+            "",
+            "A valid --model-dir must be an EXISTING DIRECTORY containing:",
+            f"  {XSEG_MODEL_REQUIRED_FILE}   (required) model weights",
+            f"  {XSEG_MODEL_OPTIONAL_FILE}   (optional) face-type metadata; without it the CLI asks interactively",
+            "",
+            "This distribution bundles no XSeg model and downloads nothing;",
+            "--model-dir must point at a model directory you have obtained yourself.",
+        ] + _documented_location_note(model_path))
+    if not model_path.is_dir():
+        _fail_with([
+            f"ERROR: XSeg model directory is a file, not a directory: {model_path}",
+            "",
+            f"A valid --model-dir must be an EXISTING DIRECTORY containing {XSEG_MODEL_REQUIRED_FILE}",
+            f"(and optionally {XSEG_MODEL_OPTIONAL_FILE}).",
+        ])
+    if not (model_path / XSEG_MODEL_REQUIRED_FILE).is_file():
+        try:
+            present = ', '.join(sorted(p.name for p in model_path.iterdir()))
+        except OSError:
+            present = '<unreadable directory>'
+        _fail_with([
+            f"ERROR: XSeg model directory is structurally incomplete: {model_path}",
+            "",
+            f"  required file missing: {XSEG_MODEL_REQUIRED_FILE}",
+            f"  present files: {present or '(none)'}",
+            "",
+            "The directory exists but is not a usable XSeg model directory",
+            "(expected layout listed above).",
+        ] + _documented_location_note(model_path))
+
+
+def _loader_failure_lines(model_path, error):
+    """Actionable diagnostic for a model file that passed the structural
+    preflight but whose contents fail to load. Only the typed resource/
+    content failures the strict loader can raise are ever handed in here
+    (CheckpointLoadError, pickle.UnpicklingError, EOFError); every other
+    exception type propagates under the app's normal error policy and is
+    never rewritten into a resource diagnostic."""
+    lines = [
+        f"ERROR: XSeg model could not be loaded from: {model_path}",
+        "",
+    ]
+    if isinstance(error, CheckpointLoadError):
+        lines += [
+            "  the model file exists but FAILED strict weight validation",
+            "  (likely a corrupt, truncated, or incompatible model file).",
+        ]
+    else:
+        # pickle.UnpicklingError / EOFError: the bytes cannot be decoded
+        # as a checkpoint at all (empty, truncated, or not a model file).
+        lines += [
+            "  the model file exists but is not a readable checkpoint",
+            "  (its bytes are corrupt, truncated, or empty).",
+        ]
+    lines += [
+        "",
+        "  Re-obtain the model file from your source and verify its",
+        "  integrity, or point --model-dir at a known-good compatible",
+        "  model directory.",
+        "",
+        "This distribution bundles no XSeg model and downloads nothing;",
+        "--model-dir must point at a model directory you have obtained yourself.",
+    ]
+    lines += _documented_location_note(model_path)
+    return lines
+
+
+def apply_xseg(input_path, model_path):
+    io.log_info(f'Input directory: {input_path}')
+    io.log_info(f'Model directory: {model_path}')
+
+    # Structural preflight BEFORE any interactive prompt, device
+    # selection, NN initialization, or model loading
+    # (P13-GENERIC-XSEG-RESOURCE-POLICY): missing or structurally
+    # invalid resources fail with actionable diagnostics - never a raw
+    # loader exception, and never a silent fallback to another model
+    # location.
+    _validate_apply_resources(input_path, model_path)
+
+
     face_type = None
     
-    model_dat = model_path / 'XSeg_data.dat'
+    model_dat = model_path / XSEG_MODEL_OPTIONAL_FILE
     if model_dat.exists():
-        dat = pickle.loads( model_dat.read_bytes() )
-        dat_options = dat.get('options', None)
-        if dat_options is not None:
-            face_type = dat_options.get('face_type', None)
+        dat = None
+        try:
+            dat = pickle.loads( model_dat.read_bytes() )
+        except Exception:
+            io.log_err(f'WARNING: {model_dat} exists but could not be read; ignoring it and asking for the face type interactively.')
+        if dat is not None:
+            dat_options = dat.get('options', None) if isinstance(dat, dict) else None
+            if dat_options is not None:
+                face_type = dat_options.get('face_type', None)
         
         
         
@@ -43,18 +234,52 @@ def apply_xseg(input_path, model_path):
                      'wf' : FaceType.WHOLE_FACE,
                      'head' : FaceType.HEAD}[face_type]
                      
-    io.log_info(f'Applying trained XSeg model to {input_path.name}/ folder.')
+    io.log_info(f'Applying XSeg model to {input_path.name}/ folder.')
 
     device_config = nn.DeviceConfig.ask_choose_device(choose_only_one=True)
     nn.initialize(device_config)
         
     
     
-    xseg = XSegNet(name='XSeg', 
-                    load_weights=True,
-                    weights_file_root=model_path,
-                    data_format=nn.data_format,
-                    raise_on_no_model_files=True)
+    # The preflight already validated this directory; re-verify the
+    # required weight file immediately before load so the known
+    # "file removed after preflight" case stays actionable. This is a
+    # state check, not exception-string classification.
+    required_weight_file = model_path / XSEG_MODEL_REQUIRED_FILE
+    if not required_weight_file.is_file():
+        _fail_with([
+            f"ERROR: XSeg model weight file is missing: {required_weight_file}",
+            "",
+            "  the model directory was structurally valid earlier in this",
+            "  run, but the required file is no longer present:",
+            f"    {XSEG_MODEL_REQUIRED_FILE}   (required)",
+            f"    {XSEG_MODEL_OPTIONAL_FILE}   (optional)",
+            "",
+            "  Restore the file and re-run.",
+            "",
+            "This distribution bundles no XSeg model and downloads nothing;",
+            "--model-dir must point at a model directory you have obtained yourself.",
+        ] + _documented_location_note(model_path))
+
+    try:
+        xseg = XSegNet(name='XSeg',
+                        load_weights=True,
+                        weights_file_root=model_path,
+                        data_format=nn.data_format,
+                        raise_on_no_model_files=True)
+    except (CheckpointLoadError, pickle.UnpicklingError, EOFError) as e:
+        # Known resource/content failures of the strict loader only:
+        # CheckpointLoadError (the file exists but failed strict weight
+        # validation) and pickle.UnpicklingError / EOFError (the bytes
+        # cannot be decoded as a checkpoint at all - unpicklable, empty,
+        # or truncated; the loader's contract is that an existing file
+        # that cannot be loaded STRICTLY fails, and unpicklable bytes are
+        # the one content failure it surfaces without its typed
+        # CheckpointLoadError). Nothing else is caught here: device,
+        # implementation, and runtime errors propagate under the app's
+        # normal error policy and are never rewritten into a resource
+        # diagnostic.
+        _fail_with(_loader_failure_lines(model_path, e))
     xseg_res = xseg.get_resolution()
               
     images_paths = pathex.get_image_paths(input_path, return_Path_class=True)

@@ -74,6 +74,17 @@ model/
 pretrained/
 pretrain_faces/
 
+# --- User-provided generic XSeg model resource
+# (P13-GENERIC-XSEG-RESOURCE-POLICY) ---
+# Host-local, never tracked, never redistributed: the documented
+# user-managed location for a generic (pretrained) XSeg model consumed
+# by the curated xseg-apply-generic-masks-* launchers (see their
+# headers and the Phase-13 state doc). The repository never bundles,
+# downloads, or redistributes model bytes. The rule is deliberately
+# narrow (root-anchored, that location only): any other resources/
+# content, metadata, or manifests stay visible to Git.
+/resources/xseg_generic_model/
+
 # --- Caches ---
 .cache/
 .nvidia/
