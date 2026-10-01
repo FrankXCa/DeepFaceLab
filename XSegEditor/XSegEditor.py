@@ -12,6 +12,14 @@ from types import SimpleNamespace as sn
 import cv2
 import numpy as np
 import numpy.linalg as npla
+# torch must be imported before any PyQt5 import (the loader child
+# processes re-import this module, so the order is decided here): on
+# Windows the PyQt5 wheel's find_qt() registers its Qt5\bin directory,
+# which carries a stale VC++ 2019 CRT, on the DLL search path; if that
+# happens before torch's native init, c10.dll's MSVCP140 dependency
+# binds the stale CRT copy and the child processes die with
+# WinError 1114 (covered by test_xseg_child_process_imports_torch_before_pyqt5)
+import torch
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *

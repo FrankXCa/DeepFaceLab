@@ -73,7 +73,9 @@ import ast
 import gc
 import importlib
 import importlib.util
+import json
 import random
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -375,6 +377,177 @@ def test_editor_import_without_tensorflow():
                 del sys.modules[name]
         gc.collect()
     assert not _forbidden_loaded()
+
+
+# --- 2b. child-process import order (torch before PyQt5) --------------
+#
+# The packaged Windows GUI runtimes bundle the PyQt5 wheel.  On ANY
+# ``import PyQt5`` the wheel's ``PyQt5/__init__.py`` ``find_qt()`` runs
+# and registers the wheel's ``PyQt5\Qt5\bin`` directory (a stale VC++
+# 2019 14.26 CRT set: MSVCP140.dll / MSVCP140_1.dll) both on ``PATH``
+# and via ``os.add_dll_directory``.  If that registration happens
+# before ``torch`` is loaded, ``torch\lib\c10.dll`` (built with MSVC
+# 14.4x, hard-importing MSVCP140.dll) resolves its CRT dependency to
+# the stale wheel copy and the CRT DllMain init fails:
+# ``OSError: [WinError 1114] ... c10.dll``.  If torch loads first, the
+# CRT binds to the runtime root VCRUNTIME140* + System32 MSVCP140
+# (14.4x) and the later PyQt5 import reuses those already-loaded
+# instances.  The XSeg editor's loader child processes
+# (``LoaderQSubprocessor`` / ``Cli`` in ``core/qtex/QSubprocessor.py``)
+# re-import ``XSegEditor.XSegEditor`` fresh, so the module body — not
+# ``main.py`` — decides the child's order.
+
+
+_CHILD_PROCESS_PROBE = r"""
+import builtins
+import importlib
+import importlib.util
+import json
+import os
+import sys
+import time
+import types
+
+# the spawned children inherit runtime_entry's sys.path pinning of the
+# repo root; -I drops the implicit cwd entry for -c, so re-add it here
+sys.path.insert(0, os.getcwd())
+
+
+def _install_stub():
+    class _Meta(type):
+        def __getattr__(cls, name):
+            return _Stub
+
+    class _Stub(metaclass=_Meta):
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, name):
+            return _Stub
+
+        def __call__(self, *args, **kwargs):
+            return _Stub()
+
+    names = [
+        "Qt", "QAction", "QActionGroup", "QApplication", "QBrush",
+        "QButtonGroup", "QColor", "QCursor", "QDialog", "QFileDialog",
+        "QFont", "QFontDatabase", "QFrame", "QGraphicsOpacityEffect",
+        "QGridLayout", "QHBoxLayout", "QIcon", "QImage", "QLabel",
+        "QLightEffect", "QLineEdit", "QMenu", "QMessageBox", "QPainter",
+        "QPainterPath", "QPalette", "QPen", "QPixmap", "QPoint",
+        "QKeySequence", "QProgressBar", "QPushButton", "QRect",
+        "QScrollArea", "QSize", "QSizePolicy", "QSlider", "QTabWidget",
+        "QThread", "QTimer", "QToolButton", "QVBoxLayout", "QWidget",
+        "QGroupBox", "QGuiApplication", "QShortcut", "QStyle",
+        "QAbstractButton", "Signal", "Slot",
+    ]
+    pkg = types.ModuleType("PyQt5")
+    pkg.__path__ = []
+    for sub in ("QtCore", "QtGui", "QtWidgets"):
+        m = types.ModuleType("PyQt5." + sub)
+        for name in names:
+            m.__dict__[name] = _Stub
+        pkg.__dict__[sub] = m
+        sys.modules["PyQt5." + sub] = m
+    sys.modules["PyQt5"] = pkg
+
+
+_first = {}
+_order = []
+_orig_import = builtins.__import__
+_t0 = time.perf_counter()
+
+
+def _hook(name, *args, **kwargs):
+    top = name.split(".")[0] if name else ""
+    if top and top not in _first:
+        _first[top] = round(time.perf_counter() - _t0, 6)
+        _order.append(top)
+    return _orig_import(name, *args, **kwargs)
+
+
+builtins.__import__ = _hook
+
+# presence check WITHOUT importing: ``import PyQt5`` would itself run
+# the wheel's find_qt() (and on the packaged runtimes would already
+# trigger the failure under test before the editor chain even starts)
+have_pyqt5 = importlib.util.find_spec("PyQt5") is not None
+if not have_pyqt5:
+    # dev/CI venvs ship no PyQt5: exercise the same chain against the
+    # stand-in (order semantics are what this probe enforces; the real
+    # native-CRT behavior of a wrong order is covered by the packaged
+    # GUI runtime app smokes)
+    _install_stub()
+
+ok = True
+err = None
+try:
+    # the exact first import of the spawned child processes
+    importlib.import_module("XSegEditor.XSegEditor")
+except BaseException as e:  # noqa: BLE001
+    ok = False
+    err = repr(e)
+
+print("CHILD_PROBE_RESULT " + json.dumps({
+    "ok": ok,
+    "err": err,
+    "have_pyqt5": have_pyqt5,
+    "first": _first,
+    "order_head": _order[:40],
+}))
+sys.exit(0 if ok else 3)
+"""
+
+
+def test_xseg_child_process_imports_torch_before_pyqt5():
+    """A fresh child interpreter (the loader subprocess bootstrap) must
+    import ``torch`` before any ``PyQt5`` import in the XSeg editor
+    module.
+
+    Runs ``import XSegEditor.XSegEditor`` — the exact first import of
+    the spawned ``LoaderQSubprocessor`` children — in a fresh
+    interpreter launched with the same flags and working directory the
+    real app uses (``python -I -B``, repo root as CWD), records the
+    first import offset of ``torch`` and ``PyQt5``, and asserts torch
+    comes first.  With the order wrong, packaged GUI runtimes die with
+    WinError 1114 on ``c10.dll`` (see the section note); with real
+    PyQt5 present this probe reproduces that crash itself.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", _CHILD_PROCESS_PROBE],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    line = None
+    for l in proc.stdout.splitlines():
+        if l.startswith("CHILD_PROBE_RESULT "):
+            line = l
+    assert line is not None, (
+        "child probe emitted no result (rc=%s)\n"
+        "stdout tail: %s\nstderr tail: %s"
+        % (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:]))
+    data = json.loads(line[len("CHILD_PROBE_RESULT "):])
+    assert data["ok"], (
+        "XSeg editor child-process import chain failed: %s"
+        % data["err"])
+    first = data["first"]
+    assert "torch" in first, (
+        "torch was never imported in the child chain: %s"
+        % data["order_head"])
+    assert "PyQt5" in first, (
+        "PyQt5 was never imported in the child chain: %s"
+        % data["order_head"])
+    assert first["torch"] < first["PyQt5"], (
+        "the XSeg editor module imports PyQt5 (first=%.6f s) before "
+        "torch (first=%.6f s): in the packaged GUI runtimes the wheel's "
+        "find_qt() then puts the stale VC++ 2019 CRT (PyQt5\\Qt5\\bin) "
+        "on the DLL search path before torch's native init, so "
+        "c10.dll's MSVCP140 dependency binds the stale CRT copy and "
+        "torch's DLL init fails (WinError 1114). The module must import "
+        "torch before any PyQt5 import. order_head=%s"
+        % (first["PyQt5"], first["torch"], data["order_head"]))
 
 
 # --- 3. DFLIMG XSeg mask metadata round-trip --------------------------
