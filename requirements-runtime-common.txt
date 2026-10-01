@@ -16,3 +16,19 @@ ffmpeg-python==0.2.0
 # (GUI and non-GUI) at application startup, before CLI dispatch.
 colorama==0.4.6
 tqdm==4.70.1
+
+# image loading, encoding, palette reduction and text drawing:
+# core/imagelib/text.py and core/imagelib/reduce_colors.py are imported via
+# core/imagelib/__init__.py by every production entry module (extractor,
+# sorter, trainer, export, merge, faceset, xseg), so Pillow is a common
+# production runtime dependency of all four variants. Pillow 9.5.0 is the
+# reviewed compatibility pin for the current runtime baseline: the production
+# source uses Pillow APIs including Image.ADAPTIVE (core/imagelib/
+# reduce_colors.py, exercised on the conditional merge color-degradation
+# path in merger/MergeMasked.py). It is an honest compatibility baseline,
+# not an assertion that it is the newest possible compatible version.
+# Version changes, especially major-version changes, require explicit
+# source-compatibility review and runtime validation on all four variants
+# before lock regeneration; see the Pillow compatibility contract in
+# scripts/generate_runtime_locks.py.
+pillow==9.5.0

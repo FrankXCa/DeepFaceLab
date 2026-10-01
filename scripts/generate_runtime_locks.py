@@ -37,6 +37,32 @@ PRIVATE_PATH_RE = re.compile(
     r"appdata[\\/]|(?:^|[\\/])\.venv(?:[\\/]|$))"
 )
 
+# Reviewed Pillow compatibility contract (P13 runtime dependency closure,
+# review round 2). Pillow 9.5.0 is the reviewed and frozen compatibility pin
+# for the current DeepFaceLab runtime baseline: an honest compatibility
+# baseline pin, not an assertion that it is the newest possible compatible
+# version. The current production source uses Pillow APIs including
+# Image.ADAPTIVE (core/imagelib/reduce_colors.py, exercised on the
+# conditional merge color-degradation path in merger/MergeMasked.py).
+# Changing the Pillow version -- in particular across a major version --
+# requires an explicit source-compatibility review and runtime validation on
+# all four variants; only then may PILLOW_REVIEWED_VERSION and
+# PILLOW_COMPATIBILITY_REVIEW_KEY be updated together with
+# runtime-lock.json and requirements-runtime-common.txt.
+PILLOW_REVIEWED_VERSION = "9.5.0"
+PILLOW_COMPATIBILITY_REVIEW_KEY = "p13-pillow-9.5.0-reviewed-baseline"
+
+# Dev/test-only packages that must never enter a packaged runtime lock.
+# tqdm is NOT in this set: it is a common production runtime dependency
+# (imported unconditionally by core/interact/interact.py at application
+# startup, all variants).
+# pillow is NOT in this set either: it is a common production runtime
+# dependency (imported via core/imagelib/__init__.py by every production
+# entry module, all variants), exactly as colorama and tqdm.
+FORBIDDEN_RUNTIME_PACKAGES = {
+    "ipython", "matplotlib", "psutil", "pytest", "ffmpeg"
+}
+
 
 def fail(message: str) -> "NoReturn":
     raise SystemExit(message)
@@ -517,13 +543,6 @@ def validate_locks(config: dict) -> None:
         fail("ambiguous generic requirements-lock.txt must not exist")
     config_hash = sha256_file_text_canonical(CONFIG_PATH)
     generator_hash = sha256_file_text_canonical(GENERATOR_PATH)
-    # Dev/test-only packages that must never enter a packaged runtime lock.
-    # tqdm is NOT in this set: it is a common production runtime dependency
-    # (imported unconditionally by core/interact/interact.py at application
-    # startup, all variants).
-    forbidden = {
-        "ipython", "matplotlib", "pillow", "psutil", "pytest", "ffmpeg"
-    }
     for variant, variant_config in sorted(config["variants"].items()):
         lock_path = ROOT / f"requirements-lock-{variant}.txt"
         if not lock_path.is_file():
@@ -549,8 +568,27 @@ def validate_locks(config: dict) -> None:
         actual = {entry["name"]: entry["version"] for entry in entries}
         if actual != expected or list(actual) != sorted(actual):
             fail(f"package-set identity mismatch in {lock_path.name}")
-        if forbidden.intersection(actual):
-            fail(f"dev/orphan package in {lock_path.name}: {sorted(forbidden.intersection(actual))}")
+        # Reviewed Pillow compatibility contract: the locked Pillow version
+        # must equal the reviewed pin (PILLOW_REVIEWED_VERSION). A Pillow
+        # version change -- especially across a major version -- that does
+        # not update the contract in this file (after an explicit
+        # source-compatibility review and runtime validation on all four
+        # variants) fails here instead of silently passing through lock
+        # regeneration.
+        if actual.get("pillow") != PILLOW_REVIEWED_VERSION:
+            fail(
+                f"Pillow compatibility contract violation in {lock_path.name}: "
+                f"locked {actual.get('pillow')!r} but the reviewed pin is "
+                f"{PILLOW_REVIEWED_VERSION!r} (review key: "
+                f"{PILLOW_COMPATIBILITY_REVIEW_KEY}). A Pillow version change "
+                "requires an explicit source-compatibility review and runtime "
+                "validation on all four variants before updating the contract."
+            )
+        if FORBIDDEN_RUNTIME_PACKAGES.intersection(actual):
+            fail(
+                f"dev/orphan package in {lock_path.name}: "
+                f"{sorted(FORBIDDEN_RUNTIME_PACKAGES.intersection(actual))}"
+            )
         if "ffmpeg-python" not in actual or actual.get("future") != "1.0.0":
             fail(f"ffmpeg-python/future contract missing in {lock_path.name}")
         gui_names = {"pyqt5", "pyqt5-qt5", "pyqt5-sip"}

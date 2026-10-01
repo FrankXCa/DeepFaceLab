@@ -23,7 +23,11 @@ GUI_PACKAGES = {"pyqt5", "pyqt5-qt5", "pyqt5-sip"}
 # tqdm is NOT in this set: it is a common production runtime dependency
 # (imported unconditionally at module level by core/interact/interact.py)
 # since P13-RUNTIME-DEP-CLOSURE, exactly as in the generator's validator.
-DEV_ONLY = {"ipython", "matplotlib", "pillow", "pytest"}
+# pillow is NOT in this set either: it is a common production runtime
+# dependency (imported via core/imagelib/__init__.py by every production
+# entry module, all variants) since the Pillow closure pass, exactly as
+# colorama and tqdm.
+DEV_ONLY = {"ipython", "matplotlib", "pytest"}
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -37,6 +41,19 @@ def entries(variant: str) -> list[dict]:
 
 def package_map(variant: str) -> dict[str, dict]:
     return {entry["name"]: entry for entry in entries(variant)}
+
+
+def common_requirement_pins() -> dict[str, str]:
+    """Exact pins declared in requirements-runtime-common.txt (normalized)."""
+    pins: dict[str, str] = {}
+    for raw in (ROOT / "requirements-runtime-common.txt").read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        match = locks.PIN_RE.fullmatch(line)
+        if match:
+            pins[locks.normalized_name(match.group(1))] = match.group(2)
+    return pins
 
 
 def crlf_bytes(path: Path) -> bytes:
@@ -131,6 +148,47 @@ def test_no_dev_only_or_orphan_packages(variant):
     names = package_map(variant).keys()
     assert DEV_ONLY.isdisjoint(names)
     assert "psutil" not in names
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_pillow_is_a_common_production_runtime_dependency(variant):
+    """Regression: Pillow is imported via core/imagelib/__init__.py by every
+    production entry module (extractor, sorter, trainer, export, merge,
+    faceset, xseg), so it must be a DIRECT common dependency present in all
+    four variant locks, not a dev/test-only package.
+
+    The expected version is anchored to the reviewed Pillow compatibility
+    contract in scripts/generate_runtime_locks.py
+    (PILLOW_REVIEWED_VERSION / PILLOW_COMPATIBILITY_REVIEW_KEY), NOT to
+    whatever runtime-lock.json currently declares: a Pillow version change --
+    especially across a major version -- is only accepted after an explicit
+    source-compatibility review and runtime validation on all four variants
+    plus a deliberate update of that contract. Regenerating the locks alone
+    (e.g. bumping the pin in runtime-lock.json and the common requirements)
+    must therefore fail these tests until the reviewed contract is updated.
+    Pillow 9.5.0 is the reviewed compatibility pin for the current baseline:
+    the production source uses Pillow APIs including Image.ADAPTIVE via
+    core/imagelib/reduce_colors.py on the conditional merge color-degradation
+    path in merger/MergeMasked.py. It is an honest compatibility baseline,
+    not an assertion that it is the newest possible compatible version."""
+    contract_version = locks.PILLOW_REVIEWED_VERSION
+    assert re.fullmatch(r"\d+\.\d+\.\d+", contract_version)
+    assert locks.PILLOW_COMPATIBILITY_REVIEW_KEY.strip()
+    # The reviewed pin must be declared in the common production inputs
+    # (removing or de-classifying pillow from production inputs fails here).
+    assert common_requirement_pins().get("pillow") == contract_version
+    # The reviewed pin must be declared in the authoritative lock config.
+    assert CONFIG["resolved_versions"]["common"]["pillow"] == contract_version
+    # Pillow must not be classified as dev/test-only or forbidden.
+    assert "pillow" not in DEV_ONLY
+    assert "pillow" not in locks.FORBIDDEN_RUNTIME_PACKAGES
+    # Pillow must be locked in every variant at the reviewed version.
+    assert "pillow" in package_map(variant)
+    pillow = package_map(variant)["pillow"]
+    assert pillow["version"] == contract_version
+    assert pillow["classification"] == "direct"
+    assert pillow["filename"].endswith("-cp312-cp312-win_amd64.whl")
+    assert pillow["source"] == "https://pypi.org/simple"
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -375,3 +433,127 @@ def test_offline_validator_accepts_crlf_textual_identity_inputs(tmp_path):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "Phase-13 runtime input locks: PASS" in completed.stdout
+
+
+def _copy_lock_tree(tmp_path) -> None:
+    """Copy the full checked-in lock/validator tree into tmp_path (byte
+    copy, never mutating the checked-in files) so a case can mutate its
+    private copy and rerun the offline validator against it."""
+    required = {
+        "requirements-cpu.txt",
+        "requirements-cuda.txt",
+        "requirements-runtime-common.txt",
+        "requirements-runtime-gui.txt",
+        "runtime-lock.json",
+        "runtime-python.json",
+        "runtime-python-licenses.json",
+        "scripts/generate_runtime_locks.py",
+        *(f"requirements-lock-{variant}.txt" for variant in VARIANTS),
+    }
+    for relative in sorted(required):
+        source = ROOT / relative
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _run_check(tmp_path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "scripts/generate_runtime_locks.py", "--check"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _bump_locked_pillow(tmp_path, major_minor_patch: str) -> None:
+    for variant in VARIANTS:
+        lock = tmp_path / f"requirements-lock-{variant}.txt"
+        text = lock.read_text(encoding="utf-8")
+        old = f'"variant":"{variant}","version":"9.5.0"'
+        new = f'"variant":"{variant}","version":"{major_minor_patch}"'
+        assert old in text
+        lock.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+
+def _remove_pillow_from_one_variant_lock(tmp_path, variant: str) -> None:
+    lock = tmp_path / f"requirements-lock-{variant}.txt"
+    kept = []
+    for line in lock.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# artifact:") and '"name":"pillow"' in line:
+            continue
+        if line.startswith("pillow @ "):
+            continue
+        kept.append(line)
+    lock.write_text("\n".join(kept) + "\n", encoding="utf-8", newline="\n")
+
+
+def _mark_generator_changed(tmp_path) -> None:
+    """Refresh the generator-sha256 header of every tmp lock so a mutation
+    of the tmp generator itself is not masked as a stale-generator failure."""
+    new_hash = locks.sha256_file_text_canonical(tmp_path / "scripts" / "generate_runtime_locks.py")
+    for variant in VARIANTS:
+        lock = tmp_path / f"requirements-lock-{variant}.txt"
+        text = lock.read_text(encoding="utf-8")
+        text = re.sub(r"^# generator-sha256: [0-9a-f]{64}\r?$",
+                      f"# generator-sha256: {new_hash}", text,
+                      count=1, flags=re.MULTILINE)
+        lock.write_text(text, encoding="utf-8", newline="\n")
+
+
+@pytest.mark.parametrize("case", [
+    "A-current-contract",
+    "B-lock-only-major-bump",
+    "C-removed-from-common-production",
+    "D-classified-dev-only",
+    "E-omitted-from-one-variant",
+])
+def test_pillow_contract_acceptance_cases(tmp_path, case):
+    """Acceptance cases A-E for the reviewed Pillow compatibility contract,
+    exercised on private tmp copies of the tree (the checked-in locks and
+    requirements are never mutated). A current contract state must pass;
+    every unreviewed Pillow version/classification change must make the
+    offline validator fail, so a Pillow major-version change can never pass
+    lock regeneration silently without updating the contract in
+    scripts/generate_runtime_locks.py."""
+    _copy_lock_tree(tmp_path)
+    if case == "A-current-contract":
+        completed = _run_check(tmp_path)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "Phase-13 runtime input locks: PASS" in completed.stdout
+    elif case == "B-lock-only-major-bump":
+        # Locks alone moved to a newer major version; config/contract stay.
+        _bump_locked_pillow(tmp_path, "10.0.0")
+        completed = _run_check(tmp_path)
+        assert completed.returncode != 0, "B: lock-only major bump must FAIL"
+    elif case == "C-removed-from-common-production":
+        common = tmp_path / "requirements-runtime-common.txt"
+        lines = common.read_text(encoding="utf-8").splitlines()
+        assert "pillow==9.5.0" in lines
+        common.write_text(
+            "\n".join(l for l in lines if l.strip() != "pillow==9.5.0") + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        completed = _run_check(tmp_path)
+        assert completed.returncode != 0, "C: removal from production inputs must FAIL"
+    elif case == "D-classified-dev-only":
+        gen = tmp_path / "scripts" / "generate_runtime_locks.py"
+        text = gen.read_text(encoding="utf-8")
+        old = '"ipython", "matplotlib", "psutil", "pytest", "ffmpeg"'
+        assert old in text
+        gen.write_text(
+            text.replace(old,
+                         '"ipython", "matplotlib", "pillow", "psutil", "pytest", "ffmpeg"'),
+            encoding="utf-8", newline="\n",
+        )
+        _mark_generator_changed(tmp_path)
+        completed = _run_check(tmp_path)
+        assert completed.returncode != 0, "D: dev-only reclassification must FAIL"
+        assert "pillow" in (completed.stdout + completed.stderr)
+    elif case == "E-omitted-from-one-variant":
+        _remove_pillow_from_one_variant_lock(tmp_path, "cuda-gui")
+        completed = _run_check(tmp_path)
+        assert completed.returncode != 0, "E: omission from one variant must FAIL"
+    else:
+        raise AssertionError(f"unknown acceptance case: {case}")
