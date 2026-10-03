@@ -1,237 +1,77 @@
-﻿<table align="center" border="0">
+# DeepFaceLab modernization
 
-<tr><td colspan=2 align="center">
+This branch modernizes the Windows package and execution boundary for DeepFaceLab. It uses generated, versioned Python runtimes instead of an in-place embedded environment, routes application commands through one launcher, and keeps user data and externally supplied resources outside the generated runtime.
 
-# DeepFaceLab  
+The current package/runtime contract has been validated on the current Windows development environment and its current generated runtimes. That evidence is not a general release-portability certification. Clean-machine, different-user, moved-install, path-with-spaces, archive, fresh-extraction, and offline reconstruction scenarios are not yet qualified.
 
-<a href="https://arxiv.org/abs/2005.05535">
+See [DISTRIBUTION.md](DISTRIBUTION.md) for the complete runtime, launcher, workspace, resource, workflow-availability, and support contract.
 
-<img src="https://static.arxiv.org/static/browse/0.3.0/images/icons/favicon.ico" width=14></img>
-https://arxiv.org/abs/2005.05535</a>
+## Quick start
 
-</td></tr>
-<tr><td colspan=2 align="center">
+From a Windows `cmd.exe` prompt at the repository root, construct and activate one runtime variant:
 
-<p align="center">
+```bat
+launchers\dfl-setup-runtime.bat cuda-gui --activate
+```
 
-![](doc/logo_tensorflow.png)
-![](doc/logo_cuda.png)
-![](doc/logo_directx.png)
+Runtime construction is a developer/build operation and requires suitable host tooling. Once a runtime is built and selected, normal application commands use only that packaged runtime's Python interpreter; they do not fall back to system Python.
 
-</p>
+Inspect the application surface and verify the selected package:
 
-DeepFaceLab is used by such popular youtube channels as
+```bat
+launchers\dfl.bat --help
+launchers\dfl.bat --self-test
+launchers\dfl-envreport.bat --verify
+```
 
-|![](doc/tiktok_icon.png) [deeptomcruise](https://www.tiktok.com/@deeptomcruise)|![](doc/tiktok_icon.png) [1facerussia](https://www.tiktok.com/@1facerussia)|![](doc/tiktok_icon.png) [arnoldschwarzneggar](https://www.tiktok.com/@arnoldschwarzneggar)
-|---|---|---|
+`--self-test` is a focused bootstrap diagnostic. `dfl-envreport.bat --verify` checks the current environment, external prerequisites, and runtime consistency. Neither command replaces the test suite or release-portability qualification.
 
-|![](doc/tiktok_icon.png) [mariahcareyathome?](https://www.tiktok.com/@mariahcareyathome?)|![](doc/tiktok_icon.png) [diepnep](https://www.tiktok.com/@diepnep)|![](doc/tiktok_icon.png) [mr__heisenberg](https://www.tiktok.com/@mr__heisenberg)|![](doc/tiktok_icon.png) [deepcaprio](https://www.tiktok.com/@deepcaprio)
-|---|---|---|---|
+## Runtime variants
 
-|![](doc/youtube_icon.png) [VFXChris Ume](https://www.youtube.com/channel/UCGf4OlX_aTt8DlrgiH3jN3g/videos)|![](doc/youtube_icon.png) [Sham00k](https://www.youtube.com/channel/UCZXbWcv7fSZFTAZV4beckyw/videos)|
-|---|---|
+| Variant | Compute | GUI workflows |
+| --- | --- | --- |
+| `cpu-nogui` | CPU Torch; CUDA unavailable | No |
+| `cpu-gui` | CPU Torch; CUDA unavailable | Yes |
+| `cuda-nogui` | CUDA-enabled Torch for supported NVIDIA environments | No |
+| `cuda-gui` | CUDA-enabled Torch for supported NVIDIA environments | Yes |
 
-|![](doc/youtube_icon.png) [Collider videos](https://www.youtube.com/watch?v=A91P2qtPT54&list=PLayt6616lBclvOprvrC8qKGCO-mAhPRux)|![](doc/youtube_icon.png) [iFake](https://www.youtube.com/channel/UCC0lK2Zo2BMXX-k1Ks0r7dg/videos)|![](doc/youtube_icon.png) [NextFace](https://www.youtube.com/channel/UCFh3gL0a8BS21g-DHvXZEeQ/videos)|
-|---|---|---|
+Choose a GUI variant for XSeg Editor and other supported PyQt workflows. The CUDA variants require a compatible NVIDIA GPU and driver; no particular GPU model is a general requirement.
 
-|![](doc/youtube_icon.png) [Futuring Machine](https://www.youtube.com/channel/UCC5BbFxqLQgfnWPhprmQLVg)|![](doc/youtube_icon.png) [RepresentUS](https://www.youtube.com/channel/UCRzgK52MmetD9aG8pDOID3g)|![](doc/youtube_icon.png) [Corridor Crew](https://www.youtube.com/c/corridorcrew/videos)|
-|---|---|---|
+## Host prerequisites
 
-|![](doc/youtube_icon.png) [DeepFaker](https://www.youtube.com/channel/UCkHecfDTcSazNZSKPEhtPVQ)|![](doc/youtube_icon.png) [DeepFakes in movie](https://www.youtube.com/c/DeepFakesinmovie/videos)|
-|---|---|
+- 64-bit Windows and the Microsoft Visual C++ 2015–2022 x64 runtime.
+- `ffmpeg` and `ffprobe` available through `PATH`; they are not bundled. `PATH` order selects the executables used.
+- A compatible NVIDIA driver and GPU only for `cuda-*` variants.
+- Host Python/build tooling only when constructing runtimes, not for normal application launch.
 
-|![](doc/youtube_icon.png) [DeepFakeCreator](https://www.youtube.com/channel/UCkNFhcYNLQ5hr6A6lZ56mKA)|![](doc/youtube_icon.png) [Jarkan](https://www.youtube.com/user/Jarkancio/videos)|
-|---|---|
+Historical avecl/OpenCL setup is not a prerequisite of the current production runtime contract.
 
-</td></tr>
+## Workspace and external resources
 
-<tr><td colspan=2 align="center">
+The workspace is user-managed data. Launchers commonly use:
 
-# What can I do using DeepFaceLab?
+```text
+workspace\data_src
+workspace\data_dst
+workspace\model
+```
 
-</td></tr>
-<tr><td colspan=2 align="center">
+Runtime construction does not package faces, source or destination media, checkpoints, previews, training history, or other workspace content. Individual workflows may create output or model directories when invoked.
 
-## Replace the face
+Some features require resources that are deliberately not bundled:
 
-<img src="doc/replace_the_face.jpg" align="center">
+- Automated Generic-XSeg mask application requires a compatible user-supplied model directory.
+- SAEHD and XSeg pretraining, when enabled, require a user-supplied pretraining dataset.
 
-</td></tr>
+Manual XSeg mask editing is different: it needs aligned user face data and a GUI runtime, but it does not need Generic-XSeg weights or a pretraining dataset.
 
-<tr><td colspan=2 align="center">
+## Workflow availability
 
-## De-age the face
+The current packaged surface covers the primary extraction, sorting, faceset, XSeg, SAEHD/AMP training, merge, export, and result-video workflows. Some historical package workflows have different availability:
 
-</td></tr>
+- Quick96 training and merging are not included in the current packaged baseline.
+- The historical FaceEnhancer workflow is not currently available in the packaged Torch baseline.
+- XSeg training with pretraining mode requires explicitly supplied external pretraining data.
+- Third-party and convenience applications such as EbSynth and bundled viewers are not included.
 
-<tr><td align="center" width="50%">
-
-<img src="doc/deage_0_1.jpg" align="center">
-
-</td>
-<td align="center" width="50%">
-
-<img src="doc/deage_0_2.jpg" align="center">
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=Ddx5B-84ebo
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-## Replace the head
-
-</td></tr>
-
-<tr><td align="center" width="50%">
-
-<img src="doc/head_replace_1_1.jpg" align="center">
-
-</td>
-<td align="center" width="50%">
-
-<img src="doc/head_replace_1_2.jpg" align="center">
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-![](doc/youtube_icon.png) https://www.youtube.com/watch?v=RTjgkhMugVw
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-# Native resolution progress
-
-</td></tr>
-<tr><td colspan=2 align="center">
-
-<img src="doc/deepfake_progress.png" align="center">
-
-</td></tr>
-<tr><td colspan=2 align="center">
-
-<img src="doc/make_everything_ok.png" align="center">
-
-Unfortunately, there is no "make everything ok" button in DeepFaceLab. You should spend time studying the workflow and growing your skills. A skill in programs such as *AfterEffects* or *Davinci Resolve* is also desirable.
-
-</td></tr>
-<tr><td colspan=2 align="center">
-
-## Mini tutorial
-
-<a href="https://www.youtube.com/watch?v=kOIMXt8KK8M">
-
-<img src="doc/mini_tutorial.jpg" align="center">
-
-</a>
-
-</td></tr>
-<tr><td colspan=2 align="center">
-
-## Releases
-
-</td></tr>
-
-<tr><td align="right">
-<a href="https://tinyurl.com/2p9cvt25">Windows (magnet link)</a>
-</td><td align="center">Last release. Use torrent client to download.</td></tr>
-
-<tr><td align="right">
-<a href="https://mega.nz/folder/Po0nGQrA#dbbttiNWojCt8jzD4xYaPw">Windows (Mega.nz)</a>
-</td><td align="center">Contains new and prev releases.</td></tr>
-
-<tr><td align="right">
-<a href="https://disk.yandex.ru/d/7i5XTKIKVg5UUg">Windows (yandex.ru)</a>
-</td><td align="center">Contains new and prev releases.</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/nagadit/DeepFaceLab_Linux">Linux (github)</a>
-</td><td align="center">by @nagadit</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/elemantalcode/dfl">CentOS Linux (github)</a>
-</td><td align="center">May be outdated. By @elemantalcode</td></tr>
-
-</table>
-
-<table align="center" border="0">
-
-<tr><td colspan=2 align="center">
-
-### Communication groups
-
-</td></tr>
-
-<tr><td align="right">
-<a href="https://discord.gg/rxa7h9M6rH">Discord</a>
-</td><td align="center">Official discord channel. English / Russian.</td></tr>
-
-<tr><td colspan=2 align="center">
-
-## Related works
-
-</td></tr>
-
-<tr><td align="right">
-<a href="https://github.com/iperov/DeepFaceLive">DeepFaceLive</a>
-</td><td align="center">Real-time face swap for PC streaming or video calls</td></tr>
-
-</td></tr>
-</table>
-
-<table align="center" border="0">
-
-<tr><td colspan=2 align="center">
-
-## How I can help the project?
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-### Star this repo
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-Register github account and push "Star" button.
-
-</td></tr>
-
-</table>
-
-<table align="center" border="0">
-<tr><td colspan=2 align="center">
-
-## Meme zone
-
-</td></tr>
-
-<tr><td align="center" width="50%">
-
-<img src="doc/meme1.jpg" align="center">
-
-</td>
-
-<td align="center" width="50%">
-
-<img src="doc/meme2.jpg" align="center">
-
-</td></tr>
-
-<tr><td colspan=2 align="center">
-
-<sub>#deepfacelab #faceswap #face-swap #deep-learning #deeplearning #deep-neural-networks #deepface #deep-face-swap #neural-networks #neural-nets #tensorflow #cuda #nvidia</sub>
-
-</td></tr>
-
-
-
-</table>
+See [DISTRIBUTION.md](DISTRIBUTION.md#workflow-availability) for the detailed current workflow boundary.
