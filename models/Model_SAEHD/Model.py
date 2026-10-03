@@ -360,19 +360,19 @@ Examples: df, liae, df-d, df-ud, liae-ud, ...
             # (official L185) can never trigger on the override path
             self.options['pretrain'] = io.input_bool ("Enable pretraining mode", default_pretrain, help_message="Pretrain the model with large amount of various faces. After that, model can be used to train the fakes more quickly. Forces random_warp=N, random_flips=Y, gan_power=0.0, lr_dropout=N, styles=0.0, uniform_yaw=Y")
 
-        # official Model_tf.py L180-185, verbatim semantics: the pretrain
-        # data-path guard and the two detection flags, both assigned as
-        # UNCONDITIONAL booleans (the official code never leaves
+        # official Model_tf.py L180-185 semantics: the two detection flags
+        # remain UNCONDITIONAL booleans (the official code never leaves
         # pretrain_just_disabled unset — on_initialize references both
-        # flags on every resume path):
+        # flags on every resume path). Phase 13 extends the official
+        # None-only data-path guard with typed external-resource validation:
         #   gan_model_changed — D_src archi (patch size / dims) differs
         #     from the stored defaults -> the official 637-657 loop
         #     re-initializes D_src;
         #   pretrain_just_disabled — pretrain was on in the stored
         #     defaults and is now off -> the official re-init rule for
         #     the inter components + set_iter(0).
-        if self.options['pretrain'] and self.get_pretraining_data_path() is None:
-            raise Exception("pretraining_data_path is not defined")
+        if self.options['pretrain']:
+            self.validate_pretraining_data()
 
         self.gan_model_changed = (default_gan_patch_size != self.options['gan_patch_size']) or (default_gan_dims != self.options['gan_dims'])
 

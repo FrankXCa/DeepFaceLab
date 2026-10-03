@@ -136,6 +136,7 @@ if __name__ == "__main__":
     p.set_defaults (func=process_util)
 
     def process_train(arguments):
+        global exit_code
         osex.set_process_lowest_prio()
 
 
@@ -154,12 +155,12 @@ if __name__ == "__main__":
                   'debug'                    : arguments.debug,
                   }
         from mainscripts import Trainer
-        Trainer.main(**kwargs)
+        exit_code = Trainer.main(**kwargs)
 
     p = subparsers.add_parser( "train", help="Trainer")
     p.add_argument('--training-data-src-dir', required=True, action=fixPathAction, dest="training_data_src_dir", help="Dir of extracted SRC faceset.")
     p.add_argument('--training-data-dst-dir', required=True, action=fixPathAction, dest="training_data_dst_dir", help="Dir of extracted DST faceset.")
-    p.add_argument('--pretraining-data-dir', action=fixPathAction, dest="pretraining_data_dir", default=None, help="Optional dir of extracted faceset that will be used in pretraining mode.")
+    p.add_argument('--pretraining-data-dir', action=fixPathAction, dest="pretraining_data_dir", default=None, help="External user-supplied DFL faceset directory used when an applicable model's pretraining mode is enabled. Accepts top-level lowercase .jpg DFL faces or faceset.pak; every sample requires usable 68x2 face landmarks. No data is bundled or downloaded.")
     p.add_argument('--pretrained-model-dir', action=fixPathAction, dest="pretrained_model_dir", default=None, help="Optional dir of pretrain model files. (Currently only for Quick96).")
     p.add_argument('--model-dir', required=True, action=fixPathAction, dest="model_dir", help="Saved models dir.")
     p.add_argument('--model', required=True, dest="model_name", choices=pathex.get_all_dir_names_startswith ( Path(__file__).parent / 'models' , 'Model_'), help="Model class name.")

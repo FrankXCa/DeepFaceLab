@@ -10,8 +10,9 @@ Official behavior preserved:
   flow verbatim — the official "Restart training?" prompt on resume
   override, the official ``face_type`` prompt on first run, the
   official ``ask_batch_size(4, range=[2,16])`` + "Enable pretraining
-  mode" prompts, the official pretraining_data_path guard (skipped for
-  export), and the official ``pretrain_just_disabled`` detection
+  mode" prompts, the pretraining-data guard (extended in Phase 13 with
+  typed external-resource validation and still skipped for export), and
+  the official ``pretrain_just_disabled`` detection
   (stored pretrain True -> now False);
 - ``on_initialize``: the official structural portion — the official
   data-format rule (NCHW when exporting or on GPU, NHWC otherwise;
@@ -170,8 +171,8 @@ class XSegModel(ModelBase):
             self.ask_batch_size(4, range=[2,16])
             self.options['pretrain'] = io.input_bool ("Enable pretraining mode", default_pretrain)
 
-        if not self.is_exporting and (self.options['pretrain'] and self.get_pretraining_data_path() is None):
-            raise Exception("pretraining_data_path is not defined")
+        if not self.is_exporting and self.options['pretrain']:
+            self.validate_pretraining_data()
 
         self.pretrain_just_disabled = (default_pretrain == True and self.options['pretrain'] == False)
 

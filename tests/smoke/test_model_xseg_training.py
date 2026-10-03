@@ -5,6 +5,7 @@ import gc
 import importlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 import core.leras.models  # noqa: E402,F401
 from core.interact import interact as io  # noqa: E402
 from core.leras import nn  # noqa: E402
-from samplelib import SampleGeneratorBase  # noqa: E402
+from samplelib import SampleGeneratorBase, SampleLoader  # noqa: E402
 
 xseg_module = importlib.import_module("models.Model_XSeg.Model")
 XSegModel = xseg_module.XSegModel
@@ -154,10 +155,18 @@ def expected_loss(model, image, target):
 
 
 def test_xseg_model_cpu_lifecycle_transition_and_preview(
-        plain_tmp, dummy_generators):
+        plain_tmp, dummy_generators, monkeypatch):
     root = Path(plain_tmp) / "xseg_training"
     root.mkdir()
     pretrain_path = root / "pretrain"
+    pretrain_path.mkdir()
+    (pretrain_path / "synthetic.jpg").write_bytes(b"candidate")
+    loaded_sample = SimpleNamespace(
+        landmarks=np.zeros((68, 2), dtype=np.float32)
+    )
+    monkeypatch.setattr(
+        SampleLoader, "load", lambda *_args, **_kwargs: [loaded_sample]
+    )
     HeadlessXSeg.seed_pretrain = True
     model = build(HeadlessXSeg, root, pretrain_path)
     assert model.model_data_format == "NHWC" and model.pretrain

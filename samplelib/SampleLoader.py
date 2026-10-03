@@ -1,6 +1,7 @@
 import multiprocessing
 import operator
 import pickle
+import struct
 import traceback
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from DFLIMG import *
 from facelib import FaceType, LandmarksProcessor
 
 from .Sample import Sample, SampleType
+
+
+class PackedFacesetDataError(ValueError):
+    """A packed faceset exists but its file data cannot be decoded."""
 
 
 class SampleLoader:
@@ -33,9 +38,13 @@ class SampleLoader:
         return len(list(persons_name_idxs.keys()))
 
     @staticmethod
-    def load(sample_type, samples_path, subdirs=False):
+    def load(sample_type, samples_path, subdirs=False, raise_on_error=False):
         """
-        Return MPSharedList of samples
+        Return MPSharedList of samples.
+
+        ``raise_on_error`` is an opt-in strict boundary for callers that must
+        distinguish invalid packed data from loader/programming failures.
+        The default retains the historical log-and-unpacked-fallback behavior.
         """
         samples_cache = SampleLoader.samples_cache
 
@@ -58,7 +67,17 @@ class SampleLoader:
                 result = None
                 try:
                     result = samplelib.PackedFaceset.load(samples_path)
+                except (OSError, EOFError, pickle.UnpicklingError,
+                        struct.error, NotImplementedError) as exc:
+                    if raise_on_error:
+                        raise PackedFacesetDataError(
+                            f"Unable to read packed faceset: "
+                            f"{Path(samples_path) / 'faceset.pak'}"
+                        ) from exc
+                    io.log_err(f"Error occured while loading samplelib.PackedFaceset.load {str(samples_path)}, {traceback.format_exc()}")
                 except:
+                    if raise_on_error:
+                        raise
                     io.log_err(f"Error occured while loading samplelib.PackedFaceset.load {str(samples_path)}, {traceback.format_exc()}")
 
                 if result is not None:

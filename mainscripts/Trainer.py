@@ -28,6 +28,7 @@ def trainerThread (s2c, c2s, e,
                     execute_programs = None,
                     debug=False,
                     **kwargs):
+    exit_code = 0
     while True:
         try:
             start_time = time.time()
@@ -204,11 +205,16 @@ def trainerThread (s2c, c2s, e,
 
             model.finalize()
 
-        except Exception as e:
-            print ('Error: %s' % (str(e)))
+        except models.PretrainingDataError as exc:
+            exit_code = 1
+            io.log_err('Pretraining data error: %s' % (str(exc)))
+        except Exception as exc:
+            exit_code = 1
+            print ('Error: %s' % (str(exc)))
             traceback.print_exc()
         break
-    c2s.put ( {'op':'close'} )
+    e.set()
+    c2s.put ( {'op':'close', 'exit_code':exit_code} )
 
 
 
@@ -225,6 +231,7 @@ def main(**kwargs):
     thread.start()
 
     e.wait() #Wait for inital load to occur.
+    exit_code = 0
 
     if no_preview:
         while True:
@@ -232,6 +239,7 @@ def main(**kwargs):
                 input = c2s.get()
                 op = input.get('op','')
                 if op == 'close':
+                    exit_code = input.get('exit_code', 0)
                     break
             try:
                 io.process_messages(0.1)
@@ -282,6 +290,7 @@ def main(**kwargs):
                         selected_preview = selected_preview % len(previews)
                         update_preview = True
                 elif op == 'close':
+                    exit_code = input.get('exit_code', 0)
                     break
 
             if update_preview:
@@ -358,3 +367,6 @@ def main(**kwargs):
                 s2c.put ( {'op': 'close'} )
 
         io.destroy_all_windows()
+
+    thread.join()
+    return exit_code

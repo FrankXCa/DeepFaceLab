@@ -60,11 +60,16 @@ from core import imagelib, pathex
 from core.cv2ex import *
 from core.interact import interact as io
 from core.leras import nn
-from samplelib import SampleGeneratorBase
+from samplelib import SampleGeneratorBase, SampleLoader, SampleType
+from samplelib.SampleLoader import PackedFacesetDataError
 
 
 class SkippedGeneratorStep(RuntimeError):
     """GradScaler rejected one generator update; retry with its new scale."""
+
+
+class PretrainingDataError(ValueError):
+    """The enabled pretraining mode has no usable user-supplied faceset."""
 
 
 class ModelBase(object):
@@ -432,6 +437,102 @@ class ModelBase(object):
 
     def get_pretraining_data_path(self):
         return self.pretraining_data_path
+
+    def validate_pretraining_data(self):
+        """Validate and load the external faceset selected for pretraining.
+
+        This deliberately reuses ``SampleLoader`` for semantic validation.
+        The small checks before it only distinguish structural failures that
+        can be reported truthfully without duplicating the DFLIMG/packed-
+        faceset parser.  ``SampleLoader`` caches the result, so the model's
+        later ``SampleGeneratorFace`` construction does not load it twice.
+        """
+        samples_path = self.get_pretraining_data_path()
+        supply_hint = (
+            'Supply a compatible external faceset with '
+            '--pretraining-data-dir "<PRETRAIN_DATA_DIR>".'
+        )
+
+        if samples_path is None:
+            raise PretrainingDataError(
+                f"Pretraining mode is enabled, but no pretraining data "
+                f"directory was supplied. {supply_hint}"
+            )
+
+        samples_path = Path(samples_path)
+        if not samples_path.exists():
+            raise PretrainingDataError(
+                f"Pretraining data directory does not exist: "
+                f"{samples_path}. {supply_hint}"
+            )
+        if not samples_path.is_dir():
+            raise PretrainingDataError(
+                f"Pretraining data path is not a directory: "
+                f"{samples_path}. {supply_hint}"
+            )
+
+        packed_path = samples_path / 'faceset.pak'
+        # ``SampleLoader`` currently recognizes unpacked DFL metadata only
+        # through DFLIMG's lowercase .jpg branch.  Other ordinary image
+        # extensions accepted elsewhere in the application are not face
+        # samples here; keep the preflight aligned with that loader truth.
+        image_paths = [
+            path for path in pathex.get_image_paths(samples_path)
+            if Path(path).suffix == '.jpg'
+        ]
+        if not packed_path.is_file() and not image_paths:
+            raise PretrainingDataError(
+                f"Pretraining data directory contains no candidate face "
+                f"samples: {samples_path}. Expected a top-level faceset.pak "
+                f"or top-level lowercase .jpg DFL face images; subdirectories are "
+                f"not scanned. {supply_hint}"
+            )
+
+        try:
+            samples = SampleLoader.load(
+                SampleType.FACE, samples_path, raise_on_error=True
+            )
+        except PackedFacesetDataError as exc:
+            raise PretrainingDataError(
+                f"Pretraining data contains an unreadable or malformed "
+                f"faceset.pak: {packed_path}. {supply_hint}"
+            ) from exc
+
+        if len(samples) == 0:
+            raise PretrainingDataError(
+                f"Pretraining data directory contains no valid DFL face "
+                f"samples: {samples_path}. Check that the images or "
+                f"faceset.pak contain DeepFaceLab face metadata. "
+                f"{supply_hint}"
+            )
+
+        invalid_landmark_samples = []
+        for index, sample in enumerate(samples):
+            landmarks = sample.landmarks
+            usable = (
+                isinstance(landmarks, np.ndarray)
+                and landmarks.shape == (68, 2)
+                and np.issubdtype(landmarks.dtype, np.number)
+                and np.isfinite(landmarks).all()
+            )
+            if not usable:
+                invalid_landmark_samples.append(index)
+
+        if invalid_landmark_samples:
+            first_index = invalid_landmark_samples[0]
+            raise PretrainingDataError(
+                f"Pretraining data contains {len(invalid_landmark_samples)} "
+                f"sample(s) without usable 68x2 face landmarks "
+                f"(first sample index: {first_index}): {samples_path}. "
+                f"Landmarks are required by the training sample processor. "
+                f"{supply_hint}"
+            )
+
+        io.log_info(
+            f"Pretraining data: loaded {len(samples)} valid face samples "
+            f"from user-supplied directory: {samples_path}"
+        )
+        return samples
 
     def get_target_iter(self):
         return self.target_iter

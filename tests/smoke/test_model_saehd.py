@@ -451,7 +451,7 @@ def test_pretrain_structural_overrides_cpu(plain_tmp, headless_io):
 def test_pretrain_requires_pretraining_path_cpu(plain_tmp, headless_io):
     root = Path(plain_tmp) / "m"
     opts = {"archi": "liae-ud", "pretrain": True}
-    with pytest.raises(Exception, match="pretraining_data_path"):
+    with pytest.raises(Exception, match="--pretraining-data-dir"):
         construct_real(root, options=opts, is_training=False, cpu_only=True)
 
 
