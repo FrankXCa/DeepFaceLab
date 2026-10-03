@@ -234,16 +234,18 @@ def test_full_ledger_covers_fifty_six_references():
     assert len(_excluded_entries()) == 12
     assert len(_curated_entries()) + len(_excluded_entries()) == 56
 
-    counts = {"REPRODUCE_BEHAVIOR": len(_curated_entries())}
-    for disposition in ALLOWED_DISPOSITIONS - {"REPRODUCE_BEHAVIOR"}:
-        counts[disposition] = sum(
-            x["disposition"] == disposition for x in _excluded_entries()
+    counts = {
+        disposition: (
+            (len(_curated_entries()) if disposition == "REPRODUCE_BEHAVIOR" else 0)
+            + sum(x["disposition"] == disposition for x in _excluded_entries())
         )
+        for disposition in ALLOWED_DISPOSITIONS
+    }
     assert counts == {
-        "REPRODUCE_BEHAVIOR": 44,
+        "REPRODUCE_BEHAVIOR": 46,
         "REPLACE": 1,
         "DROP": 1,
-        "RESOURCE_GATED": 3,
+        "RESOURCE_GATED": 1,
         "PHASE14_PENDING": 3,
         "POST_BASELINE": 4,
     }
@@ -291,6 +293,34 @@ def test_no_launcher_created_for_excluded_dispositions():
         "videoed", "sort", "util", "facesettool", "extract", "xseg",
         "train", "exportdfm", "merge",
     }
+
+
+def test_xseg_editor_references_are_reproduced_by_generic_cli():
+    expected = {
+        "5.XSeg) data_src mask - edit.bat": "workspace\\data_src\\aligned",
+        "5.XSeg) data_dst mask - edit.bat": "workspace\\data_dst\\aligned",
+    }
+    rows = {
+        row["reference_launcher"]: row
+        for row in _excluded_entries()
+        if row["reference_launcher"] in expected
+    }
+    assert set(rows) == set(expected)
+    for reference, input_dir in expected.items():
+        row = rows[reference]
+        assert row["disposition"] == "REPRODUCE_BEHAVIOR"
+        assert f"dfl.bat xseg editor --input-dir {input_dir}" in row["reason"]
+
+    # These historical fixed-path wrappers are reproduced by the generic
+    # packaged CLI, not by adding duplicate curated launchers.
+    assert all("editor" not in name for name in _curated_names())
+
+    main_text = MAIN_PY.read_text(encoding="utf-8")
+    assert 'xseg_parser.add_parser( "editor", help="XSeg editor.")' in main_text
+    editor_block = main_text.split('xseg_parser.add_parser( "editor"', 1)[1]
+    editor_block = editor_block.split('xseg_parser.add_parser( "apply"', 1)[0]
+    assert "--input-dir" in editor_block
+    assert "XSegEditor.start" in editor_block
 
 
 def test_faceenhancer_is_phase14_pending_and_not_exposed():
