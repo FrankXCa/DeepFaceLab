@@ -38,6 +38,15 @@ if __name__ == "__main__":
         def __call__(self, parser, namespace, values, option_string=None):
             setattr(namespace, self.dest, os.path.abspath(os.path.expanduser(values)))
 
+    def parse_merge_gpu_idxs(value):
+        try:
+            return [int(idx) for idx in value.split(',')]
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated integer GPU indexes "
+                "(for example: 0 or 0,1)"
+            ) from exc
+
     exit_code = 0
     
     parser = argparse.ArgumentParser()
@@ -206,7 +215,7 @@ if __name__ == "__main__":
     p.add_argument('--model', required=True, dest="model_name", choices=pathex.get_all_dir_names_startswith ( Path(__file__).parent / 'models' , 'Model_'), help="Model class name.")
     p.add_argument('--force-model-name', dest="force_model_name", default=None, help="Forcing to choose model name from model/ folder.")
     p.add_argument('--cpu-only', action="store_true", dest="cpu_only", default=False, help="Merge on CPU.")
-    p.add_argument('--force-gpu-idxs', dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
+    p.add_argument('--force-gpu-idxs', type=parse_merge_gpu_idxs, dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
     p.set_defaults(func=process_merge)
 
     videoed_parser = subparsers.add_parser( "videoed", help="Video processing.").add_subparsers()
