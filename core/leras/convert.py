@@ -97,8 +97,8 @@ Phase 4 coverage (parity labels, see docs/COMPATIBILITY.md):
   and discriminators (CodeDiscriminator, PatchDiscriminator,
   UNetPatchDiscriminator) as named Saveables, and the Phase 3E2
   optimizers (AdaBelief, RMSprop — iters + ms_/vs_/acc_ states,
-  value-exact including the official int32 -> torch int64 iteration
-  counter widening);
+  value-exact including deliberate legacy int32 -> official/torch int64
+  iteration-counter widening);
 - EXACT format contract on real official artifacts (facelib/*.npy
   pickled-dict files tracked in the baseline): parsing, key
   conventions, layouts, dtypes (incl. float16 FaceEnhancer);
@@ -150,9 +150,9 @@ ERR_INVALID_LAYOUT = "INVALID_LAYOUT"
 
 _WEIGHT_STATE_PREFIXES = ("ms_", "vs_", "acc_")
 
-# Declared exact integer widening for the iteration counter: official
-# TF stored ``iters`` as int32, the torch implementation keeps it as
-# int64 (torch.long) — value-exact, reported, not a silent cast
+# Declared exact legacy widening for the iteration counter. The reviewed
+# official RMSprop variable is int64; accepted older int32 inputs widen to
+# int64 (torch.long) value-exactly, with an explicit conversion report.
 _ITERS_INT_WIDENING = {np.dtype(np.int32): torch.int64}
 
 
@@ -1048,9 +1048,9 @@ def convert_optimizer_state_torch_to_official(optimizer, component=None):
     """Convert the torch ``optimizer`` state to an official-format dict
     (``iters:0`` + the official ``ms_*``/``vs_*``/``acc_*`` sub-names —
     exact on the torch side via ``_iter_official_weights``). The
-    iteration counter is stored as int64 (torch.long); the official TF
-    implementation used int32 — the value is exact and the official
-    loader casts to its variable dtype on load.
+    iteration counter is stored as int64 (torch.long), matching the reviewed
+    official TensorFlow RMSprop variable. Deliberately accepted legacy int32
+    inputs are widened only on import; newly exported state remains int64.
 
     State LAYOUT (OptimizerBase module docstring): the on-disk dict
     is official-layout, so each state tensor is converted through the

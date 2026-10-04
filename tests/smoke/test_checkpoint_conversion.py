@@ -63,7 +63,7 @@ NOT copied)):
   official name; the initialize_variables order only names positional
   parameters — never the sole identity): AdaBelief and RMSprop,
   value-exact resume equivalence (iters + all states ``torch.equal``
-  after a fresh optimizer), the declared official int32 -> torch
+  after a fresh optimizer), the declared legacy int32 -> official/torch
   int64 iteration-counter widening, and the strict failures (missing
   iters, missing one state, extra state, unrecognized prefix, state
   referencing a variable outside the given saveable);
@@ -878,9 +878,9 @@ def test_optimizer_state_official_layout_rule():
     assert all(m.rule == "identity" for m in rep3.mapped)
 
 
-def test_iters_int32_official_widening():
-    # official TF stored iters as int32; the torch counter is int64 —
-    # declared exact widening, reported (not a silent cast)
+def test_iters_legacy_int32_widening():
+    # The reviewed official TF counter is int64. Deliberately accepted older
+    # int32 input widens exactly and is reported (never a silent cast).
     init_cpu()
     _, ps = _bound_conv()
     opt = dfl_nn.AdaBelief(name="opt", lr=0.01)
