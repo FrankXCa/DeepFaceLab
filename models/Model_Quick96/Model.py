@@ -1,8 +1,7 @@
-"""Torch-native Quick96 training and persistence.
+"""Torch-native Quick96 training, persistence, and merge inference.
 
-The architecture, loss stack, batching, optimizer, and sample-reuse behavior
-are the official Quick96 contract. Merge remains a separate Phase-14 feature
-and is deliberately not implemented here.
+The architecture, loss stack, batching, optimizer, sample-reuse behavior, and
+merge output ordering are the official Quick96 contract.
 
 Low-VRAM training keeps the checkpoint-owning modules and RMSprop state on
 CPU and builds disposable compute mirrors on every selected GPU. Sufficient-
@@ -12,6 +11,7 @@ those gradients are averaged once, and one canonical optimizer step is made.
 """
 
 import multiprocessing
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -28,17 +28,66 @@ class QModel(ModelBase):
     _SUFFICIENT_VRAM_GB = 4
 
     @staticmethod
+    def _validate_merge_model_data(path):
+        """Require the minimum metadata written by ``ModelBase.save``.
+
+        ``loss_history``, ``sample_for_preview``, and
+        ``choosed_gpu_indexes`` are deliberately optional because the shared
+        loader already treats them as historical fields with defaults.  The
+        stable saved-model identity fields are ``iter`` and ``options``.
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                "Quick96 merge requires an existing saved model data.dat")
+        try:
+            model_data = pickle.loads(path.read_bytes())
+        except Exception as exc:
+            raise ValueError(
+                f"Quick96 merge requires readable saved-model metadata: "
+                f"{path}") from exc
+
+        if not isinstance(model_data, dict):
+            raise ValueError(
+                "Quick96 merge data.dat must contain a metadata dictionary")
+
+        missing = [name for name in ("iter", "options")
+                   if name not in model_data]
+        if missing:
+            raise ValueError(
+                "Quick96 merge data.dat is missing required field(s): "
+                + ", ".join(missing))
+
+        iteration = model_data["iter"]
+        if type(iteration) is not int or iteration < 0:
+            raise ValueError(
+                "Quick96 merge data.dat field 'iter' must be a "
+                "non-negative integer")
+
+        options = model_data["options"]
+        if (not isinstance(options, dict)
+                or any(not isinstance(name, str) for name in options)):
+            raise ValueError(
+                "Quick96 merge data.dat field 'options' must be a "
+                "dictionary with string keys")
+
+    def get_strpath_storage_for_file(self, filename):
+        path = super().get_strpath_storage_for_file(filename)
+        if filename == "data.dat" and not self.is_training:
+            # ModelBase resolves this virtual path immediately before it
+            # unpickles data.dat.  Validate here so even a non-mapping pickle
+            # fails with the Quick96-local merge error rather than reaching
+            # the generic loader's mapping operations.
+            self._validate_merge_model_data(path)
+        return path
+
+    @staticmethod
     def _official_batch_layout(selected_device_count):
         tower_count = max(1, selected_device_count)
         per_tower = max(1, 4 // tower_count)
         return tower_count, per_tower, tower_count * per_tower
 
     def on_initialize(self):
-        if not self.is_training:
-            raise NotImplementedError(
-                "Quick96 merge is a separate Phase-14 feature and is not "
-                "implemented by the training/persistence feature")
-
         device_config = nn.getCurrentDeviceConfig()
         devices = device_config.devices
         self.model_data_format = (
@@ -61,8 +110,10 @@ class QModel(ModelBase):
             devices and self.is_training
             and all(dev.total_mem_gb >= self._SUFFICIENT_VRAM_GB
                     for dev in devices))
-        self.low_vram_split = bool(devices and not self.models_opt_on_gpu)
-        canonical_device = (nn.device if self.models_opt_on_gpu
+        self.low_vram_split = bool(
+            self.is_training and devices and not self.models_opt_on_gpu)
+        canonical_device = (nn.device if (self.models_opt_on_gpu
+                                          or not self.is_training)
                             else torch.device("cpu"))
 
         input_ch = 3
@@ -99,62 +150,75 @@ class QModel(ModelBase):
             [self.decoder_dst, "decoder_dst.npy"],
         ]
 
-        self.src_dst_trainable_weights = (
-            self.encoder.get_weights() + self.inter.get_weights()
-            + self.decoder_src.get_weights() + self.decoder_dst.get_weights())
+        if self.is_training:
+            self.src_dst_trainable_weights = (
+                self.encoder.get_weights() + self.inter.get_weights()
+                + self.decoder_src.get_weights()
+                + self.decoder_dst.get_weights())
 
-        self._bind_official_optimizer_names(self._quick96_components)
-        self.src_dst_opt = nn.RMSprop(
-            lr=2e-4, rho=0.9, lr_dropout=0.3, name="src_dst_opt")
-        self.src_dst_opt.initialize_variables(
-            self.src_dst_trainable_weights,
-            vars_on_cpu=not self.models_opt_on_gpu)
-        if not self.models_opt_on_gpu:
-            # OptimizerBase normally follows the global primary device for the
-            # scalar counter. Quick96's low-VRAM contract instead keeps ALL
-            # canonical optimizer state, including iters, on CPU.
-            self.src_dst_opt.iterations.data = (
-                self.src_dst_opt.iterations.data.to(canonical_device))
-        self.model_filename_list += [(self.src_dst_opt, "src_dst_opt.npy")]
+            self._bind_official_optimizer_names(self._quick96_components)
+            self.src_dst_opt = nn.RMSprop(
+                lr=2e-4, rho=0.9, lr_dropout=0.3, name="src_dst_opt")
+            self.src_dst_opt.initialize_variables(
+                self.src_dst_trainable_weights,
+                vars_on_cpu=not self.models_opt_on_gpu)
+            if not self.models_opt_on_gpu:
+                # OptimizerBase normally follows the global primary device for
+                # the scalar counter. Quick96's low-VRAM contract instead
+                # keeps ALL canonical optimizer state, including iters, on CPU.
+                self.src_dst_opt.iterations.data = (
+                    self.src_dst_opt.iterations.data.to(canonical_device))
+            self.model_filename_list += [
+                (self.src_dst_opt, "src_dst_opt.npy")]
 
-        gpu_count, self._quick96_bs_per_tower, official_batch_size = (
-            self._official_batch_layout(len(devices)))
-        self.set_batch_size(official_batch_size)
+            gpu_count, self._quick96_bs_per_tower, official_batch_size = (
+                self._official_batch_layout(len(devices)))
+            self.set_batch_size(official_batch_size)
 
-        # Strict persistence has two intentionally distinct modes:
-        # data.dat present => a genuine saved-model resume requiring every
-        # component and optimizer file; no data.dat => a fresh initialization,
-        # optionally seeded by the historical partial pretrained package.
-        self._quick96_saved_model_resume = self.model_data_path.exists()
-        self.pretrained_components_loaded = []
-        self._load_or_initialize_state()
+            # Feature-A persistence: data.dat means a strict full resume;
+            # otherwise initialize, optionally from the historical package.
+            self._quick96_saved_model_resume = self.model_data_path.exists()
+            self.pretrained_components_loaded = []
+            self._load_or_initialize_state()
 
-        # Build tower topology only after canonical load/init. In low-VRAM
-        # mode replica 0 is the CPU canonical state and is intentionally not a
-        # compute tower; replicas 1..N are the selected GPU compute towers.
-        selected_plan = nn.ReplicaPlan.from_device_config(device_config)
-        if self.low_vram_split:
-            self.replica_plan = nn.ReplicaPlan.from_torch_devices(
-                torch.device("cpu"),
-                [torch.device("cpu"), *selected_plan.replica_devices])
-            self._quick96_tower_offset = 1
+            # Build tower topology only after canonical load/init. In low-VRAM
+            # mode replica 0 is CPU state, not a compute tower.
+            selected_plan = nn.ReplicaPlan.from_device_config(device_config)
+            if self.low_vram_split:
+                self.replica_plan = nn.ReplicaPlan.from_torch_devices(
+                    torch.device("cpu"),
+                    [torch.device("cpu"), *selected_plan.replica_devices])
+                self._quick96_tower_offset = 1
+            else:
+                self.replica_plan = selected_plan
+                self._quick96_tower_offset = 0
+
+            self.tower_devices = tuple(
+                self.replica_plan.replica_devices[
+                    self._quick96_tower_offset:
+                    self._quick96_tower_offset + gpu_count])
+
+            if self.replica_plan.num_replicas > 1:
+                for component in self._quick96_components:
+                    self.replica_plan.add_component(component)
+                self.replica_plan.initial_sync()
+
+            self._install_eager_paths(masked_training)
+            self._initialize_sample_generators()
+            self.last_samples = None
         else:
-            self.replica_plan = selected_plan
-            self._quick96_tower_offset = 0
-
-        self.tower_devices = tuple(
-            self.replica_plan.replica_devices[
-                self._quick96_tower_offset:
-                self._quick96_tower_offset + gpu_count])
-
-        if self.replica_plan.num_replicas > 1:
+            # Merge is only valid for a genuine saved model. The four model
+            # components are required strictly; optimizer/training state is
+            # deliberately neither constructed nor loaded.
+            if not self.model_data_path.exists():
+                raise FileNotFoundError(
+                    "Quick96 merge requires an existing saved model data.dat")
+            self._quick96_saved_model_resume = True
+            self.pretrained_components_loaded = []
+            self._load_or_initialize_state()
             for component in self._quick96_components:
-                self.replica_plan.add_component(component)
-            self.replica_plan.initial_sync()
-
-        self._install_eager_paths(masked_training)
-        self._initialize_sample_generators()
-        self.last_samples = None
+                component.eval()
+            self._install_merge_path()
 
     @staticmethod
     def _bind_official_optimizer_names(components):
@@ -417,6 +481,26 @@ class QModel(ModelBase):
 
         self.AE_view = AE_view
 
+    def _install_merge_path(self):
+        """Install the official non-training eager inference boundary."""
+        device = nn.device
+
+        def AE_merge(warped_dst):
+            warped_dst = self._to_tensor_device(warped_dst, device)
+            with torch.inference_mode():
+                dst_code = self.inter(self.encoder(warped_dst))
+                pred_src_dst, pred_src_dstm = self.decoder_src(dst_code)
+                _, pred_dst_dstm = self.decoder_dst(dst_code)
+                # Official internal order. predictor_func deliberately
+                # reorders the two masks for the external merger consumer.
+                return [
+                    value.detach().cpu().numpy()
+                    for value in (
+                        pred_src_dst, pred_dst_dstm, pred_src_dstm)
+                ]
+
+        self.AE_merge = AE_merge
+
     def _initialize_sample_generators(self):
         cpu_count = min(multiprocessing.cpu_count(), 8)
         src_generators_count = cpu_count // 2
@@ -521,12 +605,24 @@ class QModel(ModelBase):
         ]
 
     def predictor_func(self, face=None):
-        raise NotImplementedError(
-            "Quick96 predictor/merge is outside the training feature")
+        face = nn.to_data_format(
+            np.asarray(face, dtype=np.float32)[None, ...],
+            self.model_data_format, "NHWC")
+        bgr, mask_dst_dstm, mask_src_dstm = [
+            nn.to_data_format(
+                value, "NHWC", self.model_data_format).astype(
+                    np.float32, copy=False)
+            for value in self.AE_merge(face)
+        ]
+        return (bgr[0], mask_src_dstm[0][..., 0],
+                mask_dst_dstm[0][..., 0])
 
     def get_MergerConfig(self):
-        raise NotImplementedError(
-            "Quick96 merge is outside the training feature")
+        import merger
+        return (self.predictor_func,
+                (self.resolution, self.resolution, 3),
+                merger.MergerConfigMasked(
+                    face_type=self.face_type, default_mode="overlay"))
 
 
 Model = QModel

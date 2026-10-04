@@ -21,6 +21,7 @@ import torch
 from core.leras import nn
 from core.leras.checkpoint import CheckpointLoadError
 from core.leras.device import Devices
+from facelib import FaceType
 from models.Model_Quick96 import Model as Quick96Model
 from tests.parity.generate_quick96_tf_reference import (
     OfficialSourceAuthenticationError, _stable_number,
@@ -134,14 +135,14 @@ def _official_probes(saveable, values, identities):
     return np.asarray(result, dtype=np.float64)
 
 
-def _make_model(root, *, cpu_only=True, force_gpu_idxs=None,
-                pretrained_model_path=None, debug=True):
+def _make_model(root, *, is_training=True, cpu_only=True,
+                force_gpu_idxs=None, pretrained_model_path=None, debug=True):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    if not (root / "src" / "faceset.pak").exists():
+    if is_training and not (root / "src" / "faceset.pak").exists():
         make_training_dirs(root)
     return Quick96Model(
-        is_training=True,
+        is_training=is_training,
         saved_models_path=root,
         training_data_src_path=root / "src",
         training_data_dst_path=root / "dst",
@@ -153,6 +154,36 @@ def _make_model(root, *, cpu_only=True, force_gpu_idxs=None,
         debug=debug,
         no_preview=True,
     )
+
+
+def _make_merge_checkpoint(root):
+    """Write a genuine Feature-A checkpoint with frozen synthetic weights."""
+    root = Path(root)
+    fixture, metadata = _reference()
+    model = _make_model(root)
+    try:
+        weights_root = root / "synthetic_component_inputs"
+        weights_root.mkdir()
+        _load_synthetic_components(
+            model._quick96_components, metadata, weights_root)
+        expected = {
+            component.name: [_tensor_digest(value)
+                             for value in component.get_weights()]
+            for component in model._quick96_components
+        }
+        model.set_iter(1)
+        model.save()
+    finally:
+        model.finalize()
+    return fixture, metadata, expected
+
+
+def _checkpoint_digests(root):
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(Path(root).glob("test_Quick96_*"))
+        if path.is_file()
+    }
 
 
 def _synthetic_batch(model, batch=None, identical=False):
@@ -760,9 +791,261 @@ def test_lr_dropout_independent_parameter_masks_in_same_step(monkeypatch):
     assert not torch.equal(first["mask"], second["mask"])
 
 
-def test_quick96_merge_remains_explicitly_out_of_scope():
+def test_merge_predictor_structurally_reorders_internal_masks():
     model = Quick96Model.__new__(Quick96Model)
-    with pytest.raises(NotImplementedError, match="outside the training"):
-        model.predictor_func(np.zeros((96, 96, 3), np.float32))
-    with pytest.raises(NotImplementedError, match="outside the training"):
-        model.get_MergerConfig()
+    model.model_data_format = "NHWC"
+    model.AE_merge = lambda face: [
+        np.full((1, 96, 96, 3), 1.0, np.float32),
+        np.full((1, 96, 96, 1), 2.0, np.float32),
+        np.full((1, 96, 96, 1), 3.0, np.float32),
+    ]
+
+    face, source_mask, destination_mask = model.predictor_func(
+        np.zeros((96, 96, 3), np.float32))
+    assert np.all(face == 1.0)
+    assert np.all(source_mask == 3.0)
+    assert np.all(destination_mask == 2.0)
+
+
+def test_cpu_merge_checkpoint_parity_config_state_and_merger_smoke(plain_tmp):
+    root = Path(plain_tmp) / "quick96_merge_cpu"
+    fixture, _, expected = _make_merge_checkpoint(root)
+    checkpoint_before = _checkpoint_digests(root)
+
+    model = _make_model(root, is_training=False)
+    try:
+        assert model.is_training is False
+        assert [filename for _, filename in model.model_filename_list] == [
+            "encoder.npy", "inter.npy", "decoder_src.npy",
+            "decoder_dst.npy"]
+        for name in ("src_dst_opt", "src_dst_trainable_weights",
+                     "replica_plan", "tower_devices", "generator_list",
+                     "_src_dst_train_vectors", "AE_view"):
+            assert not hasattr(model, name)
+        assert not hasattr(model, "export_dfm")
+        assert model.model_data_format == "NHWC"
+        assert {value.device.type
+                for component in model._quick96_components
+                for value in component.get_weights()} == {"cpu"}
+        for component in model._quick96_components:
+            assert [_tensor_digest(value) for value in component.get_weights()
+                    ] == expected[component.name]
+
+        parameters_before = {
+            component.name: [_tensor_digest(value)
+                             for value in component.get_weights()]
+            for component in model._quick96_components
+        }
+        internal = model.AE_merge(fixture["warped_dst"])
+        assert isinstance(internal, list) and len(internal) == 3
+        internal_fields = (
+            (internal[0], "ae_merge_face"),
+            (internal[1], "ae_merge_dst_mask"),
+            (internal[2], "ae_merge_src_mask"),
+        )
+        cpu_differences = {}
+        for actual, name in internal_fields:
+            _assert_parity_field(name, actual, fixture[name])
+            cpu_differences[name] = float(np.max(np.abs(
+                actual.astype(np.float64)
+                - fixture[name].astype(np.float64))))
+        print(f"Quick96 CPU merge max differences: {cpu_differences}")
+
+        predicted = model.predictor_func(fixture["warped_dst"][0])
+        expected_predictor = (
+            fixture["ae_merge_face"][0],
+            fixture["ae_merge_src_mask"][0, ..., 0],
+            fixture["ae_merge_dst_mask"][0, ..., 0],
+        )
+        assert [value.shape for value in predicted] == [
+            (96, 96, 3), (96, 96), (96, 96)]
+        assert all(value.dtype == np.float32 for value in predicted)
+        for actual, wanted in zip(predicted, expected_predictor):
+            np.testing.assert_allclose(
+                actual, wanted, rtol=0.0, atol=2e-6)
+
+        import merger
+        predictor, input_shape, config = model.get_MergerConfig()
+        assert getattr(predictor, "__self__", None) is model
+        assert predictor.__func__ is type(model).predictor_func
+        assert input_shape == (96, 96, 3)
+        assert isinstance(config, merger.MergerConfigMasked)
+        assert config.face_type == model.face_type == FaceType.FULL
+        assert config.default_mode == "overlay"
+
+        # Exercise the real official MergeMasked driver on disposable data.
+        import importlib
+        from tests.smoke.test_merge_contracts import (
+            _frame_info, _masked_cfg, _no_enhancer, _zero_xseg)
+        smoke_root = Path(plain_tmp) / "quick96_merge_smoke"
+        smoke_root.mkdir()
+        merged = importlib.import_module("merger.MergeMasked").MergeMasked(
+            predictor, input_shape, _no_enhancer, _zero_xseg,
+            _masked_cfg(), _frame_info(smoke_root))
+        assert merged.shape == (256, 256, 4)
+        assert merged.dtype == np.uint8
+
+        parameters_after = {
+            component.name: [_tensor_digest(value)
+                             for value in component.get_weights()]
+            for component in model._quick96_components
+        }
+        assert parameters_after == parameters_before
+        assert all(value.grad is None
+                   for component in model._quick96_components
+                   for value in component.get_weights())
+        assert _checkpoint_digests(root) == checkpoint_before
+    finally:
+        model.finalize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_physical_cuda_merge_frozen_parity_and_checkpoint_portability(
+        plain_tmp):
+    nn.initialize_main_env()
+    selected = Devices.getDevices()[0]
+    root = Path(plain_tmp) / "quick96_merge_cuda"
+    fixture, _, expected = _make_merge_checkpoint(root)
+    checkpoint_before = _checkpoint_digests(root)
+
+    model = _make_model(
+        root, is_training=False, cpu_only=False,
+        force_gpu_idxs=[selected.index], debug=False)
+    try:
+        assert model.model_data_format == "NCHW"
+        assert not hasattr(model, "src_dst_opt")
+        assert not hasattr(model, "replica_plan")
+        devices = {
+            value.device
+            for component in model._quick96_components
+            for value in component.get_weights()
+        }
+        assert {device.type for device in devices} == {"cuda"}
+        assert {device.index for device in devices} == {selected.index}
+        for component in model._quick96_components:
+            assert [_tensor_digest(value) for value in component.get_weights()
+                    ] == expected[component.name]
+
+        warped_dst = nn.to_data_format(
+            fixture["warped_dst"], "NCHW", "NHWC")
+        internal = model.AE_merge(warped_dst)
+        converted = [
+            nn.to_data_format(value, "NHWC", "NCHW")
+            for value in internal
+        ]
+        fields = (
+            (converted[0], "ae_merge_face"),
+            (converted[1], "ae_merge_dst_mask"),
+            (converted[2], "ae_merge_src_mask"),
+        )
+        cuda_differences = {}
+        for actual, name in fields:
+            _assert_parity_field(name, actual, fixture[name])
+            cuda_differences[name] = float(np.max(np.abs(
+                actual.astype(np.float64)
+                - fixture[name].astype(np.float64))))
+        print(f"Quick96 CUDA merge max differences: {cuda_differences}")
+
+        predicted = model.predictor_func(fixture["warped_dst"][0])
+        assert [value.shape for value in predicted] == [
+            (96, 96, 3), (96, 96), (96, 96)]
+        assert all(value.dtype == np.float32 for value in predicted)
+        assert _checkpoint_digests(root) == checkpoint_before
+        assert all(value.grad is None
+                   for component in model._quick96_components
+                   for value in component.get_weights())
+    finally:
+        model.finalize()
+
+
+def test_merge_requires_existing_data_and_strict_components(plain_tmp):
+    missing_data_root = Path(plain_tmp) / "missing_data"
+    with pytest.raises(FileNotFoundError, match="existing saved model"):
+        _make_model(missing_data_root, is_training=False)
+    assert not list(missing_data_root.glob("test_Quick96_*.npy"))
+
+    malformed_root = Path(plain_tmp) / "malformed_data"
+    malformed_root.mkdir()
+    (malformed_root / "test_Quick96_data.dat").write_bytes(b"not-pickle")
+    with pytest.raises(ValueError, match="readable saved-model metadata"):
+        _make_model(malformed_root, is_training=False)
+
+    root = Path(plain_tmp) / "strict_merge"
+    _make_merge_checkpoint(root)
+    data_path = root / "test_Quick96_data.dat"
+    valid_model_data = data_path.read_bytes()
+    invalid_model_data = (
+        ([], "metadata dictionary"),
+        ({}, "missing required field"),
+        ({"options": {}}, "missing required field"),
+        ({"iter": 1}, "missing required field"),
+        ({"iter": "1", "options": {}}, "non-negative integer"),
+        ({"iter": True, "options": {}}, "non-negative integer"),
+        ({"iter": -1, "options": {}}, "non-negative integer"),
+        ({"iter": 1, "options": []}, "dictionary with string keys"),
+        ({"iter": 1, "options": {1: "invalid"}},
+         "dictionary with string keys"),
+    )
+    try:
+        for payload, message in invalid_model_data:
+            data_path.write_bytes(pickle.dumps(payload, 4))
+            with pytest.raises(ValueError, match=message):
+                _make_model(root, is_training=False)
+    finally:
+        data_path.write_bytes(valid_model_data)
+
+    # Historical fields read by ModelBase with defaults remain optional.
+    current_model_data = pickle.loads(valid_model_data)
+    minimum_model_data = {
+        "iter": current_model_data["iter"],
+        "options": current_model_data["options"],
+    }
+    data_path.write_bytes(pickle.dumps(minimum_model_data, 4))
+    try:
+        minimum_model = _make_model(root, is_training=False)
+        minimum_model.finalize()
+    finally:
+        data_path.write_bytes(valid_model_data)
+
+    component_files = [
+        "encoder.npy", "inter.npy", "decoder_src.npy", "decoder_dst.npy"]
+    for filename in component_files:
+        path = root / f"test_Quick96_{filename}"
+        original = path.read_bytes()
+        path.unlink()
+        try:
+            with pytest.raises(FileNotFoundError, match=filename):
+                _make_model(root, is_training=False)
+        finally:
+            path.write_bytes(original)
+
+    encoder_path = root / "test_Quick96_encoder.npy"
+    encoder_original = encoder_path.read_bytes()
+    encoder_path.write_bytes(encoder_original[:len(encoder_original) // 2])
+    try:
+        with pytest.raises((pickle.UnpicklingError, EOFError)):
+            _make_model(root, is_training=False)
+    finally:
+        encoder_path.write_bytes(encoder_original)
+
+    payload = pickle.loads(encoder_original)
+    first = next(iter(payload))
+    payload[first] = payload[first][..., :-1]
+    encoder_path.write_bytes(pickle.dumps(payload, 4))
+    try:
+        with pytest.raises(CheckpointLoadError, match="shape mismatch"):
+            _make_model(root, is_training=False)
+    finally:
+        encoder_path.write_bytes(encoder_original)
+
+    optimizer_path = root / "test_Quick96_src_dst_opt.npy"
+    optimizer_backup = optimizer_path.read_bytes()
+    optimizer_path.unlink()
+    try:
+        merge_model = _make_model(root, is_training=False)
+        try:
+            assert not hasattr(merge_model, "src_dst_opt")
+        finally:
+            merge_model.finalize()
+    finally:
+        optimizer_path.write_bytes(optimizer_backup)
