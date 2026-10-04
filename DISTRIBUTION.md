@@ -187,13 +187,13 @@ When pretraining is requested, missing or invalid data fails actionably. It does
 
 ## Workflow availability
 
-The curated launchers and generic `dfl.bat` command surface provide the current packaged workflows without reproducing every historical batch filename or package layout. Primary extraction, sorting, faceset, XSeg, SAEHD/AMP training, merge, export, and result-video workflows are available through those entrypoints.
+The curated launchers and generic `dfl.bat` command surface provide the current packaged workflows without reproducing every historical batch filename or package layout. Primary extraction, sorting, faceset, XSeg, SAEHD/AMP/Quick96 training and merge, SAEHD/AMP export, and result-video workflows are available through those entrypoints.
 
 The following historical package workflows require special note:
 
 - Manual XSeg editing for source and destination aligned faces is available through the generic `xseg editor` commands documented above; duplicate fixed-path wrappers are not required.
 - XSeg training with pretraining mode is available through the generic training surface when compatible external pretraining data is supplied explicitly. No dataset is bundled or downloaded.
-- Quick96 training and merging are not included in the current packaged baseline.
+- Quick96 training and masked merging are available through `launchers\train-quick96.bat` and `launchers\merge-quick96.bat`. Quick96 DFM export is not supported. Basic merging keeps super-resolution disabled by default and does not require FaceEnhancer.
 - The historical FaceEnhancer workflow is not currently available in the packaged Torch baseline because its historical implementation depends on a backend that is not part of the packaged runtime.
 - Historical in-place CPU-only package mutation is replaced by the explicit isolated CPU runtime variants.
 - The third-party EbSynth launcher is not included; users manage and start their own EbSynth installation.

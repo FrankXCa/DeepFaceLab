@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Phase 13 - P13-CURATED-WORKFLOW-LAUNCHERS: curated workflow launcher tests.
 #
-# Covers the curated per-workflow launchers shipped in launchers/ (44 thin
+# Covers the curated per-workflow launchers shipped in launchers/ (46 thin
 # wrappers) plus the machine-readable surface manifest
 # launchers/workflow_launchers.json (the machine-readable home of the 56
 # reference-disposition ledger for test purposes; the full ledger with
@@ -18,8 +18,8 @@
 #     (ASCII, LF, @echo off, allowed line shapes only, exactly the shared
 #     dfl.bat call lines, exit-code propagation, no second execution
 #     surface, no absolute paths, no delayed expansion, no forbidden
-#     batch tokens), the manifest/ledger completeness (44 curated +
-#     12 excluded references = the full 56-reference ledger; no launcher
+#     batch tokens), the manifest/ledger completeness (46 curated +
+#     10 excluded references = the full 56-reference ledger; no launcher
 #     for any excluded reference; the launcher directory matches the
 #     manifest exactly), and the exact CLI vocabulary of every mapped
 #     command against the frozen main.py argparse surface.
@@ -68,7 +68,6 @@ ALLOWED_DISPOSITIONS = {
 # launcher (hard exclusions of this feature).
 FORBIDDEN_SUBCOMMANDS = ("editor",)
 FORBIDDEN_TOKENS = (
-    "Quick96",
     "FaceEnhancer",
     "model_generic_xseg",
     "pretrain_faces",
@@ -230,8 +229,8 @@ def test_full_ledger_covers_fifty_six_references():
     # --model-dir to the documented user-provided resource location
     # resources/xseg_generic_model (CONFIGURABLE_USER_SUPPLIED_PATH:
     # no bundled model bytes, no redistribution, no downloads).
-    assert len(_curated_entries()) == 44
-    assert len(_excluded_entries()) == 12
+    assert len(_curated_entries()) == 46
+    assert len(_excluded_entries()) == 10
     assert len(_curated_entries()) + len(_excluded_entries()) == 56
 
     counts = {
@@ -242,11 +241,11 @@ def test_full_ledger_covers_fifty_six_references():
         for disposition in ALLOWED_DISPOSITIONS
     }
     assert counts == {
-        "REPRODUCE_BEHAVIOR": 46,
+        "REPRODUCE_BEHAVIOR": 48,
         "REPLACE": 1,
         "DROP": 1,
         "RESOURCE_GATED": 1,
-        "PHASE14_PENDING": 3,
+        "PHASE14_PENDING": 1,
         "POST_BASELINE": 4,
     }
 
@@ -272,8 +271,6 @@ def test_excluded_reference_rows_are_present():
         "5.XSeg) data_dst mask - edit.bat",
         "5.XSeg) train.bat",
         "4.2) data_src util faceset enhance.bat",
-        "6) train Quick96.bat",
-        "7) merge Quick96.bat",
     ):
         assert required in refs, f"required excluded row missing: {required}"
 
@@ -330,6 +327,41 @@ def test_faceenhancer_is_phase14_pending_and_not_exposed():
     assert rows[0]["disposition"] == "PHASE14_PENDING"
     assert "faces-src-enhance.bat" not in _curated_names()
     assert not (LAUNCHERS_DIR / "faces-src-enhance.bat").exists()
+
+
+def test_quick96_train_and_merge_are_curated_without_export():
+    entries = {entry["file"]: entry for entry in _curated_entries()}
+    expected = {
+        "train-quick96.bat": ("train", "train the Quick96 model"),
+        "merge-quick96.bat": ("merge", "merge aligned data_dst faces"),
+    }
+    for name, (group, purpose_fragment) in expected.items():
+        assert (LAUNCHERS_DIR / name).is_file()
+        assert entries[name]["group"] == group
+        assert entries[name]["forwarding"] is False
+        assert purpose_fragment in entries[name]["purpose"]
+
+    excluded = {row["reference_launcher"] for row in _excluded_entries()}
+    assert "6) train Quick96.bat" not in excluded
+    assert "7) merge Quick96.bat" not in excluded
+    assert "export-quick96-dfm.bat" not in entries
+    assert not (LAUNCHERS_DIR / "export-quick96-dfm.bat").exists()
+    assert {
+        name for name in _curated_names()
+        if "Quick96" in _launcher_text(name)
+    } == set(expected)
+
+    assert _call_args(_launcher_text("train-quick96.bat")) == (
+        'train --training-data-src-dir "workspace\\data_src\\aligned" '
+        '--training-data-dst-dir "workspace\\data_dst\\aligned" '
+        '--model-dir "workspace\\model" --model Quick96 '
+        '--no-preview --silent-start')
+    assert _call_args(_launcher_text("merge-quick96.bat")) == (
+        'merge --input-dir "workspace\\data_dst" '
+        '--output-dir "workspace\\data_dst\\merged" '
+        '--output-mask-dir "workspace\\data_dst\\merged_mask" '
+        '--aligned-dir "workspace\\data_dst\\aligned" '
+        '--model-dir "workspace\\model" --model Quick96')
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +570,32 @@ def _run_curated(tmp_path: Path, name: str, *args, cwd=None, exit_code="0"):
     proc = tl.run_bat(launcher, *args, cwd=cwd, env=env)
     loginfo = tl.read_fakeint_log(log)
     return {"proc": proc, "repo": repo_root, "log": log, "loginfo": loginfo, "cwd": cwd}
+
+
+@pytest.mark.parametrize(
+    "name", ("train-quick96.bat", "merge-quick96.bat"))
+def test_quick96_launcher_is_spaced_install_safe(tmp_path, name):
+    repo_root = tmp_path / "fake dfl with spaces"
+    make_curated_fake_repo(repo_root)
+    log = tmp_path / f"{name}.log"
+    env = tl._env(
+        tl.HOSTILE_PARENT_ENV,
+        FAKEINT_LOG=str(log),
+        FAKEINT_EXIT="0",
+    )
+
+    proc = tl.run_bat(
+        repo_root / "launchers" / name,
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    loginfo = tl.read_fakeint_log(log)
+    assert loginfo["args"] == _expected_args_line(name)
+    assert loginfo["exec"] == (
+        f"runtime\\versions\\{FAKE_RUNTIME_ID}\\python.exe")
+    assert '"workspace\\' in _call_args(_launcher_text(name))
 
 
 def _assert_isolated_child_env(env: dict):

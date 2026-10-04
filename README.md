@@ -67,9 +67,9 @@ Manual XSeg mask editing is different: it needs aligned user face data and a GUI
 
 ## Workflow availability
 
-The current packaged surface covers the primary extraction, sorting, faceset, XSeg, SAEHD/AMP training, merge, export, and result-video workflows. Some historical package workflows have different availability:
+The current packaged surface covers the primary extraction, sorting, faceset, XSeg, SAEHD/AMP/Quick96 training and merge, SAEHD/AMP export, and result-video workflows. Some historical package workflows have different availability:
 
-- Quick96 training and merging are not included in the current packaged baseline.
+- Quick96 training and masked merging are available through `launchers\train-quick96.bat` and `launchers\merge-quick96.bat`. Quick96 DFM export is not supported.
 - The historical FaceEnhancer workflow is not currently available in the packaged Torch baseline.
 - XSeg training with pretraining mode requires explicitly supplied external pretraining data.
 - Third-party and convenience applications such as EbSynth and bundled viewers are not included.
