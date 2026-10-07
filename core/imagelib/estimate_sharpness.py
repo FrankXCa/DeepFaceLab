@@ -31,6 +31,143 @@ goods or services; loss of use, data, or profits; or business interruption) howe
 import numpy as np
 import cv2
 from math import atan2, pi
+from scipy import ndimage as ndi
+
+
+# The Canny compatibility subset below is derived from scikit-image 0.14.2
+# (skimage.feature._canny), originally authored by Lee Kamentsky for
+# CellProfiler.
+#
+# Copyright (c) 2003-2009 Massachusetts Institute of Technology
+# Copyright (c) 2009-2011 Broad Institute
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. Neither the names of the copyright holders nor contributors may be used
+#    to endorse or promote products derived from this software without
+#    specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE.
+
+
+_HSOBEL_WEIGHTS = np.array([[1, 2, 1],
+                            [0, 0, 0],
+                            [-1, -2, -1]], dtype=np.float64) / 4.0
+
+
+def _smooth_with_mask(image, mask):
+    """Apply the historical sigma-1 Gaussian with mask compensation."""
+    bleed_over = ndi.gaussian_filter(
+        mask.astype(float), 1.0, mode="constant")
+    masked_image = np.zeros(image.shape, image.dtype)
+    masked_image[mask] = image[mask]
+    smoothed_image = ndi.gaussian_filter(
+        masked_image, 1.0, mode="constant")
+    return smoothed_image / (bleed_over + np.finfo(float).eps)
+
+
+def _canny(image):
+    """Reproduce the scikit-image 0.14.2 default Canny subset used by CPBD."""
+    if image.ndim != 2:
+        raise ValueError("Canny input must be a two-dimensional array")
+
+    low_threshold = 0.1
+    high_threshold = 0.2
+    mask = np.ones(image.shape, dtype=bool)
+    smoothed = _smooth_with_mask(image, mask)
+    jsobel = ndi.sobel(smoothed, axis=1)
+    isobel = ndi.sobel(smoothed, axis=0)
+    abs_isobel = np.abs(isobel)
+    abs_jsobel = np.abs(jsobel)
+    magnitude = np.hypot(isobel, jsobel)
+
+    structure = ndi.generate_binary_structure(2, 2)
+    eroded_mask = ndi.binary_erosion(mask, structure, border_value=0)
+    eroded_mask &= magnitude > 0
+    local_maxima = np.zeros(image.shape, bool)
+
+    pts = (((isobel >= 0) & (jsobel >= 0) &
+            (abs_isobel >= abs_jsobel)) |
+           ((isobel <= 0) & (jsobel <= 0) &
+            (abs_isobel >= abs_jsobel)))
+    pts &= eroded_mask
+    c1 = magnitude[1:, :][pts[:-1, :]]
+    c2 = magnitude[1:, 1:][pts[:-1, :-1]]
+    center = magnitude[pts]
+    weight = abs_jsobel[pts] / abs_isobel[pts]
+    c_plus = c2 * weight + c1 * (1 - weight) <= center
+    c1 = magnitude[:-1, :][pts[1:, :]]
+    c2 = magnitude[:-1, :-1][pts[1:, 1:]]
+    c_minus = c2 * weight + c1 * (1 - weight) <= center
+    local_maxima[pts] = c_plus & c_minus
+
+    pts = (((isobel >= 0) & (jsobel >= 0) &
+            (abs_isobel <= abs_jsobel)) |
+           ((isobel <= 0) & (jsobel <= 0) &
+            (abs_isobel <= abs_jsobel)))
+    pts &= eroded_mask
+    c1 = magnitude[:, 1:][pts[:, :-1]]
+    c2 = magnitude[1:, 1:][pts[:-1, :-1]]
+    center = magnitude[pts]
+    weight = abs_isobel[pts] / abs_jsobel[pts]
+    c_plus = c2 * weight + c1 * (1 - weight) <= center
+    c1 = magnitude[:, :-1][pts[:, 1:]]
+    c2 = magnitude[:-1, :-1][pts[1:, 1:]]
+    c_minus = c2 * weight + c1 * (1 - weight) <= center
+    local_maxima[pts] = c_plus & c_minus
+
+    pts = (((isobel <= 0) & (jsobel >= 0) &
+            (abs_isobel <= abs_jsobel)) |
+           ((isobel >= 0) & (jsobel <= 0) &
+            (abs_isobel <= abs_jsobel)))
+    pts &= eroded_mask
+    c1 = magnitude[:, 1:][pts[:, :-1]]
+    c2 = magnitude[:-1, 1:][pts[1:, :-1]]
+    center = magnitude[pts]
+    weight = abs_isobel[pts] / abs_jsobel[pts]
+    c_plus = c2 * weight + c1 * (1.0 - weight) <= center
+    c1 = magnitude[:, :-1][pts[:, 1:]]
+    c2 = magnitude[1:, :-1][pts[:-1, 1:]]
+    c_minus = c2 * weight + c1 * (1.0 - weight) <= center
+    local_maxima[pts] = c_plus & c_minus
+
+    pts = (((isobel <= 0) & (jsobel >= 0) &
+            (abs_isobel >= abs_jsobel)) |
+           ((isobel >= 0) & (jsobel <= 0) &
+            (abs_isobel >= abs_jsobel)))
+    pts &= eroded_mask
+    c1 = magnitude[:-1, :][pts[1:, :]]
+    c2 = magnitude[:-1, 1:][pts[1:, :-1]]
+    center = magnitude[pts]
+    weight = abs_jsobel[pts] / abs_isobel[pts]
+    c_plus = c2 * weight + c1 * (1 - weight) <= center
+    c1 = magnitude[1:, :][pts[:-1, :]]
+    c2 = magnitude[1:, :-1][pts[:-1, 1:]]
+    c_minus = c2 * weight + c1 * (1 - weight) <= center
+    local_maxima[pts] = c_plus & c_minus
+
+    high_mask = local_maxima & (magnitude >= high_threshold)
+    low_mask = local_maxima & (magnitude >= low_threshold)
+    labels, count = ndi.label(low_mask, np.ones((3, 3), bool))
+    if count == 0:
+        return low_mask
+    sums = np.array(
+        ndi.sum(high_mask, labels, np.arange(count, dtype=np.int32) + 1),
+        copy=False, ndmin=1)
+    good_label = np.zeros((count + 1,), bool)
+    good_label[1:] = sums > 0
+    return good_label[labels]
 
 
 def sobel(image):
@@ -40,12 +177,10 @@ def sobel(image):
 
     Inspired by the [Octave implementation](https://sourceforge.net/p/octave/image/ci/default/tree/inst/edge.m#l196).
     """
-    from skimage.filters.edges import HSOBEL_WEIGHTS
-    h1 = np.array(HSOBEL_WEIGHTS)
+    h1 = np.array(_HSOBEL_WEIGHTS)
     h1 /= np.sum(abs(h1))  # normalize h1
-    
-    from scipy.ndimage import convolve
-    strength2 = np.square(convolve(image, h1.T))
+
+    strength2 = np.square(ndi.convolve(image, h1.T))
 
     # Note: https://sourceforge.net/p/octave/image/ci/default/tree/inst/edge.m#l59
     thresh2 = 2 * np.sqrt(np.mean(strength2))
@@ -102,8 +237,7 @@ def compute(image):
     # edge detection using canny and sobel canny edge detection is done to
     # classify the blocks as edge or non-edge blocks and sobel edge
     # detection is done for the purpose of edge width measurement.
-    from skimage.feature import canny
-    canny_edges = canny(image)
+    canny_edges = _canny(image)
     sobel_edges = sobel(image)
 
     # edge width calculation

@@ -4,6 +4,7 @@ import operator
 import os
 import sys
 import tempfile
+import traceback
 from functools import cmp_to_key
 from pathlib import Path
 
@@ -21,6 +22,34 @@ from DFLIMG import *
 from facelib import LandmarksProcessor
 
 
+FATAL_SCORER_FAILURE = "FATAL_SCORER_FAILURE"
+
+
+class SharpnessScoringError(RuntimeError):
+    """A blur scorer failed; sorter output must remain untouched."""
+
+
+def _fatal_scorer_result(filepath, error):
+    return [
+        FATAL_SCORER_FAILURE,
+        str(filepath),
+        type(error).__name__,
+        str(error),
+        traceback.format_exc(),
+    ]
+
+
+def _raise_fatal_scorer_errors(errors):
+    details = []
+    for result in errors:
+        _, pathname, error_type, message, diagnostic = result
+        details.append(
+            f"{pathname}: {error_type}: {message}\n{diagnostic}".rstrip())
+    raise SharpnessScoringError(
+        "FATAL_SCORER_FAILURE: blur sharpness scoring failed:\n" +
+        "\n".join(details))
+
+
 class BlurEstimatorSubprocessor(Subprocessor):
     class Cli(Subprocessor.Cli):
         def on_initialize(self, client_dict):
@@ -35,17 +64,23 @@ class BlurEstimatorSubprocessor(Subprocessor):
                 self.log_err (f"{filepath.name} is not a dfl image file")
                 return [ str(filepath), 0 ]
             else:
-                image = cv2_imread( str(filepath) )
-                
-                face_mask = LandmarksProcessor.get_image_hull_mask (image.shape, dflimg.get_landmarks())
-                image = (image*face_mask).astype(np.uint8)
-                
-                
-                if self.estimate_motion_blur:
-                    value = cv2.Laplacian(image, cv2.CV_64F, ksize=11).var()    
-                else:
-                    value = estimate_sharpness(image)
-                
+                try:
+                    image = cv2_imread( str(filepath) )
+                    if image is None:
+                        raise ValueError(f"Unable to decode {filepath.name}")
+
+                    face_mask = LandmarksProcessor.get_image_hull_mask (
+                        image.shape, dflimg.get_landmarks())
+                    image = (image*face_mask).astype(np.uint8)
+
+                    if self.estimate_motion_blur:
+                        value = cv2.Laplacian(
+                            image, cv2.CV_64F, ksize=11).var()
+                    else:
+                        value = estimate_sharpness(image)
+                except Exception as error:
+                    return _fatal_scorer_result(filepath, error)
+
                 return [ str(filepath), value ]
 
 
@@ -60,6 +95,7 @@ class BlurEstimatorSubprocessor(Subprocessor):
         self.estimate_motion_blur = estimate_motion_blur
         self.img_list = []
         self.trash_img_list = []
+        self.fatal_errors = []
         super().__init__('BlurEstimator', BlurEstimatorSubprocessor.Cli, 60)
 
     #override
@@ -80,6 +116,8 @@ class BlurEstimatorSubprocessor(Subprocessor):
 
     #override
     def get_data(self, host_dict):
+        if self.fatal_errors:
+            return None
         if len (self.input_data) > 0:
             return self.input_data.pop(0)
 
@@ -91,7 +129,9 @@ class BlurEstimatorSubprocessor(Subprocessor):
 
     #override
     def on_result (self, host_dict, data, result):
-        if result[1] == 0:
+        if result[0] == FATAL_SCORER_FAILURE:
+            self.fatal_errors.append(result)
+        elif result[1] == 0:
             self.trash_img_list.append ( result )
         else:
             self.img_list.append ( result )
@@ -100,6 +140,8 @@ class BlurEstimatorSubprocessor(Subprocessor):
 
     #override
     def get_result(self):
+        if self.fatal_errors:
+            _raise_fatal_scorer_errors(self.fatal_errors)
         return self.img_list, self.trash_img_list
 
 
@@ -465,16 +507,29 @@ class FinalLoaderSubprocessor(Subprocessor):
 
                 bgr = cv2_imread(str(filepath))
                 if bgr is None:
-                    raise Exception ("Unable to load %s" % (filepath.name) )
+                    raise ValueError("Unable to decode %s" % filepath.name)
 
                 gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            except Exception as error:
+                if not self.faster:
+                    return _fatal_scorer_result(filepath, error)
+                self.log_err(error)
+                return [ 1, [str(filepath)] ]
+
+            try:
                 if self.faster:
                     source_rect = dflimg.get_source_rect()
                     sharpness = mathlib.polygon_area(np.array(source_rect[[0,2,2,0]]).astype(np.float32), np.array(source_rect[[1,1,3,3]]).astype(np.float32))
                 else:
                     face_mask = LandmarksProcessor.get_image_hull_mask (gray.shape, dflimg.get_landmarks())     
                     sharpness = estimate_sharpness( (gray[...,None]*face_mask).astype(np.uint8) )
+            except Exception as error:
+                if not self.faster:
+                    return _fatal_scorer_result(filepath, error)
+                self.log_err(error)
+                return [ 1, [str(filepath)] ]
 
+            try:
                 pitch, yaw, roll = LandmarksProcessor.estimate_pitch_yaw_roll ( dflimg.get_landmarks(), size=dflimg.get_shape()[1] )
 
                 hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
@@ -496,6 +551,7 @@ class FinalLoaderSubprocessor(Subprocessor):
         self.faster = faster
         self.result = []
         self.result_trash = []
+        self.fatal_errors = []
 
         super().__init__('FinalLoader', FinalLoaderSubprocessor.Cli, 60)
 
@@ -517,6 +573,8 @@ class FinalLoaderSubprocessor(Subprocessor):
 
     #override
     def get_data(self, host_dict):
+        if self.fatal_errors:
+            return None
         if len (self.img_list) > 0:
             return [self.img_list.pop(0)]
 
@@ -528,7 +586,9 @@ class FinalLoaderSubprocessor(Subprocessor):
 
     #override
     def on_result (self, host_dict, data, result):
-        if result[0] == 0:
+        if result[0] == FATAL_SCORER_FAILURE:
+            self.fatal_errors.append(result)
+        elif result[0] == 0:
             self.result.append (result[1])
         else:
             self.result_trash.append (result[1])
@@ -536,6 +596,8 @@ class FinalLoaderSubprocessor(Subprocessor):
 
     #override
     def get_result(self):
+        if self.fatal_errors:
+            _raise_fatal_scorer_errors(self.fatal_errors)
         return self.result, self.result_trash
 
 class FinalHistDissimSubprocessor(Subprocessor):
