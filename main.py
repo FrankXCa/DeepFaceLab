@@ -38,7 +38,7 @@ if __name__ == "__main__":
         def __call__(self, parser, namespace, values, option_string=None):
             setattr(namespace, self.dest, os.path.abspath(os.path.expanduser(values)))
 
-    def parse_merge_gpu_idxs(value):
+    def parse_gpu_idxs(value):
         try:
             return [int(idx) for idx in value.split(',')]
         except ValueError as exc:
@@ -215,7 +215,7 @@ if __name__ == "__main__":
     p.add_argument('--model', required=True, dest="model_name", choices=pathex.get_all_dir_names_startswith ( Path(__file__).parent / 'models' , 'Model_'), help="Model class name.")
     p.add_argument('--force-model-name', dest="force_model_name", default=None, help="Forcing to choose model name from model/ folder.")
     p.add_argument('--cpu-only', action="store_true", dest="cpu_only", default=False, help="Merge on CPU.")
-    p.add_argument('--force-gpu-idxs', type=parse_merge_gpu_idxs, dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
+    p.add_argument('--force-gpu-idxs', type=parse_gpu_idxs, dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
     p.set_defaults(func=process_merge)
 
     videoed_parser = subparsers.add_parser( "videoed", help="Video processing.").add_subparsers()
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     p = facesettool_parser.add_parser ("enhance", help="Enhance details in DFL faceset.")
     p.add_argument('--input-dir', required=True, action=fixPathAction, dest="input_dir", help="Input directory of aligned faces.")
     p.add_argument('--cpu-only', action="store_true", dest="cpu_only", default=False, help="Process on CPU.")
-    p.add_argument('--force-gpu-idxs', dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
+    p.add_argument('--force-gpu-idxs', type=parse_gpu_idxs, dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
 
     p.set_defaults(func=process_faceset_enhancer)
     

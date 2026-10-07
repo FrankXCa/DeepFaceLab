@@ -274,17 +274,62 @@ def _masked_cfg(mode="overlay", mask_mode=4, ctm=ctm_str_dict[None],
     )
 
 
-def _merge_frame(root, predictor, cfg, n_faces=1):
+def _merge_frame(root, predictor, cfg, n_faces=1, enhancer=_no_enhancer):
     """The official multi-face driver on a synthetic frame. Returns
     (the uint8 (H,W,4) frame, the frame_info) — the official
     ``MergeMasked`` returns exactly the uint8 array
     (``(final_img*255).astype(np.uint8)``)."""
     frame_info = _frame_info(root, n_faces)
     out_u8 = merge_masked.MergeMasked(
-        predictor, (RES, RES, 3), _no_enhancer, _zero_xseg,
+        predictor, (RES, RES, 3), enhancer, _zero_xseg,
         cfg, frame_info)
     assert out_u8.dtype == np.uint8
     return out_u8, frame_info
+
+
+def test_super_resolution_power_zero_never_calls_enhancer(
+        workdir, no_cli_prompts):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("power=0 must remain lazy")
+
+    baseline, _ = _merge_frame(
+        workdir, _const_predictor(face_value=0.4),
+        _masked_cfg(mask_mode=0, super_res=0), enhancer=forbidden)
+    accepted, _ = _merge_frame(
+        workdir, _const_predictor(face_value=0.4),
+        _masked_cfg(mask_mode=0, super_res=0))
+    assert np.array_equal(baseline, accepted)
+
+
+@pytest.mark.parametrize(
+    ("power", "enhanced_value", "expected_value"),
+    [(25, 0.8, 0.5), (100, 1.2, 1.0)],
+)
+def test_super_resolution_blend_equation_clipping_masks_and_single_callback(
+        workdir, no_cli_prompts, power, enhanced_value, expected_value):
+    calls = []
+
+    def enhancer(face, is_tanh=False, preserve_size=True):
+        calls.append((face.copy(), is_tanh, preserve_size))
+        assert face.shape == (RES, RES, 3)
+        assert np.all(face == np.float32(0.4))
+        return np.full((RES * 4, RES * 4, 3), enhanced_value,
+                       dtype=np.float32)
+
+    output, _ = _merge_frame(
+        workdir, _const_predictor(face_value=0.4),
+        _masked_cfg(mask_mode=0, super_res=power), enhancer=enhancer)
+    assert len(calls) == 1
+    assert calls[0][1:] == (True, False)
+    assert output.shape == (FRAME, FRAME, 4)
+    assert output.dtype == np.uint8
+    # The full-mask center is unaffected by the affine boundary and pins the
+    # exact blend: resized_original*(1-mod) + enhanced*mod, then clip [0,1].
+    expected_u8 = int(np.float32(expected_value) * 255)
+    np.testing.assert_array_equal(
+        output[FRAME // 2, FRAME // 2, :3],
+        np.full(3, expected_u8, dtype=np.uint8))
+    assert output[FRAME // 2, FRAME // 2, 3] == 255
 
 
 # --- predictor callbacks ----------------------------------------------------

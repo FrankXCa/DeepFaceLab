@@ -1,5 +1,6 @@
 import multiprocessing
 import shutil
+import traceback
 
 from DFLIMG import *
 from core.interact import interact as io
@@ -86,14 +87,16 @@ class FacesetEnhancerSubprocessor(Subprocessor):
                 device_config = nn.DeviceConfig.GPUIndexes ([device_idx])
                 device_vram = device_config.devices[0].total_mem_gb
 
-            nn.initialize (device_config)
-
             intro_str = 'Running on %s.' % (client_dict['device_name'])
 
             self.log_info (intro_str)
 
             from facelib import FaceEnhancer
-            self.fe = FaceEnhancer( place_model_on_cpu=(device_vram<=2 or cpu_only), run_on_cpu=cpu_only )
+            self.fe = FaceEnhancer(
+                place_model_on_cpu=(device_vram <= 2 or cpu_only),
+                run_on_cpu=cpu_only,
+                device_config=device_config,
+            )
 
         #override
         def process_data(self, filepath):

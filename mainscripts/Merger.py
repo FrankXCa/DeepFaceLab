@@ -57,7 +57,8 @@ def main (model_class_name=None,
         # Preparing MP functions
         predictor_func = MPFunc(predictor_func)
 
-        run_on_cpu = len(nn.getCurrentDeviceConfig().devices) == 0
+        device_config = nn.getCurrentDeviceConfig()
+        run_on_cpu = len(device_config.devices) == 0
         xseg_256_extract_func = MPClassFuncOnDemand(XSegNet, 'extract',
                                                     name='XSeg',
                                                     resolution=256,
@@ -67,7 +68,8 @@ def main (model_class_name=None,
 
         face_enhancer_func = MPClassFuncOnDemand(FaceEnhancer, 'enhance',
                                                     place_model_on_cpu=True,
-                                                    run_on_cpu=run_on_cpu)
+                                                    run_on_cpu=run_on_cpu,
+                                                    device_config=device_config)
 
         is_interactive = io.input_bool ("Use interactive merger?", True) if not io.is_colab() else False
 
