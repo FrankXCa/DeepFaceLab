@@ -775,86 +775,160 @@ def sort_by_vggface(input_path):
 def sort_by_absdiff(input_path):
     io.log_info ("Sorting by absolute difference...")
 
-    is_sim = io.input_bool ("Sort by similar?", True, help_message="Otherwise sort by dissimilar.")
-
-    from core.leras import nn
-
-    device_config = nn.DeviceConfig.ask_choose_device(choose_only_one=True)
-    nn.initialize( device_config=device_config, data_format="NHWC" )
-    tf = nn.tf
-
     image_paths = pathex.get_image_paths(input_path)
     image_paths_len = len(image_paths)
 
-    batch_size = 512
-    batch_size_remain = image_paths_len % batch_size
+    # Validate the complete input before creating temporary storage or allowing
+    # final_process() to rename anything.  The historical TensorFlow
+    # placeholders accepted arbitrary, but uniform, HWC shapes.
+    _validate_absdiff_images(image_paths)
 
-    i_t = tf.placeholder (tf.float32, (None,None,None,None) )
-    j_t = tf.placeholder (tf.float32, (None,None,None,None) )
+    if image_paths_len == 0:
+        return [], []
+    if image_paths_len == 1:
+        return [(image_paths[0],)], []
 
-    outputs_full = []
-    outputs_remain = []
+    is_sim = io.input_bool ("Sort by similar?", True, help_message="Otherwise sort by dissimilar.")
 
-    for i in range(batch_size):
-        diff_t = tf.reduce_sum( tf.abs(i_t-j_t[i]), axis=[1,2,3] )
-        outputs_full.append(diff_t)
-        if i < batch_size_remain:
-            outputs_remain.append(diff_t)
+    device_config = nn.DeviceConfig.ask_choose_device(choose_only_one=True)
+    from core.leras.device import get_torch_device
+    import torch
 
-    def func_bs_full(i,j):
-        return nn.tf_sess.run (outputs_full, feed_dict={i_t:i,j_t:j})
+    device = (torch.device("cpu") if len(device_config.devices) == 0
+              else get_torch_device(device_config.devices[0]))
+    sorted_ids = _sort_absdiff_image_paths(
+        image_paths, is_sim, device, torch=torch, block_size=512)
 
-    def func_bs_remain(i,j):
-        return nn.tf_sess.run (outputs_remain, feed_dict={i_t:i,j_t:j})
+    img_list = [ (image_paths[x],) for x in sorted_ids]
+    return img_list, []
 
-    import h5py
-    db_file_path = Path(tempfile.gettempdir()) / 'sort_cache.hdf5'
-    db_file = h5py.File( str(db_file_path), "w")
-    db = db_file.create_dataset("results", (image_paths_len,image_paths_len), compression="gzip")
 
-    pg_len = image_paths_len // batch_size
-    if batch_size_remain != 0:
-        pg_len += 1
+def _read_absdiff_image(image_path, expected_shape=None):
+    image = cv2_imread(image_path)
+    name = Path(image_path).name
+    if image is None:
+        raise ValueError(f"Unable to decode absdiff input image: {name}")
+    if image.ndim != 3:
+        raise ValueError(
+            f"absdiff input image must be HWC (rank 3): {name} has "
+            f"shape {image.shape}")
+    if expected_shape is not None and image.shape != expected_shape:
+        raise ValueError(
+            f"absdiff input images must have one common HWC shape: {name} "
+            f"has {image.shape}, expected {expected_shape}")
+    return np.ascontiguousarray(image)
 
-    pg_len = int( (  pg_len*pg_len - pg_len ) / 2 + pg_len )
 
-    io.progress_bar ("Computing", pg_len)
-    j=0
-    while j < image_paths_len:
-        j_images = [ cv2_imread(x) for x in image_paths[j:j+batch_size] ]
-        j_images_len = len(j_images)
+def _validate_absdiff_images(image_paths):
+    expected_shape = None
+    for image_path in image_paths:
+        image = _read_absdiff_image(image_path, expected_shape)
+        if expected_shape is None:
+            expected_shape = image.shape
+    return expected_shape
 
-        func = func_bs_remain if image_paths_len-j < batch_size else func_bs_full
 
-        i=0
-        while i < image_paths_len:
-            if i >= j:
-                i_images = [ cv2_imread(x) for x in image_paths[i:i+batch_size] ]
-                i_images_len = len(i_images)
-                result = func (i_images,j_images)
-                db[j:j+j_images_len,i:i+i_images_len] = np.array(result)
-                io.progress_bar_inc(1)
+def _score_absdiff_blocks(i_images, j_images, device, torch):
+    """Return float32 scores with rows from j_images and columns from i_images."""
+    i_array = np.stack(i_images)
+    i_tensor = torch.as_tensor(i_array, dtype=torch.float32, device=device)
+    rows = []
+    with torch.inference_mode():
+        for j_image in j_images:
+            j_tensor = torch.as_tensor(
+                j_image, dtype=torch.float32, device=device)
+            row = torch.sum(
+                torch.abs(i_tensor - j_tensor),
+                dim=(1, 2, 3),
+                dtype=torch.float32,
+            )
+            rows.append(row.detach().cpu().numpy())
+    return np.asarray(rows, dtype=np.float32)
 
-            i += batch_size
-        db_file.flush()
-        j += batch_size
 
-    io.progress_bar_close()
+def _greedy_absdiff_order(score_matrix, is_sim):
+    image_count = score_matrix.shape[0]
+    if image_count == 0:
+        return []
 
     next_id = 0
-    sorted = [next_id]
-    for i in io.progress_bar_generator ( range(image_paths_len-1), "Sorting" ):
-        id_ar = np.concatenate ( [ db[:next_id,next_id], db[next_id,next_id:] ] )
+    sorted_ids = [next_id]
+    for _ in io.progress_bar_generator(range(image_count - 1), "Sorting"):
+        id_ar = np.concatenate(
+            [score_matrix[:next_id, next_id],
+             score_matrix[next_id, next_id:]])
         id_ar = np.argsort(id_ar)
+        remaining = np.setdiff1d(id_ar, sorted_ids, True)
+        next_id = int(remaining[0 if is_sim else -1])
+        sorted_ids.append(next_id)
+    return sorted_ids
 
 
-        next_id = np.setdiff1d(id_ar, sorted, True)[ 0 if is_sim else -1]
-        sorted += [next_id]
-    db_file.close()
-    db_file_path.unlink()
+def _sort_absdiff_image_paths(image_paths, is_sim, device, torch,
+                              block_size=512):
+    image_count = len(image_paths)
+    if image_count <= 1:
+        return list(range(image_count))
+    if block_size <= 0:
+        raise ValueError("absdiff block_size must be positive")
 
-    img_list = [ (image_paths[x],) for x in sorted]
-    return img_list, []
+    expected_shape = _read_absdiff_image(image_paths[0]).shape
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix="dfl_absdiff_", suffix=".mmap")
+    os.close(temp_fd)
+    score_matrix = None
+    progress_open = False
+    try:
+        score_matrix = np.memmap(
+            temp_name, dtype=np.float32, mode="w+",
+            shape=(image_count, image_count))
+        score_matrix[:] = 0.0
+
+        block_count = (image_count + block_size - 1) // block_size
+        progress_count = block_count * (block_count + 1) // 2
+        io.progress_bar("Computing", progress_count)
+        progress_open = True
+
+        for j in range(0, image_count, block_size):
+            j_paths = image_paths[j:j + block_size]
+            j_images = [
+                _read_absdiff_image(path, expected_shape) for path in j_paths]
+            j_end = j + len(j_images)
+
+            for i in range(j, image_count, block_size):
+                i_paths = image_paths[i:i + block_size]
+                i_images = [
+                    _read_absdiff_image(path, expected_shape)
+                    for path in i_paths]
+                i_end = i + len(i_images)
+
+                scores = _score_absdiff_blocks(
+                    i_images, j_images, device, torch)
+                score_matrix[j:j_end, i:i_end] = scores
+                score_matrix[i:i_end, j:j_end] = scores.T
+                io.progress_bar_inc(1)
+
+        io.progress_bar_close()
+        progress_open = False
+        score_matrix.flush()
+        return _greedy_absdiff_order(score_matrix, is_sim)
+    finally:
+        try:
+            if progress_open:
+                io.progress_bar_close()
+        finally:
+            try:
+                if score_matrix is not None:
+                    score_matrix.flush()
+            finally:
+                if score_matrix is not None:
+                    mmap = getattr(score_matrix, "_mmap", None)
+                    if mmap is not None:
+                        mmap.close()
+                try:
+                    Path(temp_name).unlink()
+                except FileNotFoundError:
+                    pass
 
 def final_process(input_path, img_list, trash_img_list):
     if len(trash_img_list) != 0:
