@@ -194,7 +194,8 @@ The following historical package workflows require special note:
 - Manual XSeg editing for source and destination aligned faces is available through the generic `xseg editor` commands documented above; duplicate fixed-path wrappers are not required.
 - XSeg training with pretraining mode is available through the generic training surface when compatible external pretraining data is supplied explicitly. No dataset is bundled or downloaded.
 - Quick96 training and masked merging are available through `launchers\train-quick96.bat` and `launchers\merge-quick96.bat`. Quick96 DFM export is not supported. Basic merging keeps super-resolution disabled by default and does not require FaceEnhancer.
-- The historical FaceEnhancer workflow is not currently available in the packaged Torch baseline because its historical implementation depends on a backend that is not part of the packaged runtime.
+- FaceEnhancer-backed enhancement of the aligned source faceset is available through `launchers\faces-src-enhance.bat`. The wrapper uses `workspace\data_src\aligned` and intentionally accepts no forwarded arguments. For another input directory or advanced device selection, use `launchers\dfl.bat facesettool enhance --input-dir <dir>` with the existing optional device flags.
+- Masked-merger super-resolution uses FaceEnhancer when the merge configuration enables it. Normal/basic merge configurations keep super-resolution disabled by default.
 - Historical in-place CPU-only package mutation is replaced by the explicit isolated CPU runtime variants.
 - The third-party EbSynth launcher is not included; users manage and start their own EbSynth installation.
 - Workspace reset and the historical bundled-viewer convenience workflows are not included in the current packaged baseline.

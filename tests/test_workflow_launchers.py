@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Phase 13 - P13-CURATED-WORKFLOW-LAUNCHERS: curated workflow launcher tests.
 #
-# Covers the curated per-workflow launchers shipped in launchers/ (46 thin
+# Covers the curated per-workflow launchers shipped in launchers/ (47 thin
 # wrappers) plus the machine-readable surface manifest
 # launchers/workflow_launchers.json (the machine-readable home of the 56
 # reference-disposition ledger for test purposes; the full ledger with
@@ -18,8 +18,8 @@
 #     (ASCII, LF, @echo off, allowed line shapes only, exactly the shared
 #     dfl.bat call lines, exit-code propagation, no second execution
 #     surface, no absolute paths, no delayed expansion, no forbidden
-#     batch tokens), the manifest/ledger completeness (46 curated +
-#     10 excluded references = the full 56-reference ledger; no launcher
+#     batch tokens), the manifest/ledger completeness (47 curated +
+#     9 excluded references = the full 56-reference ledger; no launcher
 #     for any excluded reference; the launcher directory matches the
 #     manifest exactly), and the exact CLI vocabulary of every mapped
 #     command against the frozen main.py argparse surface.
@@ -89,6 +89,7 @@ CWD_MATRIX_FILES = (
     "train-amp.bat",
     "xseg-apply-trained-masks-src.bat",
     "faces-src-pack.bat",
+    "faces-src-enhance.bat",
     "sort-faces-src.bat",
     "merge-amp.bat",
     "result-video-mp4.bat",
@@ -229,8 +230,8 @@ def test_full_ledger_covers_fifty_six_references():
     # --model-dir to the documented user-provided resource location
     # resources/xseg_generic_model (CONFIGURABLE_USER_SUPPLIED_PATH:
     # no bundled model bytes, no redistribution, no downloads).
-    assert len(_curated_entries()) == 46
-    assert len(_excluded_entries()) == 10
+    assert len(_curated_entries()) == 47
+    assert len(_excluded_entries()) == 9
     assert len(_curated_entries()) + len(_excluded_entries()) == 56
 
     counts = {
@@ -241,11 +242,11 @@ def test_full_ledger_covers_fifty_six_references():
         for disposition in ALLOWED_DISPOSITIONS
     }
     assert counts == {
-        "REPRODUCE_BEHAVIOR": 48,
+        "REPRODUCE_BEHAVIOR": 49,
         "REPLACE": 1,
         "DROP": 1,
         "RESOURCE_GATED": 1,
-        "PHASE14_PENDING": 1,
+        "PHASE14_PENDING": 0,
         "POST_BASELINE": 4,
     }
 
@@ -270,7 +271,6 @@ def test_excluded_reference_rows_are_present():
         "5.XSeg) data_src mask - edit.bat",
         "5.XSeg) data_dst mask - edit.bat",
         "5.XSeg) train.bat",
-        "4.2) data_src util faceset enhance.bat",
     ):
         assert required in refs, f"required excluded row missing: {required}"
 
@@ -282,6 +282,8 @@ def test_no_launcher_created_for_excluded_dispositions():
     groups = {e["group"] for e in _curated_entries()}
     for token in FORBIDDEN_TOKENS:
         for name in _curated_names():
+            if token == "FaceEnhancer" and name == "faces-src-enhance.bat":
+                continue
             assert token not in _launcher_text(name), f"{token} in {name}"
     for name in _curated_names():
         text = _launcher_text(name)
@@ -320,13 +322,40 @@ def test_xseg_editor_references_are_reproduced_by_generic_cli():
     assert "XSegEditor.start" in editor_block
 
 
-def test_faceenhancer_is_phase14_pending_and_not_exposed():
+def test_faceenhancer_workflow_is_curated_and_pending_row_is_removed():
     reference = "4.2) data_src util faceset enhance.bat"
     rows = [x for x in _excluded_entries() if x["reference_launcher"] == reference]
-    assert len(rows) == 1
-    assert rows[0]["disposition"] == "PHASE14_PENDING"
-    assert "faces-src-enhance.bat" not in _curated_names()
-    assert not (LAUNCHERS_DIR / "faces-src-enhance.bat").exists()
+    assert rows == []
+    assert all(
+        row["disposition"] != "PHASE14_PENDING"
+        for row in _excluded_entries()
+    )
+
+    entries = {entry["file"]: entry for entry in _curated_entries()}
+    entry = entries["faces-src-enhance.bat"]
+    assert entry["group"] == "facesettool"
+    assert entry["forwarding"] is False
+    assert "data_src" in entry["purpose"]
+    assert "FaceEnhancer" in entry["purpose"]
+    assert (LAUNCHERS_DIR / "faces-src-enhance.bat").is_file()
+
+    text = _launcher_text("faces-src-enhance.bat")
+    assert _call_args(text) == (
+        'facesettool enhance --input-dir "workspace\\data_src\\aligned"')
+    assert "%*" not in text
+    assert not re.search(r"\b(?:python|py|pip)\b", text, re.IGNORECASE)
+    assert not re.search(r"[0-9a-f]{64}", text)
+    assert not re.search(r"\b(?:install|download)\b", text, re.IGNORECASE)
+    assert text.rstrip().endswith("exit /b %ERRORLEVEL%")
+
+    main_text = MAIN_PY.read_text(encoding="utf-8")
+    enhance_block = main_text.split(
+        'facesettool_parser.add_parser ("enhance"', 1)[1]
+    enhance_block = enhance_block.split(
+        'facesettool_parser.add_parser ("resize"', 1)[0]
+    assert "--input-dir" in enhance_block
+    assert "--force-gpu-idxs" in enhance_block
+    assert "type=parse_gpu_idxs" in enhance_block
 
 
 def test_quick96_train_and_merge_are_curated_without_export():
@@ -598,6 +627,32 @@ def test_quick96_launcher_is_spaced_install_safe(tmp_path, name):
     assert '"workspace\\' in _call_args(_launcher_text(name))
 
 
+def test_faceenhancer_launcher_is_spaced_install_safe(tmp_path):
+    name = "faces-src-enhance.bat"
+    repo_root = tmp_path / "fake dfl with spaces"
+    make_curated_fake_repo(repo_root)
+    log = tmp_path / "faceenhancer-spaced.log"
+    env = tl._env(
+        tl.HOSTILE_PARENT_ENV,
+        FAKEINT_LOG=str(log),
+        FAKEINT_EXIT="0",
+    )
+
+    proc = tl.run_bat(
+        repo_root / "launchers" / name,
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    loginfo = tl.read_fakeint_log(log)
+    assert loginfo["args"] == (
+        '-I -B "scripts\\runtime_entry.py" facesettool enhance '
+        '--input-dir "workspace\\data_src\\aligned"')
+    assert loginfo["exec"] == (
+        f"runtime\\versions\\{FAKE_RUNTIME_ID}\\python.exe")
+
+
 def _assert_isolated_child_env(env: dict):
     # Sanitized families must be empty in the child (set-to-empty shows up
     # as an empty value in the findstr dump).
@@ -721,6 +776,15 @@ def test_launcher_layer_propagates_child_exit_code_verbatim(tmp_path, exit_code)
     assert r["proc"].returncode == int(exit_code)
     if exit_code == "0":
         assert r["loginfo"]["args"] == _expected_args_line("extract-faces-src.bat")
+
+
+@pytest.mark.parametrize("exit_code", ("7", "42", "255"))
+def test_faceenhancer_launcher_propagates_child_failure(tmp_path, exit_code):
+    r = _run_curated(
+        tmp_path, "faces-src-enhance.bat", exit_code=exit_code)
+    assert r["proc"].returncode == int(exit_code)
+    assert r["loginfo"]["args"] == _expected_args_line(
+        "faces-src-enhance.bat")
 
 
 def test_curated_launchers_do_not_mutate_the_repository_tree(tmp_path):

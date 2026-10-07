@@ -25,6 +25,7 @@
     { "file": "faces-dst-recover-filename.bat", "group": "util", "forwarding": false, "purpose": "rename aligned data_dst faces to their original source filenames" },
     { "file": "faces-src-resize.bat", "group": "facesettool", "forwarding": false, "purpose": "resize the aligned data_src faces" },
     { "file": "faces-dst-resize.bat", "group": "facesettool", "forwarding": false, "purpose": "resize the aligned data_dst faces" },
+    { "file": "faces-src-enhance.bat", "group": "facesettool", "forwarding": false, "purpose": "enhance the aligned data_src faces using the tracked FaceEnhancer capability" },
     { "file": "extract-faces-src.bat", "group": "extract", "forwarding": false, "purpose": "extract aligned data_src faces with the S3FD detector" },
     { "file": "extract-faces-src-manual.bat", "group": "extract", "forwarding": false, "purpose": "extract aligned data_src faces manually with the interactive window" },
     { "file": "extract-faces-dst.bat", "group": "extract", "forwarding": false, "purpose": "extract aligned data_dst faces with the S3FD detector (debug output, unlimited faces per image)" },
@@ -60,7 +61,6 @@
     { "reference_launcher": "5.1) data_dst view aligned_debug results.bat", "disposition": "POST_BASELINE", "reason": "Bundled XnViewMP viewer is not part of the current distribution surface; viewer substitution is user-side." },
     { "reference_launcher": "5.XSeg) data_src mask - edit.bat", "disposition": "REPRODUCE_BEHAVIOR", "reason": "The generic packaged CLI reproduces the historical editor workflow as: dfl.bat xseg editor --input-dir workspace\\data_src\\aligned. A dedicated fixed-path wrapper would duplicate that supported entrypoint." },
     { "reference_launcher": "5.XSeg) data_dst mask - edit.bat", "disposition": "REPRODUCE_BEHAVIOR", "reason": "The generic packaged CLI reproduces the historical editor workflow as: dfl.bat xseg editor --input-dir workspace\\data_dst\\aligned. A dedicated fixed-path wrapper would duplicate that supported entrypoint." },
-    { "reference_launcher": "5.XSeg) train.bat", "disposition": "RESOURCE_GATED", "reason": "Requires external user-supplied pretraining data passed explicitly through --pretraining-data-dir; no dataset is bundled or downloaded. The generic dfl.bat train surface provides this path contract, so a dedicated fixed-resource launcher is not shipped." },
-    { "reference_launcher": "4.2) data_src util faceset enhance.bat", "disposition": "PHASE14_PENDING", "reason": "FaceEnhancer is an official capability, but its current implementation unconditionally requires nn.tf, which is unavailable in the Torch-only baseline; expose this workflow only after its backend capability is completed and validated." }
+    { "reference_launcher": "5.XSeg) train.bat", "disposition": "RESOURCE_GATED", "reason": "Requires external user-supplied pretraining data passed explicitly through --pretraining-data-dir; no dataset is bundled or downloaded. The generic dfl.bat train surface provides this path contract, so a dedicated fixed-resource launcher is not shipped." }
   ]
 }
